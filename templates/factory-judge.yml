@@ -86,7 +86,9 @@ jobs:
           # The key is still in this step's env (inherent to running an agent with a key); the runner is ephemeral and the key is judge-only.
           export CODEX_HOME=$(mktemp -d); chmod 700 "$CODEX_HOME"
           printenv OPENAI_API_KEY | codex login --with-api-key
-          codex exec --sandbox workspace-write --skip-git-repo-check "$(cat "$RUNNER_TEMP/prompt.md")" > "$RUNNER_TEMP/codex.txt" 2>&1 || true
+          # Codex's own bubblewrap sandbox cannot start on GitHub-hosted runners (RTM_NEWADDR EPERM), so it runs with
+          # its sandbox off. The job is the isolation boundary: fresh runner, no GitHub token, PR code never executed here.
+          codex exec --sandbox danger-full-access --skip-git-repo-check "$(cat "$RUNNER_TEMP/prompt.md")" > "$RUNNER_TEMP/codex.txt" 2>&1 || true
           rm -rf "$CODEX_HOME"
           grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)\s*$' "$RUNNER_TEMP/codex.txt" | tail -1 | awk '{print $2}' > "$RUNNER_TEMP/codex.verdict" || true
       - name: Verdicts as job outputs (sanitized; anything else becomes REFUTED downstream)
