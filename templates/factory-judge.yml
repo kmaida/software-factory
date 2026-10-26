@@ -1,0 +1,110 @@
+# factory-judge.yml — two independent models refute a factory PR at its exact head SHA and post
+# factory/judge-claude and factory/judge-codex commit statuses. Three jobs on fresh runners so that
+# nothing which executes PR code shares a runner with a secret or a token:
+#   checks  — permissions {}, no secrets: runs every allowed check; the STEP FAILS if any check fails, and
+#             downstream trusts only the job result (PR code can forge outputs/artifacts, not a job result)
+#   models  — API keys only, no GITHUB_TOKEN: checks out the PR with its agent config stripped, runs the
+#             models with --bare, emits verdicts as job outputs (never artifacts)
+#   post    — statuses:write only: fails closed to REFUTED when a verdict is missing or malformed
+# Needs repo secrets ANTHROPIC_API_KEY, OPENAI_API_KEY. Prompt and policy are read from the BASE commit.
+# ponytail: untested until the first factory PR; the shape is deliberate, the CLI install lines may need a bump.
+name: factory-judge
+on:
+  pull_request:
+    types: [labeled, synchronize, opened, reopened]
+permissions: {}
+env:
+  HEAD: ${{ github.event.pull_request.head.sha }}
+  BASE: ${{ github.event.pull_request.base.sha }}
+jobs:
+  checks:
+    if: contains(github.event.pull_request.labels.*.name, 'factory')
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ github.event.pull_request.head.sha }}", fetch-depth: 0, persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24, cache: npm }
+      - name: Run every allowed check from BASE policy (PR code executes here, with nothing to steal)
+        id: run
+        run: |
+          git show "$BASE:.factory/policy.json" > "$RUNNER_TEMP/policy.json"
+          npm ci
+          out="$RUNNER_TEMP/check-output.txt"; : > "$out"; ok=1
+          while IFS= read -r c; do
+            echo "### $c" >> "$out"
+            if bash -c "$c" >> "$out" 2>&1; then echo "exit 0" >> "$out"; else echo "exit $?" >> "$out"; ok=0; fi
+          done < <(jq -r '.checks[]' "$RUNNER_TEMP/policy.json")
+          [ "$ok" = 1 ]   # job result is the only signal downstream trusts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "judge-checks-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/check-output.txt", retention-days: 14 }
+
+  models:
+    needs: checks            # runs only when every check passed; otherwise post refutes without spending API calls
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs: { claude: "${{ steps.out.outputs.claude }}", codex: "${{ steps.out.outputs.codex }}" }
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ github.event.pull_request.head.sha }}", fetch-depth: 0, persist-credentials: false }
+      - name: Strip PR-controlled agent config (hooks, settings, instructions) before any model runs
+        run: rm -rf .claude .codex .mcp.json CLAUDE.md AGENTS.md .cursor .github/copilot-instructions.md
+      - uses: actions/download-artifact@v4
+        with: { name: "judge-checks-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/checks" }
+      - name: Fill the refute prompt (literal substitution; PR title and check transcript are untrusted data)
+        env: { TITLE: "${{ github.event.pull_request.title }}", URL: "${{ github.event.pull_request.html_url }}", OK: "1" }
+        run: |
+          git show "$BASE:.factory/refute-prompt.md" > "$RUNNER_TEMP/refute-prompt.md"
+          python3 - <<'PY'
+          import os; t=os.environ["RUNNER_TEMP"]
+          p=open(f"{t}/refute-prompt.md").read()
+          for k,v in {"{{ISSUE_TITLE}}":os.environ["TITLE"],"{{PR_URL}}":os.environ["URL"],"{{HEAD_SHA}}":os.environ["HEAD"],"{{BASE_SHA}}":os.environ["BASE"],
+                      "{{DONE_WHEN}}":"every command in .factory/policy.json `checks` (already executed on a clean runner; output below — do NOT run installs or checks yourself)"}.items():
+              p=p.replace(k,v)
+          out=open(f"{t}/checks/check-output.txt").read()[-20000:]
+          p+=f"\n\n## Check output (all checks passed: {os.environ['OK']=='1'})\n```\n{out}\n```\n"
+          open(f"{t}/prompt.md","w").write(p)
+          PY
+      - name: Attacker A — Claude
+        env: { ANTHROPIC_API_KEY: "${{ secrets.ANTHROPIC_API_KEY }}" }
+        run: |
+          npm i -g @anthropic-ai/claude-code >/dev/null 2>&1
+          claude -p "$(cat "$RUNNER_TEMP/prompt.md")" --bare --permission-mode acceptEdits --max-turns 40 > "$RUNNER_TEMP/claude.txt" 2>&1 || true
+          grep -oE 'VERDICT: *(VERIFIED|CAVEATS|REFUTED)' "$RUNNER_TEMP/claude.txt" | tail -1 | awk '{print $2}' > "$RUNNER_TEMP/claude.verdict" || true
+      - name: Attacker B — Codex
+        env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }
+        run: |
+          git checkout -q -- . && git clean -qfd
+          npm i -g @openai/codex >/dev/null 2>&1
+          codex exec --sandbox workspace-write --skip-git-repo-check "$(cat "$RUNNER_TEMP/prompt.md")" > "$RUNNER_TEMP/codex.txt" 2>&1 || true
+          grep -oE 'VERDICT: *(VERIFIED|CAVEATS|REFUTED)' "$RUNNER_TEMP/codex.txt" | tail -1 | awk '{print $2}' > "$RUNNER_TEMP/codex.verdict" || true
+      - name: Verdicts as job outputs (sanitized; anything else becomes REFUTED downstream)
+        id: out
+        run: for m in claude codex; do echo "$m=$(tr -cd 'A-Z' < "$RUNNER_TEMP/$m.verdict" 2>/dev/null)" >> "$GITHUB_OUTPUT"; done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "judge-transcripts-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/*.txt", retention-days: 14 }
+
+  post:
+    needs: [checks, models]
+    if: always() && needs.checks.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions: { statuses: write }
+    steps:
+      - name: Post statuses (the only job with a token; fails closed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECKS: ${{ needs.checks.result }}
+          V_CLAUDE: ${{ needs.models.outputs.claude }}
+          V_CODEX: ${{ needs.models.outputs.codex }}
+        run: |
+          for m in claude codex; do
+            v=$([ $m = claude ] && echo "$V_CLAUDE" || echo "$V_CODEX")
+            case $v in VERIFIED|CAVEATS|REFUTED) ;; *) v=REFUTED;; esac   # missing or malformed → refuted
+            [ "$CHECKS" = success ] || v=REFUTED                          # any failing check → refuted
+            case $v in VERIFIED) st=success;; *) st=failure;; esac
+            gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD" -f state="$st" -f context="factory/judge-$m" -f description="$v" >/dev/null
+            echo "factory/judge-$m=$st ($v)"
+          done
