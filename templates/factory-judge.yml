@@ -82,8 +82,12 @@ jobs:
           git checkout -q -- . && git clean -qfd
           rm -rf .claude .codex .mcp.json CLAUDE.md AGENTS.md .cursor .github/copilot-instructions.md   # the reset restores them; strip again
           npm i -g @openai/codex@0.164.0 >/dev/null 2>&1   # pinned; bump deliberately
-          printenv OPENAI_API_KEY | codex login --with-api-key   # codex 0.164 does not read the env var on its own
+          # codex 0.164 does not read OPENAI_API_KEY on its own; log in into a throwaway CODEX_HOME and delete it after.
+          # The key is still in this step's env (inherent to running an agent with a key); the runner is ephemeral and the key is judge-only.
+          export CODEX_HOME=$(mktemp -d); chmod 700 "$CODEX_HOME"
+          printenv OPENAI_API_KEY | codex login --with-api-key
           codex exec --sandbox workspace-write --skip-git-repo-check "$(cat "$RUNNER_TEMP/prompt.md")" > "$RUNNER_TEMP/codex.txt" 2>&1 || true
+          rm -rf "$CODEX_HOME"
           grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)\s*$' "$RUNNER_TEMP/codex.txt" | tail -1 | awk '{print $2}' > "$RUNNER_TEMP/codex.verdict" || true
       - name: Verdicts as job outputs (sanitized; anything else becomes REFUTED downstream)
         id: out
