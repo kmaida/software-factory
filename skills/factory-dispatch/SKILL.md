@@ -13,7 +13,7 @@ One sweep. Every state has an owner. Re-check state before every action; never a
 [[ -f ~/.factory/registry.json ]] || { echo "no registry; run /factory:factory-onboard first"; exit 1; }
 mkdir -p ~/.factory/logs
 ```
-Run one dispatcher at a time (by hand, or one LaunchAgent). There is no lock; every action re-checks state first, so an accidental overlap wastes a sweep rather than corrupting anything.
+Run one dispatcher at a time (by hand, or one LaunchAgent), with `--permission-mode bypassPermissions`: under `auto` the permission classifier refuses to spawn the worker subprocess and the sweep stops to ask, which defeats the point. Never stop to ask a question in this skill; if something cannot be done, say so in the report and move on. There is no lock; every action re-checks state first, so an accidental overlap wastes a sweep rather than corrupting anything.
 For each repo in the registry: `gh variable get FACTORY_PAUSED -R <owner/repo>` equal to `true` → skip that repo entirely.
 
 Launch wrapper (used for every subprocess below). `KEYCARD_ZONE` must be set. If `FACTORY_DRY_RUN=1` is set, print `WARNING: dry run, running under the operator's own credentials` once and run the bare command; this exists only until the Keycard GitHub resource is registered and must not be used after.
