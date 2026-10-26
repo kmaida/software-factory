@@ -75,7 +75,7 @@ Fire one sweep now: `launchctl kickstart gui/$(id -u)/ai.keycard.factory.dispatc
 KEYCARD_ZONE=1jgewf106fax3oaf70vyykwj2i claude -p "/factory:factory-dispatch" --plugin-dir ~/Documents/Development/factory --permission-mode bypassPermissions
 ```
 
-A LaunchAgent lives in the user's GUI session: it starts when `softwarefactory` logs in, not when the machine boots. See the next section.
+A LaunchAgent lives in the user's GUI session: it starts when `softwarefactory` logs in, which automatic login does at every boot (next section).
 
 ## Always-on (admin, as `factory`)
 
@@ -87,4 +87,4 @@ sudo systemsetup -setremotelogin on
 
 Screen Sharing and Automatic login are System Settings switches (General → Sharing; Users & Groups → Automatic login). Tailscale is the standalone app from tailscale.com installed into `/Applications` as admin, signed in to Kim's free tailnet, with its network extension approved. The VPN is a system extension that launchd runs at the system level, so it is up after boot without the menu bar app or a logged-in user. Machine name `kims-mac-mini` (`kims-mac-mini.tailcd6b2c.ts.net`, 100.83.157.111). Reach it with `ssh softwarefactory@kims-mac-mini` once Remote Login is on, or Screen Sharing to the same name.
 
-**FileVault tradeoff.** The Claude, Keycard and GitHub sessions are in the login keychain, which opens only when `softwarefactory` logs in. After a power cut or `autorestart`, a machine with FileVault on stops at the pre-boot unlock screen and nothing runs until someone types a password (over Screen Sharing is not possible before unlock). Automatic login is the fix, and macOS refuses it while FileVault is on. So the choice is: FileVault on and a reboot needs a human at the console, or FileVault off, automatic login as `softwarefactory`, and the factory survives reboots on its own. The disk then holds no secrets at rest beyond the keychain, which stays encrypted with the account password either way. Kim decides; it was left on.
+**FileVault tradeoff.** The Claude, Keycard and GitHub sessions are in the login keychain, which opens only when `softwarefactory` logs in. After a power cut or `autorestart`, a machine with FileVault on stops at the pre-boot unlock screen and nothing runs until someone types a password (over Screen Sharing is not possible before unlock). Automatic login is the fix, and macOS refuses it while FileVault is on. So the choice is: FileVault on and a reboot needs a human at the console, or FileVault off, automatic login as `softwarefactory`, and the factory survives reboots on its own. The disk then holds no secrets at rest beyond the keychain, which stays encrypted with the account password either way. Decision 2026-10-26: FileVault off, automatic login as `softwarefactory`, 5-minute screen lock. The mini sits in Kim's home; every session on it is revocable from the web (GitHub token, Keycard session, claude.ai).
