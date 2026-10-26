@@ -87,4 +87,22 @@ sudo systemsetup -setremotelogin on
 
 Screen Sharing and Automatic login are System Settings switches (General → Sharing; Users & Groups → Automatic login). Tailscale is the standalone app from tailscale.com installed into `/Applications` as admin, signed in to Kim's free tailnet, with its network extension approved. The VPN is a system extension that launchd runs at the system level, so it is up after boot without the menu bar app or a logged-in user. Machine name `kims-mac-mini` (`kims-mac-mini.tailcd6b2c.ts.net`, 100.83.157.111). Reach it with `ssh softwarefactory@kims-mac-mini` once Remote Login is on, or Screen Sharing to the same name.
 
+Screen Sharing and Remote Login must allow `softwarefactory` (the default is administrators only): as `factory`, `sudo dseditgroup -o edit -a softwarefactory -t user com.apple.access_screensharing` and the same with `com.apple.access_ssh`, or System Settings → General → Sharing → (i) → "Allow access for".
+
+### From the laptop
+
+```bash
+open vnc://softwarefactory@kims-mac-mini     # Screen Sharing into the factory session (tick "remember in keychain" once)
+open vnc://factory@kims-mac-mini             # the admin desktop; pick the virtual display when asked
+ssh mini                                     # with the stanza below in ~/.ssh/config
+```
+
+```
+Host mini
+  HostName kims-mac-mini
+  User softwarefactory
+```
+
+In the Finder ⌘K dialog, + saves `vnc://softwarefactory@kims-mac-mini` as a favorite.
+
 **FileVault tradeoff.** The Claude, Keycard and GitHub sessions are in the login keychain, which opens only when `softwarefactory` logs in. After a power cut or `autorestart`, a machine with FileVault on stops at the pre-boot unlock screen and nothing runs until someone types a password (over Screen Sharing is not possible before unlock). Automatic login is the fix, and macOS refuses it while FileVault is on. So the choice is: FileVault on and a reboot needs a human at the console, or FileVault off, automatic login as `softwarefactory`, and the factory survives reboots on its own. The disk then holds no secrets at rest beyond the keychain, which stays encrypted with the account password either way. Decision 2026-10-26: FileVault off, automatic login as `softwarefactory`, 5-minute screen lock. The mini sits in Kim's home; every session on it is revocable from the web (GitHub token, Keycard session, claude.ai).
