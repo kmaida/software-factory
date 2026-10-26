@@ -20,6 +20,7 @@ Run `/fable-loop` on the task. Rules that override anything else:
 - Pre-authorized outward actions: push to `factory/<ID>`, open or update your PR, comment on your issue. Anything else irreversible or outward (deploys, deleting data, posting elsewhere, touching other branches) → `Needs Input` and exit.
 - Never edit `.factory/`, `.claude/`, `CLAUDE.md`, `.github/`, lockfiles, package manifests, or test helpers. Never delete, skip, or weaken a test.
 - The acceptance check is the `Done when` command. Run it from the repo root at the end; keep its exit code and last 30 lines. The CI judge re-runs **every** command in `checks`, so make sure all of them pass, not just the named one.
+- Your sandbox cannot bind local ports. A suite that fails only with `EPERM` on `listen` is environmental: confirm the same suite fails identically on the base branch, say so in the PR body, and let CI be the authority. Never work around it by changing the test.
 
 ## 2. Open the PR
 
