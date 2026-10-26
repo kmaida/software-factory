@@ -10,4 +10,4 @@ Linear issue → worktree worker → two-model judge → merge controller in CI.
 - `templates/factory-merge.yml` — the only merge path.
 - `keycard.toml` — the single Keycard config for local processes (one GitHub provider per zone).
 
-Run: `KEYCARD_ZONE=<zone> claude -p "/factory:factory-dispatch" --plugin-dir <this dir>` (or install the plugin and drop the flag). Pause: `gh variable set FACTORY_PAUSED -b true -R owner/repo`.
+Run: `KEYCARD_ZONE=<zone> claude -p "/factory:factory-dispatch" --plugin-dir <this dir> --permission-mode bypassPermissions`. The dispatcher needs that mode: under `auto`, the permission classifier refuses to spawn the worker subprocess and the sweep stops to ask. Workers themselves run under `auto`.. Pause: `gh variable set FACTORY_PAUSED -b true -R owner/repo`.
