@@ -32,6 +32,9 @@ gh pr create --label factory --title "<ID>: <issue title>" --body-file - <<'B'
 Closes <issue URL>
 factory-run: <the 8-hex id from the newest `factory: run …` comment on the issue>
 
+## Task (copied from the Linear issue; the CI judge cannot read Linear)
+<the issue's `## Done when`, `## Context`, and `## Out of scope` sections, verbatim>
+
 ## Assumptions
 - ...
 
