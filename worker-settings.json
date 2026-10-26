@@ -1,0 +1,16 @@
+{
+  "sandbox": {
+    "enabled": true,
+    "network": {
+      "allowedDomains": [
+        "github.com",
+        "api.github.com",
+        "codeload.github.com",
+        "objects.githubusercontent.com",
+        "registry.npmjs.org",
+        "*.npmjs.org"
+      ],
+      "deniedDomains": ["169.254.169.254", "metadata.google.internal"]
+    }
+  }
+}

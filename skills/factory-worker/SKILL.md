@@ -29,6 +29,7 @@ git remote set-url origin "https://github.com/<owner/repo>.git"
 git push -u origin "factory/<ID>"
 gh pr create --label factory --title "<ID>: <issue title>" --body-file - <<'B'
 Closes <issue URL>
+factory-run: <the 8-hex id from the newest `factory: run …` comment on the issue>
 
 ## Assumptions
 - ...

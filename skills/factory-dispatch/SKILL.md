@@ -16,11 +16,7 @@ mkdir -p ~/.factory/logs
 Run one dispatcher at a time (by hand, or one LaunchAgent), with `--permission-mode bypassPermissions`: under `auto` the permission classifier refuses to spawn the worker subprocess and the sweep stops to ask, which defeats the point. Never stop to ask a question in this skill; if something cannot be done, say so in the report and move on. There is no lock; every action re-checks state first, so an accidental overlap wastes a sweep rather than corrupting anything.
 For each repo in the registry: `gh variable get FACTORY_PAUSED -R <owner/repo>` equal to `true` → skip that repo entirely.
 
-Launch wrapper (used for every subprocess below). `KEYCARD_ZONE` must be set. If `FACTORY_DRY_RUN=1` is set, print `WARNING: dry run, running under the operator's own credentials` once and run the bare command; this exists only until the Keycard GitHub resource is registered and must not be used after.
-```bash
-run_kc() { [[ ${FACTORY_DRY_RUN:-} == 1 ]] && { "$@"; return; }
-  keycard agent exec --config "${CLAUDE_PLUGIN_ROOT}/keycard.toml" --zone "$KEYCARD_ZONE" -- "$@"; }
-```
+`KEYCARD_ZONE` must be set; every worker is launched through `keycard agent exec` so it holds no credentials of its own.
 
 ## Sweep
 
@@ -52,7 +48,12 @@ if [[ -d $wt ]]; then git -C "$wt" pull -q --rebase origin "factory/$id" || true
 elif git -C "$repo" ls-remote -q --exit-code origin "factory/$id" >/dev/null; then
   git -C "$repo" worktree add "$wt" "factory/$id"                                            # retry, worktree gone: track the branch
 else git -C "$repo" worktree add -b "factory/$id" "$wt" origin/HEAD; fi                     # first run
-( cd "$wt" && run_kc claude -p "/factory:factory-worker $id" --plugin-dir "${CLAUDE_PLUGIN_ROOT}" --permission-mode auto ) > ~/.factory/logs/$id.log 2>&1 &
+( cd "$wt" && perl -e 'alarm 5400; exec @ARGV' -- \
+    keycard agent exec --config "${CLAUDE_PLUGIN_ROOT}/keycard.toml" --zone "$KEYCARD_ZONE" -- \
+      claude -p "/factory:factory-worker $id" --plugin-dir "${CLAUDE_PLUGIN_ROOT}" \
+        --settings "${CLAUDE_PLUGIN_ROOT}/worker-settings.json" --permission-mode auto --max-turns 80 \
+  ) > ~/.factory/logs/$id.log 2>&1 &
+# budget: 80 turns and 90 minutes wall clock per run; worker-settings.json is the egress allowlist for the worker's shell commands.
 ```
 3. Do not wait for it. Report `started <ID> in <wt>`.
 
