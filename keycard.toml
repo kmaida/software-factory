@@ -1,0 +1,14 @@
+# One Keycard config for every local factory process (dispatch and worker).
+# A zone has ONE GitHub provider (providers are keyed by issuer), so there is one brokered GitHub
+# credential locally, and on the CLI path the Keycard principal is the CLI app + Kim for every process.
+# Role separation therefore lives in WHERE code runs: the judge posts statuses from CI, the merge App
+# lives only in Actions secrets, and local processes get this single worker-level token.
+[org]
+id = "p48htojvia150hqw8n22g00d4i" # Keycard
+
+[zone]
+id = "1jgewf106fax3oaf70vyykwj2i" # factory zone
+
+[[credentials.default]]
+resource = "urn:github:factory"   # external OAuth resource backed by the single factory GitHub App
+env_var = "GH_TOKEN"

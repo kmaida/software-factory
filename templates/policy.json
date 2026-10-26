@@ -1,0 +1,15 @@
+{
+  "auto_merge": false,
+  "max_lines": 300,
+  "allow": ["src/*", "tests/*", "docs/*", "README.md"],
+  "deny": [
+    "src/auth/*", "*migration*", "*schema*", "*.sql",
+    "infra/*", "deploy/*", "Dockerfile*", "*.yml", "*.yaml",
+    ".github/*", ".factory/*", ".claude/*", "CLAUDE.md",
+    "*.env*", "*secret*", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "package.json",
+    "tests/helpers/*", "tests/setup*", "jest.config*", "vitest.config*"
+  ],
+  "tests": ["tests/*", "*.test.*", "*.spec.*"],
+  "checks": ["npm test", "npm run build"],
+  "launch": "npm run dev"
+}

@@ -1,0 +1,72 @@
+# factory-merge.yml — the only thing that merges factory PRs. Installed by /factory:factory-onboard.
+# Uses pull_request_target + status so the workflow definition and the gate script always come from the
+# base branch; PR code is diffed, never executed. Needs: repo var FACTORY_APP_ID, secret FACTORY_APP_PRIVATE_KEY,
+# var FACTORY_PAUSED, branch protection on main (required CI, up to date, pushes restricted to the merge App).
+# ponytail: untested until Phase 2; the gate script is tested, this plumbing is not.
+name: factory-merge
+on:
+  pull_request_target:
+    types: [labeled, synchronize]
+  status: {}
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: read
+  checks: read
+jobs:
+  gate:
+    if: vars.FACTORY_PAUSED != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          STATUS_CONTEXT: ${{ github.event.context }}
+          STATUS_SHA: ${{ github.event.sha }}
+        run: |
+          if [ "$EVENT" = "pull_request_target" ]; then n=$PR_NUMBER
+          else
+            case "$STATUS_CONTEXT" in factory/judge-*) ;; *) echo skip=1 >> "$GITHUB_OUTPUT"; exit 0;; esac
+            n=$(gh pr list -R "$GITHUB_REPOSITORY" --search "$STATUS_SHA" --label factory --json number --jq '.[0].number // empty')
+          fi
+          [ -n "$n" ] || { echo skip=1 >> "$GITHUB_OUTPUT"; exit 0; }
+          gh pr view "$n" -R "$GITHUB_REPOSITORY" --json labels,headRefOid,baseRefOid --jq \
+            '"number='"$n"'\nhead=\(.headRefOid)\nbase=\(.baseRefOid)\nfactory=\([.labels[].name]|index("factory")!=null)"' >> "$GITHUB_OUTPUT"
+      - name: Checkout base (PR code is only ever diffed, never run)
+        if: steps.pr.outputs.skip != '1' && steps.pr.outputs.factory == 'true'
+        uses: actions/checkout@v4
+        with: { ref: "${{ github.event.repository.default_branch }}", fetch-depth: 0 }
+      - name: CI green? (judge statuses excluded; the gate checks those)
+        if: steps.pr.outputs.skip != '1' && steps.pr.outputs.factory == 'true'
+        id: ci
+        env: { GH_TOKEN: "${{ github.token }}", N: "${{ steps.pr.outputs.number }}" }
+        run: |
+          bad=$(gh pr checks "$N" -R "$GITHUB_REPOSITORY" --json name,state --jq '[.[] | select(.name|startswith("factory/judge-")|not) | select(.state!="SUCCESS")] | length')
+          echo "ok=$([ "$bad" = 0 ] && echo 1 || echo 0)" >> "$GITHUB_OUTPUT"
+      - name: Risk gate (script and policy from BASE; verdict is the exit code)
+        if: steps.ci.outputs.ok == '1'
+        id: gate
+        env: { GH_TOKEN: "${{ github.token }}", BASE: "${{ steps.pr.outputs.base }}", HEAD: "${{ steps.pr.outputs.head }}" }
+        run: |
+          git fetch -q origin "$HEAD"
+          git show "$BASE:.factory/risk-gate.sh" > "$RUNNER_TEMP/gate.sh"
+          if out=$(bash "$RUNNER_TEMP/gate.sh" . "$BASE" "$HEAD" 2>&1); then v=low; else v=review; fi
+          d="EOF_$(openssl rand -hex 16)"
+          { echo "out<<$d"; printf '%s\n' "$out"; echo "$d"; } >> "$GITHUB_OUTPUT"
+          echo "verdict=$v" >> "$GITHUB_OUTPUT"   # written last, after the untrusted block
+      - name: Comment if review
+        if: steps.gate.outputs.verdict == 'review'
+        env: { GH_TOKEN: "${{ github.token }}", N: "${{ steps.pr.outputs.number }}", OUT: "${{ steps.gate.outputs.out }}" }
+        run: gh pr comment "$N" -R "$GITHUB_REPOSITORY" -b "factory: not auto-mergeable — $OUT"
+      - name: App token
+        if: steps.gate.outputs.verdict == 'low'
+        id: app
+        uses: actions/create-github-app-token@v2
+        with: { app-id: "${{ vars.FACTORY_APP_ID }}", private-key: "${{ secrets.FACTORY_APP_PRIVATE_KEY }}" }
+      - name: Merge
+        if: steps.gate.outputs.verdict == 'low'
+        env: { GH_TOKEN: "${{ steps.app.outputs.token }}", N: "${{ steps.pr.outputs.number }}", HEAD: "${{ steps.pr.outputs.head }}" }
+        run: gh pr merge "$N" -R "$GITHUB_REPOSITORY" --squash --delete-branch --match-head-commit "$HEAD"
