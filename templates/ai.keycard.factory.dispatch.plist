@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Factory dispatcher on the Mac mini. Install: see docs/mini.md (replace __HOME__ with the
+       softwarefactory user's home, then launchctl bootstrap gui/$(id -u)). One sweep every 30 minutes
+       and one at load; the dispatch skill is idempotent so an overlap wastes a sweep, nothing more. -->
+  <key>Label</key>
+  <string>ai.keycard.factory.dispatch</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>echo "=== $(date -u +%FT%TZ) sweep start"; claude -p "/factory:factory-dispatch" --plugin-dir "$HOME/Documents/Development/factory" --permission-mode bypassPermissions; echo "=== $(date -u +%FT%TZ) sweep exit $?"</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>KEYCARD_ZONE</key>
+    <string>1jgewf106fax3oaf70vyykwj2i</string>
+    <!-- No login shell under launchd: claude, keycard, gh, node (fnm default) must all be on this PATH. -->
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:__HOME__/.local/share/fnm/aliases/default/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>__HOME__/.factory</string>
+
+  <key>StartInterval</key>
+  <integer>1800</integer>
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/.factory/logs/dispatch.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.factory/logs/dispatch.err.log</string>
+
+  <!-- Keep the sweep off the efficiency cores and don't let launchd batch it. -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>Nice</key>
+  <integer>0</integer>
+</dict>
+</plist>

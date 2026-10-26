@@ -17,3 +17,7 @@ Not yet (Phase 3): a sandbox the agent can't escape (the worker is a Claude Code
 - `keycard.toml` — the single Keycard config for local processes (one GitHub provider per zone).
 
 Run: `KEYCARD_ZONE=<zone> claude -p "/factory:factory-dispatch" --plugin-dir <this dir> --permission-mode bypassPermissions`. The dispatcher needs that mode: under `auto`, the permission classifier refuses to spawn the worker subprocess and the sweep stops to ask. Workers themselves run under `auto`.. Pause: `gh variable set FACTORY_PAUSED -b true -R owner/repo`.
+
+## Mini
+
+The always-on host is a Mac mini running the dispatcher as a dedicated non-admin macOS user from a LaunchAgent every 30 minutes. Versions, logins, paths, the plist, and the FileVault tradeoff are in `docs/mini.md`; the plist is `templates/ai.keycard.factory.dispatch.plist`.
