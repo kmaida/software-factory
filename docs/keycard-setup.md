@@ -20,7 +20,7 @@ A local process can never post a judge status or merge because the local token h
 1. **Two GitHub Apps** (https://github.com/settings/apps; names are global, prefix them):
    | App | Permissions | Used by | Credential to keep |
    |---|---|---|---|
-   | `kmaida-factory` | Contents: write, Pull requests: write, Metadata: read, Variables: read | local worker + dispatch via Keycard | client ID + client secret → Keycard |
+   | `kmaida-factory` | Repository: Contents write, Pull requests write, Metadata read, Variables read. **Account: Email addresses read-only (required: Keycard resolves the user through GitHub's `/user/emails`; without it every authorize naming a GitHub resource fails with `server_error` before GitHub is ever shown)** | local worker + dispatch via Keycard | client ID + client secret → Keycard |
    | `kmaida-factory-merge` | Contents: write, Pull requests: write | merge job only | App ID → repo variable `FACTORY_APP_ID`; private key → repo secret `FACTORY_APP_PRIVATE_KEY` |
    Callback URL for `kmaida-factory` = the zone's Redirect URL; webhook off; "Expire user authorization tokens" on. Install both on the pilot repo (Only select repositories). No private key for `kmaida-factory`; no client secret needed for `kmaida-factory-merge`.
 2. **Keycard**: Resources → add GitHub from the catalog once, with `kmaida-factory`'s client id/secret (this creates the zone's GitHub provider). Identifier `urn:github:factory`. Credential provider: that GitHub provider. Provided by: nobody. Scopes: default.
