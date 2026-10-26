@@ -75,15 +75,16 @@ jobs:
         run: |
           npm i -g @anthropic-ai/claude-code@2.1.176 >/dev/null 2>&1   # pinned; bump deliberately
           claude -p "$(cat "$RUNNER_TEMP/prompt.md")" --bare --permission-mode acceptEdits --max-turns 40 > "$RUNNER_TEMP/claude.txt" 2>&1 || true
-          grep -oE 'VERDICT: *(VERIFIED|CAVEATS|REFUTED)' "$RUNNER_TEMP/claude.txt" | tail -1 | awk '{print $2}' > "$RUNNER_TEMP/claude.verdict" || true
+          grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)\s*$' "$RUNNER_TEMP/claude.txt" | tail -1 | awk '{print $2}' > "$RUNNER_TEMP/claude.verdict" || true   # whole line only; never the prompt's instruction text
       - name: Attacker B — Codex
         env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }
         run: |
           git checkout -q -- . && git clean -qfd
           rm -rf .claude .codex .mcp.json CLAUDE.md AGENTS.md .cursor .github/copilot-instructions.md   # the reset restores them; strip again
           npm i -g @openai/codex@0.164.0 >/dev/null 2>&1   # pinned; bump deliberately
+          printenv OPENAI_API_KEY | codex login --with-api-key   # codex 0.164 does not read the env var on its own
           codex exec --sandbox workspace-write --skip-git-repo-check "$(cat "$RUNNER_TEMP/prompt.md")" > "$RUNNER_TEMP/codex.txt" 2>&1 || true
-          grep -oE 'VERDICT: *(VERIFIED|CAVEATS|REFUTED)' "$RUNNER_TEMP/codex.txt" | tail -1 | awk '{print $2}' > "$RUNNER_TEMP/codex.verdict" || true
+          grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)\s*$' "$RUNNER_TEMP/codex.txt" | tail -1 | awk '{print $2}' > "$RUNNER_TEMP/codex.verdict" || true
       - name: Verdicts as job outputs (sanitized; anything else becomes REFUTED downstream)
         id: out
         run: for m in claude codex; do echo "$m=$(tr -cd 'A-Z' < "$RUNNER_TEMP/$m.verdict" 2>/dev/null)" >> "$GITHUB_OUTPUT"; done
@@ -106,9 +107,10 @@ jobs:
         run: |
           for m in claude codex; do
             v=$([ $m = claude ] && echo "$V_CLAUDE" || echo "$V_CODEX")
-            case $v in VERIFIED|CAVEATS|REFUTED) ;; *) v=REFUTED;; esac   # missing or malformed → refuted
-            [ "$CHECKS" = success ] || v=REFUTED                          # any failing check → refuted
+            d=$v
+            case $v in VERIFIED|CAVEATS|REFUTED) ;; *) v=CAVEATS; d="CAVEATS: no verdict from $m (model error)";; esac   # missing → blocks merge, needs a human, no retry churn
+            [ "$CHECKS" = success ] || { v=REFUTED; d="REFUTED: a policy check failed"; }                     # any failing check → refuted
             case $v in VERIFIED) st=success;; *) st=failure;; esac
-            gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD" -f state="$st" -f context="factory/judge-$m" -f description="$v" >/dev/null
+            gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD" -f state="$st" -f context="factory/judge-$m" -f description="${d:0:140}" >/dev/null
             echo "factory/judge-$m=$st ($v)"
           done
