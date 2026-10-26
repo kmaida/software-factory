@@ -7,7 +7,9 @@ name: factory-merge
 on:
   pull_request_target:
     types: [labeled, synchronize]
-  status: {}
+  workflow_run:            # statuses posted with the workflow token never fire `status`; chain on the judge instead
+    workflows: [factory-judge]
+    types: [completed]
 permissions:
   contents: read
   pull-requests: write
@@ -24,13 +26,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          STATUS_CONTEXT: ${{ github.event.context }}
-          STATUS_SHA: ${{ github.event.sha }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           if [ "$EVENT" = "pull_request_target" ]; then n=$PR_NUMBER
           else
-            case "$STATUS_CONTEXT" in factory/judge-*) ;; *) echo skip=1 >> "$GITHUB_OUTPUT"; exit 0;; esac
-            n=$(gh pr list -R "$GITHUB_REPOSITORY" --search "$STATUS_SHA" --label factory --json number --jq '.[0].number // empty')
+            n=$(gh pr list -R "$GITHUB_REPOSITORY" --search "$RUN_SHA" --label factory --state open --json number --jq '.[0].number // empty')
           fi
           [ -n "$n" ] || { echo skip=1 >> "$GITHUB_OUTPUT"; exit 0; }
           gh pr view "$n" -R "$GITHUB_REPOSITORY" --json labels,headRefOid,baseRefOid --jq \
