@@ -73,7 +73,7 @@ jobs:
       - name: Attacker A — Claude
         env: { ANTHROPIC_API_KEY: "${{ secrets.ANTHROPIC_API_KEY }}" }
         run: |
-          npm i -g @anthropic-ai/claude-code >/dev/null 2>&1
+          npm i -g @anthropic-ai/claude-code@2.1.176 >/dev/null 2>&1   # pinned; bump deliberately
           claude -p "$(cat "$RUNNER_TEMP/prompt.md")" --bare --permission-mode acceptEdits --max-turns 40 > "$RUNNER_TEMP/claude.txt" 2>&1 || true
           grep -oE 'VERDICT: *(VERIFIED|CAVEATS|REFUTED)' "$RUNNER_TEMP/claude.txt" | tail -1 | awk '{print $2}' > "$RUNNER_TEMP/claude.verdict" || true
       - name: Attacker B — Codex
@@ -81,7 +81,7 @@ jobs:
         run: |
           git checkout -q -- . && git clean -qfd
           rm -rf .claude .codex .mcp.json CLAUDE.md AGENTS.md .cursor .github/copilot-instructions.md   # the reset restores them; strip again
-          npm i -g @openai/codex >/dev/null 2>&1
+          npm i -g @openai/codex@0.164.0 >/dev/null 2>&1   # pinned; bump deliberately
           codex exec --sandbox workspace-write --skip-git-repo-check "$(cat "$RUNNER_TEMP/prompt.md")" > "$RUNNER_TEMP/codex.txt" 2>&1 || true
           grep -oE 'VERDICT: *(VERIFIED|CAVEATS|REFUTED)' "$RUNNER_TEMP/codex.txt" | tail -1 | awk '{print $2}' > "$RUNNER_TEMP/codex.verdict" || true
       - name: Verdicts as job outputs (sanitized; anything else becomes REFUTED downstream)
