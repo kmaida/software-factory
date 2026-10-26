@@ -11,5 +11,7 @@
   ],
   "tests": ["tests/*", "*.test.*", "*.spec.*"],
   "checks": ["npm test", "npm run build"],
+  "check_env": {},
+  "check_setup": [],
   "launch": "npm run dev"
 }

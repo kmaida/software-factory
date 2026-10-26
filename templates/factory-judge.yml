@@ -30,6 +30,9 @@ jobs:
         id: run
         run: |
           git show "$BASE:.factory/policy.json" > "$RUNNER_TEMP/policy.json"
+          # check_env / check_setup come from BASE policy: the same env and prep the repo's CI uses for its checks
+          while IFS= read -r kv; do export "$kv"; done < <(jq -r '.check_env // {} | to_entries[] | "\(.key)=\(.value)"' "$RUNNER_TEMP/policy.json")
+          while IFS= read -r s; do bash -c "$s"; done < <(jq -r '.check_setup[]?' "$RUNNER_TEMP/policy.json")
           npm ci
           out="$RUNNER_TEMP/check-output.txt"; : > "$out"; ok=1
           while IFS= read -r c; do

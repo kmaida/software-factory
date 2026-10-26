@@ -60,7 +60,8 @@ jobs:
       - name: Comment if review
         if: steps.gate.outputs.verdict == 'review'
         env: { GH_TOKEN: "${{ github.token }}", N: "${{ steps.pr.outputs.number }}", OUT: "${{ steps.gate.outputs.out }}" }
-        run: gh pr comment "$N" -R "$GITHUB_REPOSITORY" -b "factory: not auto-mergeable — $OUT"
+        run: |
+          gh pr comment "$N" -R "$GITHUB_REPOSITORY" -b "factory: not auto-mergeable — $OUT"
       - name: App token
         if: steps.gate.outputs.verdict == 'low'
         id: app
