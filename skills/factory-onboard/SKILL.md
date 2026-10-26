@@ -22,6 +22,10 @@ On a branch `factory/onboard` from the default branch:
 - Append `${CLAUDE_PLUGIN_ROOT}/templates/CLAUDE-factory.md` to `CLAUDE.md` (create if absent). Never replace existing content.
 - Run `/fewer-permission-prompts` if `.claude/settings.json` has no allowlist yet.
 
+Create the GitHub label the workflows key on (`gh pr create --label` silently drops a label that does not exist):
+```bash
+gh label create factory -R <owner/repo> --color F2C94C --description "Opened by the software factory worker"
+```
 Open the PR with `gh pr create --title "factory: onboard" --body` listing the preflight report. Kim merges it.
 
 Then tell Kim the three things only she can do, with exact commands: (a) branch protection on the default branch requiring the CI check names from the preflight, "require branches to be up to date", and restricting who can push; (b) a GitHub App for merging with `contents: write` + `pull_requests: write`, installed on the repo, with `FACTORY_APP_ID` as a repo variable and `FACTORY_APP_PRIVATE_KEY` as a repo secret; (c) `gh variable set FACTORY_PAUSED -b false -R <r>`; (d) repo secrets `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` for the judge job.
