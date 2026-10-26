@@ -10,7 +10,8 @@
         "registry.npmjs.org",
         "*.npmjs.org"
       ],
-      "deniedDomains": ["169.254.169.254", "metadata.google.internal"]
+      "deniedDomains": ["169.254.169.254", "metadata.google.internal"],
+      "allowLocalBinding": true
     }
   }
 }
