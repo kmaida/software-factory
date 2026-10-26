@@ -4,7 +4,8 @@
 #   checks  — permissions {}, no secrets: runs every allowed check; the STEP FAILS if any check fails, and
 #             downstream trusts only the job result (PR code can forge outputs/artifacts, not a job result)
 #   models  — API keys only, no GITHUB_TOKEN: checks out the PR with its agent config stripped, runs the
-#             models with --bare, emits verdicts as job outputs (never artifacts)
+#             models with --bare and without GITHUB_ENV/PATH/OUTPUT (so a model cannot poison later steps),
+#             emits verdicts as job outputs (never artifacts)
 #   post    — statuses:write only: fails closed to REFUTED when a verdict is missing or malformed
 # Needs repo secrets ANTHROPIC_API_KEY, OPENAI_API_KEY. Prompt and policy are read from the BASE commit.
 # ponytail: untested until the first factory PR; the shape is deliberate, the CLI install lines may need a bump.
@@ -74,7 +75,7 @@ jobs:
         env: { ANTHROPIC_API_KEY: "${{ secrets.ANTHROPIC_API_KEY }}" }
         run: |
           npm i -g @anthropic-ai/claude-code@2.1.176 >/dev/null 2>&1   # pinned; bump deliberately
-          claude -p "$(cat "$RUNNER_TEMP/prompt.md")" --bare --permission-mode acceptEdits --max-turns 40 > "$RUNNER_TEMP/claude.txt" 2>&1 || true
+          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE claude -p "$(cat "$RUNNER_TEMP/prompt.md")" --bare --permission-mode acceptEdits --max-turns 40 > "$RUNNER_TEMP/claude.txt" 2>&1 || true
           grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)\s*$' "$RUNNER_TEMP/claude.txt" | tail -1 | awk '{print $2}' > "$RUNNER_TEMP/claude.verdict" || true   # whole line only; never the prompt's instruction text
       - name: Attacker B — Codex
         env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }
@@ -88,7 +89,7 @@ jobs:
           printenv OPENAI_API_KEY | codex login --with-api-key
           # Codex's own bubblewrap sandbox cannot start on GitHub-hosted runners (RTM_NEWADDR EPERM), so it runs with
           # its sandbox off. The job is the isolation boundary: fresh runner, no GitHub token, PR code never executed here.
-          codex exec --sandbox danger-full-access --skip-git-repo-check "$(cat "$RUNNER_TEMP/prompt.md")" > "$RUNNER_TEMP/codex.txt" 2>&1 || true
+          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE codex exec --sandbox danger-full-access --skip-git-repo-check "$(cat "$RUNNER_TEMP/prompt.md")" > "$RUNNER_TEMP/codex.txt" 2>&1 || true
           rm -rf "$CODEX_HOME"
           grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)\s*$' "$RUNNER_TEMP/codex.txt" | tail -1 | awk '{print $2}' > "$RUNNER_TEMP/codex.verdict" || true
       - name: Verdicts as job outputs (sanitized; anything else becomes REFUTED downstream)
