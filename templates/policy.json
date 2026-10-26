@@ -13,5 +13,6 @@
   "checks": ["npm test", "npm run build"],
   "check_env": {},
   "check_setup": [],
+  "on_caveats": "retry",
   "launch": "npm run dev"
 }

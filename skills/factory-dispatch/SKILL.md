@@ -29,8 +29,8 @@ Load the project's issues with the Linear MCP (`list_issues` filtered by project
 | `🍎 To do` | no unresolved "blocked by"; body has `## Done when`; this repo has no issue currently `In Progress` | **claim then start** (below) |
 | `🍎 To do` | body lacks `## Done when` | `save_issue` state `👀 Needs Input`; `save_comment`: `factory: needs a "## Done when" section naming one of the checks in .factory/policy.json` |
 | `👩🏻‍💻 In Progress` | newest `factory:` comment older than 2h | PR exists for branch `factory/<ID>` → state `👓 In Review`; else retry (below) |
-| `👓 In Review` | both `factory/judge-*` statuses on the head SHA (`gh api repos/<r>/commits/<sha>/status`) and either description starts with `REFUTED` | retry (below); `save_comment`: `factory: refuted at <sha>: <both descriptions>` |
-| `👓 In Review` | both judge statuses present, any `failure`, none `REFUTED` (i.e. `CAVEATS`) | `save_comment` once: `factory: caveats at <sha>, needs your review`. Kim's. |
+| `👓 In Review` | both `factory/judge-*` statuses on the head SHA (`gh api repos/<r>/commits/<sha>/status`) and either description starts with `REFUTED` | retry (below) with the judge findings |
+| `👓 In Review` | both judge statuses present, any `failure`, none `REFUTED` (i.e. `CAVEATS`) | policy `on_caveats` is `review` → `save_comment` once `factory: caveats at <sha>, needs your review`, Kim's. Otherwise (default `retry`): no `factory: retry` comment yet for this issue → retry (below) with the judge findings; a retry already happened → `save_comment` once `factory: caveats again at <sha> after a retry, needs your review`, Kim's. |
 | `👓 In Review` | PR red / conflicted / closed-unmerged for over 1h | retry (below) |
 | `👓 In Review` | PR merged | state `✅ Done`; `save_comment`: `factory: merged <pr-url>` |
 | `👀 Needs Input`, `⛔️ Blocked`, anything else | — | nothing. Kim's. |
@@ -59,7 +59,17 @@ else git -C "$repo" worktree add -b "factory/$id" "$wt" origin/HEAD; fi         
 
 ### Retry
 
-Count existing `factory: retry N` comments. Next N = count + 1. If N >= 2: state `⛔️ Blocked`, comment `factory: retry budget exhausted (<reason>)`. Else: state `🍎 To do`, comment `factory: retry N (<reason>)`. The next sweep re-dispatches it; the worker reads the retry comment and the judge's findings.
+Count existing `factory: retry N` comments. Next N = count + 1. If N >= 2: state `⛔️ Blocked`, comment `factory: retry budget exhausted (<reason>)`. Else: state `🍎 To do`, comment `factory: retry N (<reason>)` followed by the judge findings (below) when the reason is a verdict. The next sweep re-dispatches it; the worker reads the retry comment and acts on the findings.
+
+### Judge findings (what the worker needs to act on a verdict)
+
+The status descriptions are 140 characters; the findings live in the judge run's transcript artifact. For the head SHA:
+```bash
+run=$(gh run list -R <r> --workflow factory-judge.yml --json databaseId,headSha --jq '[.[]|select(.headSha=="<sha>")][0].databaseId')
+gh run download "$run" -R <r> -n "judge-transcripts-<sha>" -D "$d"
+for m in claude codex; do echo "## $m"; grep -E '^(- |\* |[0-9]+\. |VERDICT)' "$d/$m.txt" | tail -15; done
+```
+Append that output to the retry comment under `Judge findings at <sha>:`, with: "Keep the existing PR and push to its branch. Out of scope is unchanged." A worker must never be sent back without the findings; an empty retry just repeats the same mistake.
 
 ## Report
 
