@@ -22,7 +22,7 @@ Run: `KEYCARD_ZONE=<zone> keycard agent exec --config keycard.toml --zone <zone>
 
 ## Local files
 
-Three files are gitignored and live only on the host: `keycard.toml` (org and zone ids plus the two `[[credentials.default]]` entries, `GH_TOKEN` and `LINEAR_TOKEN`), `templates/ai.keycard.factory.dispatch.plist` (the LaunchAgent that runs `scripts/dispatch.sh` under `keycard agent exec`), and `docs/keycard-setup.md` (the Keycard, GitHub App and Linear setup steps). They hold identifiers and host paths, not secrets; they stay out of the repo so the public history describes the design, not one machine.
+Three files are gitignored and live only on the host: `keycard.toml` (org and zone ids plus the two `[[credentials.default]]` entries, `GH_TOKEN` and `LINEAR_TOKEN`), `templates/ai.keycard.factory.dispatch.plist` (the LaunchAgent that runs `scripts/dispatch.sh` under `keycard agent exec`), and `docs/keycard-setup.md` (the Keycard, GitHub App and Linear setup steps). They hold identifiers and host paths, not secrets; they stay out of the repo so the public history describes the design, not one machine. Their copies for the mini, the install commands, and the host notes that `docs/mini.md` replaces with placeholders live in the private repo [kmaida/factory-host](https://github.com/kmaida/factory-host).
 
 ## Mini
 
