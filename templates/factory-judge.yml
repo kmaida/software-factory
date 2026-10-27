@@ -13,14 +13,17 @@
 #                   transcript, all as inline text. The model's tools are read-only (Claude: --tools Read,Grep,Glob;
 #                   Codex: --sandbox read-only); nothing executes PR code here. The verdict is a job output, never
 #                   an artifact, and the model runs without GITHUB_ENV/PATH/OUTPUT so it cannot poison later steps.
-#   post          — statuses:write only: fails closed when a verdict is missing or malformed. A VERIFIED status
-#                   carries "VERIFIED <run id> <HMAC-SHA256(FACTORY_JUDGE_KEY, "<pr>:<head>:<base>:<run id>:<model>:VERIFIED")>";
-#                   the merge gate verifies that, never the context name, because any PR-added workflow can post a
-#                   status. Binding base and run id means a re-judge of the same head, or a base that moved, revokes it.
-# Trigger is pull_request_target: this definition, the prompt and the policy always come from the BASE branch; a PR
-# cannot rewrite the workflow that judges it. Every secret lives in the GitHub Environment "factory", whose deployment
-# branch policy allows only the default branch: environment access is decided on github.ref, which for
-# pull_request_target is the PR's base branch, so a PR targeting any other branch, or any pull_request run, gets nothing.
+#   post          — statuses:write only: fails closed when a verdict is missing or malformed. Every status reads
+#                   "<VERDICT> <run id> <HMAC-SHA256(FACTORY_JUDGE_KEY, "<pr>:<head>:<base>:<run id>:<model>:<VERDICT>")>".
+#                   The merge gate verifies signatures, never context names (any PR-added workflow can post a status),
+#                   and takes the signed verdict with the HIGHEST run id per model: statuses are append-only, so a signed
+#                   REFUTED from a later re-judge cannot be erased or outranked by replaying an older signed VERIFIED.
+# Trigger is pull_request_target: since 2025-12-08 GitHub takes this definition, and github.ref, from the DEFAULT branch
+# whatever the PR's base is, so a PR cannot rewrite the workflow that judges it. The prompt and the policy are read from
+# the PR's base commit, so the checks job refuses to start unless that base IS the default branch (a PR author can
+# retarget their PR to a branch carrying a permissive policy). Every secret lives in the GitHub Environment "factory",
+# whose deployment branch policy allows only the default branch: environment rules evaluate against github.ref, which is
+# refs/pull/N/merge for any pull_request run, so a PR-added workflow gets nothing.
 # Needs environment "factory" with ANTHROPIC_API_KEY, OPENAI_API_KEY, FACTORY_JUDGE_KEY (see factory-onboard).
 # ponytail: the CLI install lines may need a bump.
 name: factory-judge
@@ -34,7 +37,8 @@ env:
   BASE: ${{ github.event.pull_request.base.sha }}
 jobs:
   checks:
-    if: contains(github.event.pull_request.labels.*.name, 'factory')
+    # base must be the default branch: policy and prompt are read from the base commit, and the PR author picks the base
+    if: contains(github.event.pull_request.labels.*.name, 'factory') && github.event.pull_request.base.ref == github.event.repository.default_branch
     runs-on: ubuntu-latest
     permissions: {}
     steps:
@@ -44,9 +48,12 @@ jobs:
         id: run
         run: |
           p="$RUNNER_TEMP/policy.json"; git show "$BASE:.factory/policy.json" > "$p"
+          # The containers get an EXPORT of the PR tree, never the checkout: a writable .git/config (core.fsmonitor and
+          # friends) would be executed on the host by git during actions/checkout's post-job cleanup.
+          w="$RUNNER_TEMP/w"; mkdir -p "$w"; git archive --format=tar "$HEAD" | tar -x -C "$w"
           # check_env / check_setup come from BASE policy: the same env and prep the repo's CI uses for its checks
           { echo HOME=/tmp; jq -r '.check_env // {} | to_entries[] | "\(.key)=\(.value)"' "$p"; } > "$RUNNER_TEMP/check.env"
-          run() { docker run --rm -u "$(id -u):$(id -g)" --env-file "$RUNNER_TEMP/check.env" -v "$PWD:/w" -w /w "$@"; }
+          run() { docker run --rm -u "$(id -u):$(id -g)" --env-file "$RUNNER_TEMP/check.env" -v "$w:/w" -w /w "$@"; }
           # networked container: install from the PR's lockfile (nothing executes unless BASE policy sets install_scripts), then check_setup
           { echo "npm ci $([ "$(jq -r '.install_scripts // false' "$p")" = true ] || echo --ignore-scripts)"; jq -r '.check_setup[]?' "$p"; } > "$RUNNER_TEMP/setup.sh"
           run -v "$RUNNER_TEMP/setup.sh:/setup.sh:ro" node:24 bash -e /setup.sh
@@ -81,7 +88,7 @@ jobs:
         run: |
           git show "$BASE:.factory/refute-prompt.md" > "$RUNNER_TEMP/refute-prompt.md"
           git diff "$BASE" "$HEAD" > "$RUNNER_TEMP/diff.patch"
-          python3 - <<'PY'
+          python3 -I - <<'PY'   # -I: no cwd on sys.path, so a PR-added re.py or os.py is never imported
           import os, re; t=os.environ["RUNNER_TEMP"]; e=os.environ
           d=open(f"{t}/diff.patch",errors="replace").read()
           v={"PR_TITLE":e["TITLE"],"PR_BODY":e["BODY"],"PR_URL":e["URL"],"HEAD_SHA":e["HEAD"],"BASE_SHA":e["BASE"],
@@ -121,7 +128,7 @@ jobs:
         run: |
           git show "$BASE:.factory/refute-prompt.md" > "$RUNNER_TEMP/refute-prompt.md"
           git diff "$BASE" "$HEAD" > "$RUNNER_TEMP/diff.patch"
-          python3 - <<'PY'
+          python3 -I - <<'PY'   # -I: no cwd on sys.path, so a PR-added re.py or os.py is never imported
           import os, re; t=os.environ["RUNNER_TEMP"]; e=os.environ
           d=open(f"{t}/diff.patch",errors="replace").read()
           v={"PR_TITLE":e["TITLE"],"PR_BODY":e["BODY"],"PR_URL":e["URL"],"HEAD_SHA":e["HEAD"],"BASE_SHA":e["BASE"],
@@ -173,12 +180,11 @@ jobs:
           for m in claude codex; do
             v=$([ $m = claude ] && echo "$V_CLAUDE" || echo "$V_CODEX")
             d=$v
-            case $v in VERIFIED|CAVEATS|REFUTED) ;; *) v=CAVEATS; d="CAVEATS: no verdict from $m (model error)";; esac   # missing → blocks merge, needs a human, no retry churn
-            [ "$CHECKS" = success ] || { v=REFUTED; d="REFUTED: a policy check failed"; }                     # any failing check → refuted
-            if [ $v = VERIFIED ]; then
-              st=success; d="VERIFIED $GITHUB_RUN_ID $(printf '%s' "$N:$HEAD:$BASE:$GITHUB_RUN_ID:$m:VERIFIED" | openssl dgst -sha256 -mac HMAC -macopt "key:$KEY" | awk '{print $NF}')"
-            else st=failure; all=0; fi
-            gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD" -f state="$st" -f context="factory/judge-$m" -f description="${d:0:140}" >/dev/null
-            echo "factory/judge-$m=$st ($v)"
+            case $v in VERIFIED|CAVEATS|REFUTED) ;; *) v=CAVEATS; echo "no verdict from $m (model error): CAVEATS";; esac   # missing → blocks merge, needs a human, no retry churn
+            [ "$CHECKS" = success ] || { v=REFUTED; echo "a policy check failed: REFUTED"; }                      # any failing check → refuted
+            d="$v $GITHUB_RUN_ID $(printf '%s' "$N:$HEAD:$BASE:$GITHUB_RUN_ID:$m:$v" | openssl dgst -sha256 -mac HMAC -macopt "key:$KEY" | awk '{print $NF}')"
+            if [ $v = VERIFIED ]; then st=success; else st=failure; all=0; fi
+            gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD" -f state="$st" -f context="factory/judge-$m" -f description="$d" >/dev/null
+            echo "factory/judge-$m=$st ($v, run $GITHUB_RUN_ID)"
           done
           [ $all = 1 ]   # the run's conclusion is honest for humans; the merge gate trusts the signatures, not this
