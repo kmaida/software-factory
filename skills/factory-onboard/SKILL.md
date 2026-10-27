@@ -5,7 +5,7 @@ description: Onboard an existing repo (and its existing Linear project, if any) 
 
 # Factory onboard
 
-Arguments: local repo path; optional Linear project id (e.g. `P-KIM-206`).
+Arguments: local repo path; Linear project id (e.g. `P-KIM-206`, or the project's UUID). Run under `keycard agent exec --config "${CLAUDE_PLUGIN_ROOT}/keycard.toml" --zone <zone> -- claude ...` or let `scripts/linear.sh` re-exec itself under it; either way the Linear check below uses the brokered `LINEAR_TOKEN`, never a personal login.
 
 ## 1. Preflight (read-only, print a short report)
 
@@ -32,7 +32,7 @@ Then tell Kim the three things only she can do, with exact commands: (a) branch 
 
 ## 3. Registry
 
-Linear project: given id → verify with `get_project`; none given → `list_projects` for team KIM and ask which, or `save_project` named after the repo. Then:
+Linear project: `"${CLAUDE_PLUGIN_ROOT}/scripts/linear.sh" issues <project id> | jq '.project'` must print the project (name, identifier, url); a failure means the id is wrong or the brokered token cannot see the project, and onboarding stops there. No project id given → ask Kim to create one in Linear (team KIM) and pass its identifier; the factory never creates or lists projects. Then:
 ```bash
 mkdir -p ~/.factory && touch ~/.factory/registry.json
 jq --arg p "<project id>" --arg r "<abs repo path>" '. + {($p): $r}' ~/.factory/registry.json > ~/.factory/registry.tmp && mv ~/.factory/registry.tmp ~/.factory/registry.json
