@@ -6,14 +6,14 @@ Set up 2026-10-26. The mini runs the dispatcher every 30 minutes as a dedicated,
 
 | User | Role |
 |---|---|
-| `factory` (uid 501, admin) | Admin only: `sudo` for power, sharing, Tailscale, FileVault. Owns nothing the factory runs. |
-| `softwarefactory` (uid 502, not admin) | Runs everything: clones, logins, LaunchAgent, workers. Owns `/opt/homebrew` (`sudo chown -R softwarefactory:admin /opt/homebrew` once, as `factory`). |
+| `kimmaida` (uid 503, admin) | Admin only: `sudo` for power, sharing, Tailscale, FileVault. Owns nothing the factory runs. (The original admin account `factory` was removed on 2026-10-27.) |
+| `softwarefactory` (uid 502, not admin) | Runs everything: clones, logins, LaunchAgent, workers. Owns `/opt/homebrew` (`sudo chown -R softwarefactory:admin /opt/homebrew`, run as the admin; re-run after any admin-account change, which re-owns it). |
 
 ## Pinned tooling (as installed)
 
 | Tool | Version | Source |
 |---|---|---|
-| macOS | 27.0 (26A425), arm64 | |
+| macOS | 27.2 (26B123), arm64 | |
 | Xcode Command Line Tools | present at `/Library/Developer/CommandLineTools` | Apple |
 | Homebrew | 7.0.11 | `/opt/homebrew` |
 | fnm | 1.39.0 | `brew install fnm` |
@@ -44,7 +44,7 @@ Set up 2026-10-26. The mini runs the dispatcher every 30 minutes as a dedicated,
 | Claude Code | claude.ai device/browser login (Keycard enterprise org, as Kim) | `claude auth status` |
 | Keycard | `keycard auth signin --device --org p48htojvia150hqw8n22g00d4i --zone 1jgewf106fax3oaf70vyykwj2i` (two codes: org, then zone), then `keycard auth resource urn:github:factory --zone 1jgewf106fax3oaf70vyykwj2i` | `keycard credential read --zone 1jgewf106fax3oaf70vyykwj2i urn:github:factory` |
 | GitHub (Kim, for cloning the private plugin repo and this PR) | `gh auth login -h github.com -p https -w` | `gh auth status` |
-| Linear MCP | the claude.ai Linear connector comes with the Claude login and is already connected; the plugin's own server (`plugin:linear:linear`) is a one-time browser OAuth from an interactive `claude` session via `/mcp` | `claude mcp list \| grep -i linear` |
+| Linear MCP | the claude.ai Linear connector comes with the Claude login and is already connected; the plugin's own server (`plugin:linear:linear`) is a one-time browser OAuth from an interactive `claude` session via `/mcp` (done 2026-10-27, shows Connected) | `claude mcp list \| grep -i linear` |
 
 Workers never hold a GitHub token: `keycard agent exec --config keycard.toml` brokers it in as `GH_TOKEN`. Verified on the mini:
 
@@ -75,9 +75,9 @@ Fire one sweep now: `launchctl kickstart gui/$(id -u)/ai.keycard.factory.dispatc
 KEYCARD_ZONE=1jgewf106fax3oaf70vyykwj2i claude -p "/factory:factory-dispatch" --plugin-dir ~/Documents/Development/factory --permission-mode bypassPermissions
 ```
 
-A LaunchAgent lives in the user's GUI session: it starts when `softwarefactory` logs in, which automatic login does at every boot (next section).
+A LaunchAgent lives in the user's GUI session: it starts when `softwarefactory` logs in, which automatic login does at every boot (next section). Reboot test 2026-10-27: Tailscale and the agent came back on their own and the RunAtLoad sweep exited 0.
 
-## Always-on (admin, as `factory`)
+## Always-on (admin, as `kimmaida`)
 
 ```bash
 sudo pmset -a sleep 0 disksleep 0 autorestart 1
@@ -87,13 +87,13 @@ sudo systemsetup -setremotelogin on
 
 Screen Sharing and Automatic login are System Settings switches (General → Sharing; Users & Groups → Automatic login). Tailscale is the standalone app from tailscale.com installed into `/Applications` as admin, signed in to Kim's free tailnet, with its network extension approved. The VPN is a system extension that launchd runs at the system level, so it is up after boot without the menu bar app or a logged-in user. Machine name `kims-mac-mini` (`kims-mac-mini.tailcd6b2c.ts.net`, 100.83.157.111). Reach it with `ssh softwarefactory@kims-mac-mini` once Remote Login is on, or Screen Sharing to the same name.
 
-Screen Sharing and Remote Login must allow `softwarefactory` (the default is administrators only): as `factory`, `sudo dseditgroup -o edit -a softwarefactory -t user com.apple.access_screensharing` and the same with `com.apple.access_ssh`, or System Settings → General → Sharing → (i) → "Allow access for".
+Screen Sharing and Remote Login must allow `softwarefactory` (the default is administrators only): as the admin, `sudo dseditgroup -o edit -a softwarefactory -t user com.apple.access_screensharing` and the same with `com.apple.access_ssh`, or System Settings → General → Sharing → (i) → "Allow access for".
 
 ### From the laptop
 
 ```bash
 open vnc://softwarefactory@kims-mac-mini     # Screen Sharing into the factory session (tick "remember in keychain" once)
-open vnc://factory@kims-mac-mini             # the admin desktop; pick the virtual display when asked
+open vnc://kimmaida@kims-mac-mini            # the admin desktop; pick the virtual display when asked
 ssh mini                                     # with the stanza below in ~/.ssh/config
 ```
 
