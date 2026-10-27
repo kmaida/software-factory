@@ -309,4 +309,8 @@ Run against `git diff main...HEAD` after A0 was implemented in the templates. Al
 |---|---|---|---|
 | State that `check_setup` left outside the workspace (`/tmp`, `$HOME` caches) was gone when the checks ran in a fresh container | BLOCKER | Yes, regression for such policies | One host directory is mounted as `/tmp` (which is `HOME`) in both containers |
 
+### Implementation of A0, seventh pass: VERIFIED
+
+"No new findings beyond the documented residuals and dispositions." Seven passes on the implementation: 5, 3, 3, 3, 1, 1, 0 findings. Four of the sixteen were pre-existing holes in the judge template (python import from the PR checkout, `pull_request` trigger, repository secrets, status-by-name gate); the rest were defects in this branch's own first drafts, three of them regressions that a reviewer with the old template open caught.
+
 Not adopted, any round: "continuous external checkpoints" and "authenticated completion records" for the log, and per-run gateway authorization as a Phase A item. Each is the Phase B broker by another name; adding them to Phase A would be the same work twice.
