@@ -9,7 +9,7 @@ Arguments: local repo path; Linear project id (e.g. `P-KIM-206`, or the project'
 
 ## 1. Preflight (read-only, print a short report)
 
-From the repo: default branch (`git symbolic-ref refs/remotes/origin/HEAD`), `owner/repo` from the remote, package manager (lockfile present), the test and build commands from the manifest, CI workflow files and their check names (`gh api repos/<r>/commits/<default>/check-runs --jq '.check_runs[].name' | sort -u`), whether `CLAUDE.md`, `.factory/`, `.github/workflows/factory-merge.yml`, branch protection (`gh api repos/<r>/branches/<default>/protection`, 404 = none) exist. Run the test command once; record pass/fail and any pre-existing failures as the baseline in the report.
+From the repo: default branch (`git symbolic-ref refs/remotes/origin/HEAD`), `owner/repo` from the remote, package manager (lockfile present), the test and build commands from the manifest, CI workflow files and their check names (`gh api repos/<r>/commits/<default>/check-runs --jq '.check_runs[].name' | sort -u`), whether `CLAUDE.md`, `.factory/`, `.github/workflows/factory-merge.yml`, branch protection (`gh api repos/<r>/branches/<default>/protection`, 404 = none) exist, and the effective rules on the default branch with their bypass lists (`gh api repos/<r>/rules/branches/<default>`, then `gh api repos/<r>/rulesets/<id> --jq .bypass_actors` for each ruleset). Run the test command once; record pass/fail and any pre-existing failures as the baseline in the report.
 
 If there is no test command or no CI: say so; the policy gets `auto_merge: false` and the first factory issue should be a smoke test.
 
@@ -28,11 +28,10 @@ gh label create factory -R <owner/repo> --color F2C94C --description "Opened by 
 ```
 Open the PR with `gh pr create --title "factory: onboard" --body` listing the preflight report. Kim merges it.
 
-Then tell Kim the things only she can do, with exact commands:
-- (a) branch protection on the default branch requiring the CI check names from the preflight, "require branches to be up to date", and restricting who can push;
-- (b) a GitHub App for merging with `contents: write` + `pull_requests: write`, installed on the repo, with `FACTORY_APP_ID` as a repo variable;
-- (c) `gh variable set FACTORY_PAUSED -b false -R <r>`;
-- (d) the `factory` environment, which is the **only** place any factory secret may live. A same-repo PR can add a workflow that prints repository secrets; environment secrets are released only to runs whose `github.ref` matches the deployment branch policy, and for the judge and merge workflows (`pull_request_target`) that ref is the PR's base branch:
+Then tell Kim the five things only she can do, with exact commands, in this order:
+- (a) a ruleset on the default branch (classic protection's "restrict who can push" is organization-only): Restrict updates, the CI check names from the preflight as required status checks with "require branches to be up to date", block force pushes, restrict deletions, and a bypass list holding the merge App only;
+- (b) a GitHub App for merging with `contents: write` + `pull_requests: write`, installed on the repo, with `FACTORY_APP_ID` as a repo variable (its private key goes in the environment below, never in a repository secret);
+- (c) the `factory` environment, which is the **only** place any factory secret may live. A same-repo PR can add a workflow that prints repository secrets; environment secrets are released only to runs whose `github.ref` matches the deployment branch policy. For the judge and merge workflows (`pull_request_target`, `workflow_run`) that ref is the default branch; for any `pull_request` run it is `refs/pull/N/merge`, which never matches:
 ```bash
 r=<owner/repo>; d=<default branch>
 gh api -X PUT "repos/$r/environments/factory" --input - <<'J'
@@ -48,6 +47,8 @@ gh secret list -R "$r"   # must show no factory secret
 gh api -X PUT "repos/$r/actions/permissions/workflow" -f default_workflow_permissions=read -F can_approve_pull_request_reviews=false
 ```
   On a repo that already had these as repository secrets, rotate all three after the move: they were readable by every worker PR until now.
+- (d) the merge-denial check: the worker's brokered token has `contents: write`, which is enough to merge, and it acts as Kim, so the ruleset is the only thing that stops a local process from merging. In a disposable public repo with the same ruleset and both Apps installed, a merge of a PR into the default branch and a push to it, both with the brokered token, must be denied (the host doc `docs/keycard-setup.md`, step 8, has the exact commands). If either succeeds, the bypass list is letting the worker through and must change before the next step;
+- (e) only then `gh variable set FACTORY_PAUSED -b false -R <r>`.
 
 ## 3. Registry
 
@@ -60,4 +61,4 @@ jq --arg p "<project id>" --arg r "<abs repo path>" '. + {($p): $r}' ~/.factory/
 
 ## 4. Report
 
-Preflight summary, PR URL, the Kim-only steps, and the registry row.
+Preflight summary, PR URL, the five Kim-only steps in order (the merge-denial check before unpausing), and the registry row.

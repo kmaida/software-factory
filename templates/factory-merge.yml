@@ -9,9 +9,11 @@
 # run. Context names prove nothing (any PR-added workflow can post a status); replaying an older signed VERIFIED cannot
 # outrank a later signed REFUTED; re-run attempts cannot be mixed; a moved base invalidates all.
 # Residual: a PR retargeted to an unprotected branch in the instant between the final base re-check and `gh pr merge`
-# would be merged into that branch by the App; the worst case is an App commit on a worker-owned branch, never on main. Secrets live in the GitHub Environment "factory" (default branch only):
-# FACTORY_APP_PRIVATE_KEY, FACTORY_JUDGE_KEY. Also needs repo var FACTORY_APP_ID, var FACTORY_PAUSED, branch
-# protection on the default branch (required CI, up to date, pushes restricted to the merge App).
+# would be merged into that branch by the App; the worst case is an App commit on a worker-owned branch, never on main.
+# Secrets live in the GitHub Environment "factory" (default branch only): FACTORY_APP_PRIVATE_KEY, FACTORY_JUDGE_KEY.
+# Also needs repo var FACTORY_APP_ID, var FACTORY_PAUSED, and a ruleset on main (required CI, up to date, restrict
+# updates) whose only bypass is the merge App: the worker's token has contents:write and acts as the owner, so the
+# bypass list, not the scopes, is what keeps it from merging.
 # ponytail: untested until Phase 2; the gate script is tested, this plumbing is not.
 name: factory-merge
 on:
