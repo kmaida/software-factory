@@ -13,9 +13,11 @@
 # assignee, labels, blockedBy [{identifier, state, resolved}], blocks [identifier], comments [{createdAt, user, body}]
 # (comments oldest first).
 #
-# Auth: LINEAR_TOKEN, brokered in by `keycard agent exec --config keycard.toml` (resource urn:linear:factory). When it is
-# unset and keycard is on PATH, the script re-runs itself under keycard agent exec, so by-hand use is brokered and
-# audited too. Any failure, including a rejected token, is exit 1 with the reason on stderr; nothing is retried.
+# Auth: LINEAR_TOKEN, brokered in by `keycard agent exec --config keycard.toml` (resource urn:linear:factory). It is
+# either a personal API key (lin_api_..., sent bare, as Linear documents) or an OAuth access token (sent as Bearer).
+# When it is unset and keycard is on PATH, the script re-runs itself under keycard agent exec, so by-hand use is
+# brokered and audited too. Any failure, including a rejected token, is exit 1 with the reason on stderr; nothing
+# is retried.
 set -euo pipefail
 
 api=https://api.linear.app/graphql
@@ -30,17 +32,20 @@ if [[ -z ${LINEAR_TOKEN:-} ]]; then
   FACTORY_LINEAR_REEXEC=1 exec keycard agent exec --config "$here/../keycard.toml" ${KEYCARD_ZONE:+--zone "$KEYCARD_ZONE"} -- "$0" "$@"
 fi
 
+# Personal API keys go bare in the Authorization header; OAuth access tokens take the Bearer scheme.
+if [[ $LINEAR_TOKEN == lin_api_* ]]; then auth=$LINEAR_TOKEN; else auth="Bearer $LINEAR_TOKEN"; fi
+
 # gql <query> <variables-json>: prints .data, or dies with Linear's error.
 gql() {
   local body out code json
   body=$(jq -n --arg q "$1" --argjson v "$2" '{query: $q, variables: $v}')
   out=$(curl -sS -w '\n%{http_code}' -X POST "$api" \
-        -H "Authorization: Bearer $LINEAR_TOKEN" -H 'Content-Type: application/json' --data "$body") \
+        -H "Authorization: $auth" -H 'Content-Type: application/json' --data "$body") \
     || die "cannot reach $api"
   code=${out##*$'\n'}; json=${out%$'\n'*}
   case $code in
     200|400) ;;
-    401|403) die "Linear token rejected (HTTP $code); re-consent with: keycard auth resource --zone <zone> urn:linear:factory" ;;
+    401|403) die "Linear token rejected (HTTP $code); check the urn:linear:factory resource in Keycard (API key revoked or missing Read/Write?)" ;;
     *) die "HTTP $code from Linear: $(printf %s "$json" | head -c 300)" ;;
   esac
   if printf %s "$json" | jq -e '(.errors // []) | length > 0' >/dev/null; then

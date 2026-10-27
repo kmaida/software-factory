@@ -14,5 +14,5 @@ resource = "urn:github:factory"   # external OAuth resource backed by the single
 env_var = "GH_TOKEN"
 
 [[credentials.default]]
-resource = "urn:linear:factory"   # external OAuth resource backed by the factory Linear OAuth app (scopes read, write)
+resource = "urn:linear:factory"   # catalog Linear resource backed by a personal API key (Read + Write, team KIM) held by Keycard
 env_var = "LINEAR_TOKEN"          # read by scripts/linear.sh; nothing else talks to Linear
