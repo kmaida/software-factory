@@ -3,10 +3,13 @@
 # from the DEFAULT branch, whatever the PR's base. The gate script and policy are read from the PR's base commit, so
 # the gate refuses any PR whose base is not the default branch BEFORE reading anything from it: a PR author can
 # retarget their PR to a branch carrying a hostile gate script. PR code is diffed, never executed.
-# Verdicts: every judge status is "<VERDICT> <run id> <HMAC over pr:head:base:run:model:verdict>". The gate verifies
-# every signature on the head (the status list is append-only), keeps the signed verdict with the highest run id per
-# model, and merges only if both are VERIFIED from one run. Context names prove nothing (any PR-added workflow can post
-# a status); replaying an older signed VERIFIED cannot outrank a later signed REFUTED; a moved base invalidates all. Secrets live in the GitHub Environment "factory" (default branch only):
+# Verdicts: every judge status is "<VERDICT> <run> <attempt> <HMAC over pr:head:base:run:attempt:model:verdict>". The
+# gate verifies every signature on the head (the status list is append-only, and the fetch fails closed), keeps the
+# signed verdict with the highest (run, attempt) per model, and merges only if both are VERIFIED from one attempt of one
+# run. Context names prove nothing (any PR-added workflow can post a status); replaying an older signed VERIFIED cannot
+# outrank a later signed REFUTED; re-run attempts cannot be mixed; a moved base invalidates all.
+# Residual: a PR retargeted to an unprotected branch in the instant between the final base re-check and `gh pr merge`
+# would be merged into that branch by the App; the worst case is an App commit on a worker-owned branch, never on main. Secrets live in the GitHub Environment "factory" (default branch only):
 # FACTORY_APP_PRIVATE_KEY, FACTORY_JUDGE_KEY. Also needs repo var FACTORY_APP_ID, var FACTORY_PAUSED, branch
 # protection on the default branch (required CI, up to date, pushes restricted to the merge App).
 # ponytail: untested until Phase 2; the gate script is tested, this plumbing is not.
@@ -58,26 +61,30 @@ jobs:
         run: |
           bad=$(gh pr checks "$N" -R "$GITHUB_REPOSITORY" --json name,state --jq '[.[] | select(.name|startswith("factory/judge-")|not) | select(.state!="SUCCESS")] | length')
           echo "ok=$([ "$bad" = 0 ] && echo 1 || echo 0)" >> "$GITHUB_OUTPUT"
-      - name: Verify signed verdicts (highest-run-id valid signature per model must be VERIFIED; both from one judge run)
+      - name: Verify signed verdicts (highest (run, attempt) valid signature per model must be VERIFIED; both from one attempt)
         if: steps.ci.outputs.ok == '1'
         id: sig
         env: { GH_TOKEN: "${{ github.token }}", N: "${{ steps.pr.outputs.number }}", HEAD: "${{ steps.pr.outputs.head }}", BASE: "${{ steps.pr.outputs.base }}", KEY: "${{ secrets.FACTORY_JUDGE_KEY }}" }
         run: |
           [ -n "$KEY" ] || { echo "FACTORY_JUDGE_KEY is empty" >&2; exit 1; }
           # The full status list is append-only: a PR-added workflow can ADD statuses (unsigned, or replays of old signed
-          # ones) but never remove a signed REFUTED. So: verify every entry's signature against this pr/head/base, ignore
-          # the rest, and let the highest judge run id win. Run ids only grow, so a replay never outranks a later verdict.
+          # ones) but never remove a signed REFUTED. So: fetch the WHOLE list or fail (a partial list is newest-first and
+          # would show only the replays), verify every entry's signature against this pr/head/base, ignore the rest, and
+          # let the highest (run id, attempt) win. Both grow monotonically, so a replay never outranks a later verdict and
+          # two attempts of one run (re-runs keep the run id) cannot be mixed.
+          all=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$HEAD/statuses?per_page=100" --jq '.[] | select(.context|startswith("factory/judge-")) | .context + " " + .description') \
+            || { echo "could not fetch the full status list for $HEAD; refusing" >&2; exit 1; }
           missing=; run=
           for m in claude codex; do
-            best=; bestrun=0
-            while read -r v r s _; do
-              [ -n "$s" ] || continue
-              [ "$s" = "$(printf '%s' "$N:$HEAD:$BASE:$r:$m:$v" | openssl dgst -sha256 -mac HMAC -macopt "key:$KEY" | awk '{print $NF}')" ] || continue
-              [ "$r" -gt "$bestrun" ] 2>/dev/null && { bestrun=$r; best=$v; }
-            done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$HEAD/statuses?per_page=100" --jq ".[] | select(.context==\"factory/judge-$m\") | .description")
+            best=; bestrun=0; bestatt=0
+            while read -r c v r a s _; do
+              [ "$c" = "factory/judge-$m" ] && [ -n "$s" ] || continue
+              [ "$s" = "$(printf '%s' "$N:$HEAD:$BASE:$r:$a:$m:$v" | openssl dgst -sha256 -mac HMAC -macopt "key:$KEY" | awk '{print $NF}')" ] || continue
+              if [ "$r" -gt "$bestrun" ] 2>/dev/null || { [ "$r" -eq "$bestrun" ] && [ "$a" -gt "$bestatt" ]; } 2>/dev/null; then bestrun=$r; bestatt=$a; best=$v; fi
+            done <<<"$all"
             if [ "$best" = VERIFIED ]; then
-              [ -z "$run" ] && run=$bestrun
-              [ "$bestrun" = "$run" ] || missing="$missing factory/judge-$m(run $bestrun != $run)"
+              [ -z "$run" ] && run="$bestrun.$bestatt"
+              [ "$bestrun.$bestatt" = "$run" ] || missing="$missing factory/judge-$m(run $bestrun.$bestatt != $run)"
             else missing="$missing factory/judge-$m(${best:-no valid signature})"; fi
           done
           if [ -n "$missing" ]; then echo "ok=0" >> "$GITHUB_OUTPUT"; echo "out=review: no signed VERIFIED for$missing on ${HEAD:0:7} (base ${BASE:0:7})" >> "$GITHUB_OUTPUT"
@@ -103,7 +110,10 @@ jobs:
         id: app
         uses: actions/create-github-app-token@v2
         with: { app-id: "${{ vars.FACTORY_APP_ID }}", private-key: "${{ secrets.FACTORY_APP_PRIVATE_KEY }}" }
-      - name: Merge
+      - name: Merge (re-check the base at the last instant; --match-head-commit binds only the head)
         if: steps.gate.outputs.verdict == 'low'
-        env: { GH_TOKEN: "${{ steps.app.outputs.token }}", N: "${{ steps.pr.outputs.number }}", HEAD: "${{ steps.pr.outputs.head }}" }
-        run: gh pr merge "$N" -R "$GITHUB_REPOSITORY" --squash --delete-branch --match-head-commit "$HEAD"
+        env: { GH_TOKEN: "${{ steps.app.outputs.token }}", N: "${{ steps.pr.outputs.number }}", HEAD: "${{ steps.pr.outputs.head }}", DEFAULT: "${{ github.event.repository.default_branch }}" }
+        run: |
+          b=$(gh pr view "$N" -R "$GITHUB_REPOSITORY" --json baseRefName --jq .baseRefName)
+          [ "$b" = "$DEFAULT" ] || { echo "base changed to $b after the gate; not merging" >&2; exit 1; }
+          gh pr merge "$N" -R "$GITHUB_REPOSITORY" --squash --delete-branch --match-head-commit "$HEAD"

@@ -14,10 +14,11 @@
 #                   Codex: --sandbox read-only); nothing executes PR code here. The verdict is a job output, never
 #                   an artifact, and the model runs without GITHUB_ENV/PATH/OUTPUT so it cannot poison later steps.
 #   post          — statuses:write only: fails closed when a verdict is missing or malformed. Every status reads
-#                   "<VERDICT> <run id> <HMAC-SHA256(FACTORY_JUDGE_KEY, "<pr>:<head>:<base>:<run id>:<model>:<VERDICT>")>".
+#                   "<VERDICT> <run id> <attempt> <HMAC-SHA256(FACTORY_JUDGE_KEY, "<pr>:<head>:<base>:<run>:<attempt>:<model>:<VERDICT>")>".
 #                   The merge gate verifies signatures, never context names (any PR-added workflow can post a status),
-#                   and takes the signed verdict with the HIGHEST run id per model: statuses are append-only, so a signed
-#                   REFUTED from a later re-judge cannot be erased or outranked by replaying an older signed VERIFIED.
+#                   and takes the signed verdict with the HIGHEST (run id, attempt) per model: statuses are append-only, so
+#                   a signed REFUTED from a later re-judge cannot be erased or outranked by replaying an older signed
+#                   VERIFIED, and verdicts from two attempts of one run (re-runs keep the run id) cannot be mixed.
 # Trigger is pull_request_target: since 2025-12-08 GitHub takes this definition, and github.ref, from the DEFAULT branch
 # whatever the PR's base is, so a PR cannot rewrite the workflow that judges it. The prompt and the policy are read from
 # the PR's base commit, so the checks job refuses to start unless that base IS the default branch (a PR author can
@@ -182,9 +183,9 @@ jobs:
             d=$v
             case $v in VERIFIED|CAVEATS|REFUTED) ;; *) v=CAVEATS; echo "no verdict from $m (model error): CAVEATS";; esac   # missing → blocks merge, needs a human, no retry churn
             [ "$CHECKS" = success ] || { v=REFUTED; echo "a policy check failed: REFUTED"; }                      # any failing check → refuted
-            d="$v $GITHUB_RUN_ID $(printf '%s' "$N:$HEAD:$BASE:$GITHUB_RUN_ID:$m:$v" | openssl dgst -sha256 -mac HMAC -macopt "key:$KEY" | awk '{print $NF}')"
+            d="$v $GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $(printf '%s' "$N:$HEAD:$BASE:$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT:$m:$v" | openssl dgst -sha256 -mac HMAC -macopt "key:$KEY" | awk '{print $NF}')"
             if [ $v = VERIFIED ]; then st=success; else st=failure; all=0; fi
             gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD" -f state="$st" -f context="factory/judge-$m" -f description="$d" >/dev/null
-            echo "factory/judge-$m=$st ($v, run $GITHUB_RUN_ID)"
+            echo "factory/judge-$m=$st ($v, run $GITHUB_RUN_ID attempt $GITHUB_RUN_ATTEMPT)"
           done
           [ $all = 1 ]   # the run's conclusion is honest for humans; the merge gate trusts the signatures, not this
