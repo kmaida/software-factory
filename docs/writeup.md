@@ -105,6 +105,10 @@ Every one of these came from a review or a real run, and every one is fixed. Kee
 | 10 | Security scan | Git reset before the second model restored the stripped agent config | Strip again after the reset |
 | 11 | Security scan | PR code and secrets in one judge job | Three jobs on fresh runners; verdicts as job outputs; fail closed |
 | 12 | Ponytail pass | Fencing tokens, heartbeats, per-judge environments, dollar budgets, a second pause mechanism | Deleted; one-person scale |
+| 13 | Codex review of the baseline plan | Every factory secret was a repository secret; a worker PR adding one workflow file could print the merge App key and both model keys | All secrets in a default-branch-only GitHub Environment; repository copies deleted; keys rotated |
+| 14 | Codex review of the baseline plan | The gate accepted `factory/judge-*` statuses by context name; a PR-added workflow with `statuses: write` could forge them | Judge signs VERIFIED with an HMAC key only a default-branch run can read; the merge gate recomputes it |
+| 15 | Codex review of the baseline plan | The merge gate ran `.factory/risk-gate.sh` from whatever base the PR named; a PR author can retarget the base | Gate refuses any PR not based on the default branch before reading from it |
+| 16 | Codex review of the baseline plan | The judge workflow ran on `pull_request`, so a PR could rewrite the workflow that judges it; PR code on the runner could poison the base branch's cache | `pull_request_target`; PR code only in throwaway containers, no network during checks |
 
 The pattern across the list: every "security" defect was a trust-boundary mistake (who holds which token, which commit a rule is read from), and every "it doesn't work" defect was an environment assumption that held on my laptop and nowhere else.
 

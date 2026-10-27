@@ -28,7 +28,26 @@ gh label create factory -R <owner/repo> --color F2C94C --description "Opened by 
 ```
 Open the PR with `gh pr create --title "factory: onboard" --body` listing the preflight report. Kim merges it.
 
-Then tell Kim the three things only she can do, with exact commands: (a) branch protection on the default branch requiring the CI check names from the preflight, "require branches to be up to date", and restricting who can push; (b) a GitHub App for merging with `contents: write` + `pull_requests: write`, installed on the repo, with `FACTORY_APP_ID` as a repo variable and `FACTORY_APP_PRIVATE_KEY` as a repo secret; (c) `gh variable set FACTORY_PAUSED -b false -R <r>`; (d) repo secrets `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` for the judge job.
+Then tell Kim the things only she can do, with exact commands:
+- (a) branch protection on the default branch requiring the CI check names from the preflight, "require branches to be up to date", and restricting who can push;
+- (b) a GitHub App for merging with `contents: write` + `pull_requests: write`, installed on the repo, with `FACTORY_APP_ID` as a repo variable;
+- (c) `gh variable set FACTORY_PAUSED -b false -R <r>`;
+- (d) the `factory` environment, which is the **only** place any factory secret may live. A same-repo PR can add a workflow that prints repository secrets; environment secrets are released only to runs whose `github.ref` matches the deployment branch policy, and for the judge and merge workflows (`pull_request_target`) that ref is the PR's base branch:
+```bash
+r=<owner/repo>; d=<default branch>
+gh api -X PUT "repos/$r/environments/factory" --input - <<'J'
+{"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+J
+gh api -X POST "repos/$r/environments/factory/deployment-branch-policies" -f name="$d" -f type=branch
+gh secret set FACTORY_APP_PRIVATE_KEY --env factory -R "$r" < app.pem
+gh secret set ANTHROPIC_API_KEY --env factory -R "$r"
+gh secret set OPENAI_API_KEY --env factory -R "$r"
+gh secret set FACTORY_JUDGE_KEY --env factory -R "$r" --body "$(openssl rand -hex 32)"   # signs judge verdicts; never read by anything else
+for s in FACTORY_APP_PRIVATE_KEY ANTHROPIC_API_KEY OPENAI_API_KEY; do gh secret delete "$s" -R "$r" 2>/dev/null; done   # no repository-level copies
+gh secret list -R "$r"   # must show no factory secret
+gh api -X PUT "repos/$r/actions/permissions/workflow" -f default_workflow_permissions=read -F can_approve_pull_request_reviews=false
+```
+  On a repo that already had these as repository secrets, rotate all three after the move: they were readable by every worker PR until now.
 
 ## 3. Registry
 
@@ -41,4 +60,4 @@ jq --arg p "<project id>" --arg r "<abs repo path>" '. + {($p): $r}' ~/.factory/
 
 ## 4. Report
 
-Preflight summary, PR URL, the three Kim-only steps, and the registry row.
+Preflight summary, PR URL, the Kim-only steps, and the registry row.

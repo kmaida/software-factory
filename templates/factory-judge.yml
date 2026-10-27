@@ -2,7 +2,10 @@
 # factory/judge-claude and factory/judge-codex commit statuses. Four jobs on fresh runners so that
 # nothing which executes PR code shares a runner with a secret or a token, and the two reviewers share nothing:
 #   checks        — permissions {}, no secrets: runs every allowed check; the STEP FAILS if any check fails, and
-#                   downstream trusts only the job result (PR code can forge outputs/artifacts, not a job result)
+#                   downstream trusts only the job result (PR code can forge outputs/artifacts, not a job result).
+#                   PR code never runs on the runner itself: install happens in a networked throwaway container,
+#                   the checks in a --network none one, so nothing PR-controlled survives into a later step or can
+#                   read a later action's runtime token (this workflow runs in the base branch's cache scope).
 #   judge-claude  — ANTHROPIC_API_KEY only, no GITHUB_TOKEN, own runner
 #   judge-codex   — OPENAI_API_KEY only, no GITHUB_TOKEN, own runner
 #                   Each checks out the PR with its agent config stripped and builds the same prompt from the PR body
@@ -10,12 +13,19 @@
 #                   transcript, all as inline text. The model's tools are read-only (Claude: --tools Read,Grep,Glob;
 #                   Codex: --sandbox read-only); nothing executes PR code here. The verdict is a job output, never
 #                   an artifact, and the model runs without GITHUB_ENV/PATH/OUTPUT so it cannot poison later steps.
-#   post          — statuses:write only: fails closed when a verdict is missing or malformed
-# Needs repo secrets ANTHROPIC_API_KEY, OPENAI_API_KEY. Prompt and policy are read from the BASE commit.
-# ponytail: untested until the first factory PR; the shape is deliberate, the CLI install lines may need a bump.
+#   post          — statuses:write only: fails closed when a verdict is missing or malformed. A VERIFIED status
+#                   carries HMAC-SHA256(FACTORY_JUDGE_KEY, "<pr>:<head>:<model>:VERIFIED"); the merge gate verifies
+#                   that, never the context name, because any PR-added workflow can post a status.
+# Trigger is pull_request_target: this definition, the prompt and the policy always come from the BASE branch; a PR
+# cannot rewrite the workflow that judges it. Every secret lives in the GitHub Environment "factory", whose deployment
+# branch policy allows only the default branch: environment access is decided on github.ref, which for
+# pull_request_target is the PR's base branch, so a PR targeting any other branch, or any pull_request run, gets nothing.
+# Needs environment "factory" with ANTHROPIC_API_KEY, OPENAI_API_KEY, FACTORY_JUDGE_KEY (see factory-onboard).
+# ponytail: the CLI install lines may need a bump.
 name: factory-judge
+run-name: "factory-judge #${{ github.event.pull_request.number }} @ ${{ github.event.pull_request.head.sha }}"
 on:
-  pull_request:
+  pull_request_target:
     types: [labeled, synchronize, opened, reopened]
 permissions: {}
 env:
@@ -29,21 +39,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { ref: "${{ github.event.pull_request.head.sha }}", fetch-depth: 0, persist-credentials: false }
-      - uses: actions/setup-node@v4
-        with: { node-version: 24, cache: npm }
-      - name: Run every allowed check from BASE policy (PR code executes here, with nothing to steal)
+      - name: Run every allowed check from BASE policy in throwaway containers (PR code never runs on the runner)
         id: run
         run: |
-          git show "$BASE:.factory/policy.json" > "$RUNNER_TEMP/policy.json"
+          p="$RUNNER_TEMP/policy.json"; git show "$BASE:.factory/policy.json" > "$p"
           # check_env / check_setup come from BASE policy: the same env and prep the repo's CI uses for its checks
-          while IFS= read -r kv; do export "$kv"; done < <(jq -r '.check_env // {} | to_entries[] | "\(.key)=\(.value)"' "$RUNNER_TEMP/policy.json")
-          while IFS= read -r s; do bash -c "$s"; done < <(jq -r '.check_setup[]?' "$RUNNER_TEMP/policy.json")
-          npm ci
+          { echo HOME=/tmp; jq -r '.check_env // {} | to_entries[] | "\(.key)=\(.value)"' "$p"; } > "$RUNNER_TEMP/check.env"
+          run() { docker run --rm -u "$(id -u):$(id -g)" --env-file "$RUNNER_TEMP/check.env" -v "$PWD:/w" -w /w "$@"; }
+          # networked container: install from the PR's lockfile (nothing executes unless BASE policy sets install_scripts), then check_setup
+          { echo "npm ci $([ "$(jq -r '.install_scripts // false' "$p")" = true ] || echo --ignore-scripts)"; jq -r '.check_setup[]?' "$p"; } > "$RUNNER_TEMP/setup.sh"
+          run -v "$RUNNER_TEMP/setup.sh:/setup.sh:ro" node:24 bash -e /setup.sh
+          # no-network container: the checks themselves
           out="$RUNNER_TEMP/check-output.txt"; : > "$out"; ok=1
           while IFS= read -r c; do
             echo "### $c" >> "$out"
-            if bash -c "$c" >> "$out" 2>&1; then echo "exit 0" >> "$out"; else echo "exit $?" >> "$out"; ok=0; fi
-          done < <(jq -r '.checks[]' "$RUNNER_TEMP/policy.json")
+            if run --network none node:24 bash -c "$c" >> "$out" 2>&1; then echo "exit 0" >> "$out"; else echo "exit $?" >> "$out"; ok=0; fi
+          done < <(jq -r '.checks[]' "$p")
           [ "$ok" = 1 ]   # job result is the only signal downstream trusts
       - uses: actions/upload-artifact@v4
         if: always()
@@ -55,6 +66,7 @@ jobs:
     needs: checks            # runs only when every check passed; otherwise post refutes without spending API calls
     runs-on: ubuntu-latest
     permissions: {}
+    environment: factory     # the API key is readable only when this workflow was taken from the default branch
     outputs: { verdict: "${{ steps.out.outputs.verdict }}" }
     steps:
       - uses: actions/checkout@v4
@@ -94,6 +106,7 @@ jobs:
     needs: checks
     runs-on: ubuntu-latest
     permissions: {}
+    environment: factory
     outputs: { verdict: "${{ steps.out.outputs.verdict }}" }
     steps:
       - uses: actions/checkout@v4
@@ -143,20 +156,28 @@ jobs:
     if: always() && needs.checks.result != 'skipped'
     runs-on: ubuntu-latest
     permissions: { statuses: write }
+    environment: factory     # FACTORY_JUDGE_KEY: only a run of this workflow taken from the default branch can sign
     steps:
-      - name: Post statuses (the only job with a token; fails closed)
+      - name: Post statuses (the only job with a token; VERIFIED is signed; the job fails unless both are VERIFIED)
         env:
           GH_TOKEN: ${{ github.token }}
           CHECKS: ${{ needs.checks.result }}
           V_CLAUDE: ${{ needs.judge-claude.outputs.verdict }}
           V_CODEX: ${{ needs.judge-codex.outputs.verdict }}
+          KEY: ${{ secrets.FACTORY_JUDGE_KEY }}
+          N: ${{ github.event.pull_request.number }}
         run: |
+          [ -n "$KEY" ] || { echo "FACTORY_JUDGE_KEY is empty: environment 'factory' missing, or this run was not taken from the default branch" >&2; exit 1; }
+          all=1
           for m in claude codex; do
             v=$([ $m = claude ] && echo "$V_CLAUDE" || echo "$V_CODEX")
             d=$v
             case $v in VERIFIED|CAVEATS|REFUTED) ;; *) v=CAVEATS; d="CAVEATS: no verdict from $m (model error)";; esac   # missing → blocks merge, needs a human, no retry churn
             [ "$CHECKS" = success ] || { v=REFUTED; d="REFUTED: a policy check failed"; }                     # any failing check → refuted
-            case $v in VERIFIED) st=success;; *) st=failure;; esac
+            if [ $v = VERIFIED ]; then
+              st=success; d="VERIFIED $(printf '%s' "$N:$HEAD:$m:VERIFIED" | openssl dgst -sha256 -mac HMAC -macopt "key:$KEY" | awk '{print $NF}')"
+            else st=failure; all=0; fi
             gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD" -f state="$st" -f context="factory/judge-$m" -f description="${d:0:140}" >/dev/null
             echo "factory/judge-$m=$st ($v)"
           done
+          [ $all = 1 ]   # the run's conclusion is honest for humans; the merge gate trusts the signatures, not this

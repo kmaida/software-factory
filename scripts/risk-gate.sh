@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # risk-gate.sh <repo-dir> <base-sha> <head-sha>
 # exit 0 = low (prints "low"), exit 1 = review (prints the failing rule).
-# Policy is read from the BASE commit, never from the PR. Runs in CI, never by an agent.
+# Policy is read from the BASE commit, never from the PR. Runs in CI, never by an agent, and only after the
+# merge workflow has confirmed the PR's base is the default branch (a retargeted PR must not pick the script).
 set -euo pipefail
 repo=$1 base=$2 head=$3
 cd "$repo"
@@ -45,13 +46,6 @@ while IFS=$'\t' read -r -d '' a d f; do
 done < <(git diff --numstat -z "$base" "$head")
 (( lines <= max )) || review "$lines changed lines > max_lines $max"
 
-if [[ -n ${GITHUB_REPOSITORY:-} ]]; then
-  have=$(gh api "repos/$GITHUB_REPOSITORY/commits/$head/status" \
-      --jq '[.statuses[] | select(.state=="success") | .context] | join(" ")')
-  for c in factory/judge-claude factory/judge-codex; do
-    [[ " $have " == *" $c "* ]] || review "no successful $c status on ${head:0:7}"
-  done
-else
-  echo "note: GITHUB_REPOSITORY unset, judge statuses not checked" >&2
-fi
+# Judge verdicts are NOT checked here: any PR-added workflow can post a factory/judge-* status, so the merge
+# workflow verifies the judge's HMAC signature in its own step, with the key that this script must never see.
 echo low
