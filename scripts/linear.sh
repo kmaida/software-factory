@@ -13,7 +13,7 @@
 # assignee, labels, blockedBy [{identifier, state, resolved}], blocks [identifier], comments [{createdAt, user, body}]
 # (comments oldest first).
 #
-# Auth: LINEAR_TOKEN, brokered in by `keycard agent exec --config keycard.toml` (resource urn:linear:factory). It is
+# Auth: LINEAR_TOKEN, brokered in by `keycard agent exec --config keycard.toml` (resource https://api.linear.app). It is
 # either a personal API key (lin_api_..., sent bare, as Linear documents) or an OAuth access token (sent as Bearer).
 # When it is unset and keycard is on PATH, the script re-runs itself under keycard agent exec, so by-hand use is
 # brokered and audited too. Any failure, including a rejected token, is exit 1 with the reason on stderr; nothing
@@ -45,7 +45,7 @@ gql() {
   code=${out##*$'\n'}; json=${out%$'\n'*}
   case $code in
     200|400) ;;
-    401|403) die "Linear token rejected (HTTP $code); check the urn:linear:factory resource in Keycard (API key revoked or missing Read/Write?)" ;;
+    401|403) die "Linear token rejected (HTTP $code); check the https://api.linear.app resource in Keycard (API key revoked or missing Read/Write?)" ;;
     *) die "HTTP $code from Linear: $(printf %s "$json" | head -c 300)" ;;
   esac
   if printf %s "$json" | jq -e '(.errors // []) | length > 0' >/dev/null; then

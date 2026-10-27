@@ -22,7 +22,7 @@ Set up 2026-10-26. The mini runs the dispatcher every 30 minutes as a dedicated,
 | jq | 1.7.1 | macOS built-in (`/usr/bin/jq`) |
 | keycard | 0.0.38 | `brew install --cask keycardai/tap/keycard` (binary cask, no admin) |
 | claude | 2.1.310 | native installer in `~/.local/bin`; self-updates in `~/.local/share/claude/versions` |
-| Claude Code plugin `linear@claude-plugins-official` | disabled | was the unbrokered Linear path until 2026-10-27; `claude plugin disable linear@claude-plugins-official` once `urn:linear:factory` works |
+| Claude Code plugin `linear@claude-plugins-official` | disabled | was the unbrokered Linear path until 2026-10-27; `claude plugin disable linear@claude-plugins-official` once `https://api.linear.app` works |
 
 `~/.zshrc` and `~/.zprofile` put `/opt/homebrew/bin` on PATH and run `fnm env --use-on-cd`. Launchd does not read either, so the plist carries its own PATH (below). Codex is not installed; the judge runs in GitHub Actions.
 
@@ -42,7 +42,7 @@ Set up 2026-10-26. The mini runs the dispatcher every 30 minutes as a dedicated,
 | Session | How it was created | Check |
 |---|---|---|
 | Claude Code | claude.ai device/browser login (Keycard enterprise org, as Kim) | `claude auth status` |
-| Keycard | `keycard auth signin --device --org p48htojvia150hqw8n22g00d4i --zone 1jgewf106fax3oaf70vyykwj2i` (two codes: org, then zone), then `keycard auth resource --zone 1jgewf106fax3oaf70vyykwj2i urn:github:factory` (`urn:linear:factory` is backed by a personal API key held by Keycard, so it needs no browser consent) | `keycard credential read --zone 1jgewf106fax3oaf70vyykwj2i urn:github:factory` and `... urn:linear:factory` |
+| Keycard | `keycard auth signin --device --org p48htojvia150hqw8n22g00d4i --zone 1jgewf106fax3oaf70vyykwj2i` (two codes: org, then zone), then one consent per resource: `keycard auth resource --zone 1jgewf106fax3oaf70vyykwj2i urn:github:factory` and `... https://api.linear.app` (the Linear resource is backed by a personal API key held by Keycard's vault, and still needs the grant) | `keycard credential read --zone 1jgewf106fax3oaf70vyykwj2i urn:github:factory` and `... https://api.linear.app` |
 | GitHub (Kim, for cloning the private plugin repo and this PR) | `gh auth login -h github.com -p https -w` | `gh auth status` |
 
 No factory process holds a GitHub or Linear token: `keycard agent exec --config keycard.toml` brokers them in as `GH_TOKEN` and `LINEAR_TOKEN` (`scripts/linear.sh` is the only Linear client). The Linear MCP plugin is no longer used; the claude.ai Linear connector that comes with the Claude login stays for interactive sessions only. Verified on the mini:

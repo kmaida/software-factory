@@ -10,7 +10,7 @@ So Keycard gives the factory: credentials brokered into each process with nothin
 | Capability | Where | Credential |
 |---|---|---|
 | push `factory/*`, open/update PR, read PRs, variables, Actions artifacts and commit statuses | local worker / dispatch | the one brokered GitHub token (`urn:github:factory`) |
-| read the queue, move issues between states, assign, comment | local worker / dispatch, only via `scripts/linear.sh` | the one brokered Linear token (`urn:linear:factory`) |
+| read the queue, move issues between states, assign, comment | local worker / dispatch, only via `scripts/linear.sh` | the one brokered Linear token (`https://api.linear.app`) |
 | post `factory/judge-*` statuses | **GitHub Actions** (judge job) | the workflow's own `GITHUB_TOKEN` |
 | merge | GitHub Actions (merge job) | merge App token from Actions secrets |
 
@@ -32,11 +32,11 @@ Every local process, dispatch included, runs as `keycard agent exec --config key
    | `kmaida-factory` | Select permissions: **Read** and **Write** only. Not Admin, not Create issues (the factory never creates issues; Write already covers it), not Create comments on its own (Write covers `commentCreate`, and Create comments alone cannot change state). Teams: **KIM only**. | local worker + dispatch via Keycard, only through `scripts/linear.sh` | the key → Keycard, and nowhere else |
    Every request acts as Kim (as the factory's GitHub pushes do). The key does not expire; it is revoked from the same page, and the factory then fails loudly on the next sweep.
 3. **Keycard**: Resources → add GitHub from the catalog once, with `kmaida-factory`'s client id/secret (this creates the zone's GitHub provider). Identifier `urn:github:factory`. Credential provider: that GitHub provider. Provided by: nobody. Scopes: default.
-   Then Resources → add Linear from the catalog once ("Protect Linear API with Keycard"), filling **Personal API Key** and leaving Client ID / Client Secret empty. Identifier `urn:linear:factory`. Provided by: nobody. Keycard keeps the key; local processes only ever receive the credential it brokers for `urn:linear:factory` through `keycard agent exec`, one audited exchange per process, and `scripts/linear.sh` sends it as Linear expects (a `lin_api_…` key bare, anything else as `Bearer`).
-4. **Consent**, once per resource, from a browser machine signed in to Keycard as Kim (for the key-backed Linear resource this is a no-op if Keycard reports nothing to authorize):
+   Then Resources → add Linear from the catalog once ("Protect Linear API with Keycard"), filling **Personal API Key** and leaving Client ID / Client Secret empty. The catalog sets the identifier to `https://api.linear.app` and creates a zone vault entry holding the key as the resource's provider; `keycard.toml` names that identifier (Keycard's STS matches it exactly; a made-up `urn:` is `invalid_target`). Keycard keeps the key; local processes only ever receive the credential it brokers for the resource through `keycard agent exec`, one audited exchange per process, and `scripts/linear.sh` sends it as Linear expects (a `lin_api_…` key bare, anything else as `Bearer`).
+4. **Consent**, once per resource, from a browser machine signed in to Keycard as Kim. The key-backed Linear resource needs it too: until then `keycard agent exec` refuses with "access to https://api.linear.app requires authorization".
    ```bash
    keycard auth resource --zone 1jgewf106fax3oaf70vyykwj2i urn:github:factory
-   keycard auth resource --zone 1jgewf106fax3oaf70vyykwj2i urn:linear:factory
+   keycard auth resource --zone 1jgewf106fax3oaf70vyykwj2i https://api.linear.app
    ```
 5. **Repo**: `gh variable set FACTORY_PAUSED -b false -R kmaida/plan-my-today`; `FACTORY_APP_ID` and `FACTORY_APP_PRIVATE_KEY` from step 1; judge keys as repo secrets `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` (API billing for judge runs; local worker/dispatch stay on subscription logins).
 6. **Branch protection on `main`**: require the `ci / test` check; require up to date; restrict pushes to `kmaida-factory-merge`. Do not make judge statuses required checks; the merge gate requires them itself.
@@ -47,7 +47,7 @@ Every local process, dispatch included, runs as `keycard agent exec --config key
    keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- scripts/linear.sh issues P-KIM-206 | jq '.project.name, (.issues | length)'   # "Plan My Today", a count
    keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- scripts/dispatch.sh    # one brokered sweep by hand
    ```
-   Both `keycard credential read` exchanges (`urn:github:factory`, `urn:linear:factory`) then appear in the zone's audit log. Afterwards disable the Linear MCP plugin so nothing on the mini can fall back to a personal Linear login: `claude plugin disable linear@claude-plugins-official`.
+   Both `keycard credential read` exchanges (`urn:github:factory`, `https://api.linear.app`) then appear in the zone's audit log. Afterwards disable the Linear MCP plugin so nothing on the mini can fall back to a personal Linear login: `claude plugin disable linear@claude-plugins-official`.
 
 ## Not brokered
 
