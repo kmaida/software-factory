@@ -1,7 +1,8 @@
 # factory-merge.yml — the only thing that merges factory PRs. Installed by /factory:factory-onboard.
 # Uses pull_request_target + status so the workflow definition and the gate script always come from the
 # base branch; PR code is diffed, never executed. Needs: repo var FACTORY_APP_ID, secret FACTORY_APP_PRIVATE_KEY,
-# var FACTORY_PAUSED, branch protection on main (required CI, up to date, pushes restricted to the merge App).
+# var FACTORY_PAUSED, a ruleset on main (required CI, up to date, restrict updates) whose only bypass is the merge App:
+# the worker's token has contents:write and acts as the owner, so the bypass list, not the scopes, is what keeps it from merging.
 # ponytail: untested until Phase 2; the gate script is tested, this plumbing is not.
 name: factory-merge
 on:
