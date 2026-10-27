@@ -14,8 +14,9 @@
 #                   Codex: --sandbox read-only); nothing executes PR code here. The verdict is a job output, never
 #                   an artifact, and the model runs without GITHUB_ENV/PATH/OUTPUT so it cannot poison later steps.
 #   post          — statuses:write only: fails closed when a verdict is missing or malformed. A VERIFIED status
-#                   carries HMAC-SHA256(FACTORY_JUDGE_KEY, "<pr>:<head>:<model>:VERIFIED"); the merge gate verifies
-#                   that, never the context name, because any PR-added workflow can post a status.
+#                   carries "VERIFIED <run id> <HMAC-SHA256(FACTORY_JUDGE_KEY, "<pr>:<head>:<base>:<run id>:<model>:VERIFIED")>";
+#                   the merge gate verifies that, never the context name, because any PR-added workflow can post a
+#                   status. Binding base and run id means a re-judge of the same head, or a base that moved, revokes it.
 # Trigger is pull_request_target: this definition, the prompt and the policy always come from the BASE branch; a PR
 # cannot rewrite the workflow that judges it. Every secret lives in the GitHub Environment "factory", whose deployment
 # branch policy allows only the default branch: environment access is decided on github.ref, which for
@@ -175,7 +176,7 @@ jobs:
             case $v in VERIFIED|CAVEATS|REFUTED) ;; *) v=CAVEATS; d="CAVEATS: no verdict from $m (model error)";; esac   # missing → blocks merge, needs a human, no retry churn
             [ "$CHECKS" = success ] || { v=REFUTED; d="REFUTED: a policy check failed"; }                     # any failing check → refuted
             if [ $v = VERIFIED ]; then
-              st=success; d="VERIFIED $(printf '%s' "$N:$HEAD:$m:VERIFIED" | openssl dgst -sha256 -mac HMAC -macopt "key:$KEY" | awk '{print $NF}')"
+              st=success; d="VERIFIED $GITHUB_RUN_ID $(printf '%s' "$N:$HEAD:$BASE:$GITHUB_RUN_ID:$m:VERIFIED" | openssl dgst -sha256 -mac HMAC -macopt "key:$KEY" | awk '{print $NF}')"
             else st=failure; all=0; fi
             gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$HEAD" -f state="$st" -f context="factory/judge-$m" -f description="${d:0:140}" >/dev/null
             echo "factory/judge-$m=$st ($v)"
