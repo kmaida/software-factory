@@ -18,7 +18,7 @@ L="${CLAUDE_PLUGIN_ROOT}/scripts/linear.sh"   # the only way this skill talks to
 Run one dispatcher at a time (by hand, or one LaunchAgent), with `--permission-mode bypassPermissions`: under `auto` the permission classifier refuses to spawn the worker subprocess and the sweep stops to ask, which defeats the point. Never stop to ask a question in this skill; if something cannot be done, say so in the report and move on. There is no lock; every action re-checks state first, so an accidental overlap wastes a sweep rather than corrupting anything.
 For each repo in the registry: `gh variable get FACTORY_PAUSED -R <owner/repo>` equal to `true` → skip that repo entirely.
 
-`KEYCARD_ZONE` must be set. The sweep itself runs under `keycard agent exec --config keycard.toml` (`scripts/dispatch.sh` is the entrypoint; the LaunchAgent and the by-hand command both use it), which brokers `GH_TOKEN` and `LINEAR_TOKEN` in; every worker is launched the same way, so no process holds credentials of its own. All Linear reads and writes go through `$L` (`issues`, `issue`, `state`, `assign`, `comment`; `$L` with no arguments prints the contract). It exits 1 with the reason on stderr when the token is rejected or a call fails.
+`KEYCARD_ZONE` must be set. The sweep itself runs under `keycard agent exec --config keycard.toml` (`scripts/dispatch.sh` is the entrypoint; the LaunchAgent and the by-hand command both use it), which brokers `GH_TOKEN` and `LINEAR_TOKEN` in; every worker is launched the same way, so no process holds credentials of its own. All Linear reads and writes go through `$L` (`issues`, `issue`, `state`, `assign`, `comment`; `$L` with no arguments prints the contract). It exits 1 with the reason on stderr when the token is rejected or a call fails. There is no other path: dispatch and workers start with `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`, so no MCP tool exists in these processes.
 
 **A Linear failure is a precondition failure, never "nothing to do".** If `$L issues <project>` fails for any registered project, print its error and `exit 1` without touching anything.
 
@@ -56,8 +56,11 @@ else git -C "$repo" worktree add -b "factory/$id" "$wt" origin/HEAD; fi         
     keycard agent exec --config "${CLAUDE_PLUGIN_ROOT}/keycard.toml" --zone "$KEYCARD_ZONE" -- \
       claude -p "/factory:factory-worker $id" --plugin-dir "${CLAUDE_PLUGIN_ROOT}" \
         --settings "${CLAUDE_PLUGIN_ROOT}/worker-settings.json" --permission-mode auto --max-turns 80 \
+        --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
   ) > ~/.factory/logs/$id.log 2>&1 &
 # budget: 80 turns and 90 minutes wall clock per run; worker-settings.json is the egress allowlist for the worker's shell commands.
+# No MCP servers in the worker (same flags as dispatch.sh): the claude.ai connectors that come with the Claude login, Linear
+# included, are not available, so scripts/linear.sh with the brokered token is the only Linear path.
 ```
 3. Do not wait for it. Report `started <ID> in <wt>`.
 
