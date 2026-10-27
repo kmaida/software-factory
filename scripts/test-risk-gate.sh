@@ -18,6 +18,10 @@ try test-del   'git rm -q tests/a.test.ts'                'review: test deleted'
 try too-big    'seq 1 20 >> src/a.ts'                     'review: 20 changed lines'
 try rename-out 'git mv src/a.ts docs.md'                  'review: docs.md outside allow'
 try symlink    'ln -s a.ts src/l.ts'                      'review: symlink'
+# KIM-579 false-lows: rename out of tests, symlink at a path with a space, binary under src
+try test-rename 'git mv tests/a.test.ts src/disabled.ts'  'review: test deleted: tests/a.test.ts'
+try symlink-sp  'ln -s a.ts "src/link file"'              'review: symlink: src/link file'
+try binary      'head -c 102400 /dev/zero > src/blob.bin' 'review: binary: src/blob.bin'
 # auto_merge:false at base must force review even for a clean diff
 git checkout -q -b off "$base"; jq '.auto_merge=false' .factory/policy.json > p && mv p .factory/policy.json; git add -A; git commit -qm off; b2=$(git rev-parse HEAD)
 echo b >> src/a.ts; git add -A; git commit -qm change; out=$("$gate" . "$b2" HEAD 2>/dev/null || true); git checkout -q "$base"
