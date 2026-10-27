@@ -1,0 +1,4 @@
+# Local to the host, never committed (see README "Local files"):
+docs/keycard-setup.md
+keycard.toml
+templates/ai.keycard.factory.dispatch.plist

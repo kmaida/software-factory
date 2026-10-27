@@ -20,6 +20,10 @@ Not yet (Phase 3): a sandbox the agent can't escape (the worker is a Claude Code
 
 Run: `KEYCARD_ZONE=<zone> keycard agent exec --config keycard.toml --zone <zone> -- scripts/dispatch.sh` from this directory. The dispatch skill runs with `--permission-mode bypassPermissions`: under `auto`, the permission classifier refuses to spawn the worker subprocess and the sweep stops to ask. Workers themselves run under `auto`. Pause: `gh variable set FACTORY_PAUSED -b true -R owner/repo`.
 
+## Local files
+
+Three files are gitignored and live only on the host: `keycard.toml` (org and zone ids plus the two `[[credentials.default]]` entries, `GH_TOKEN` and `LINEAR_TOKEN`), `templates/ai.keycard.factory.dispatch.plist` (the LaunchAgent that runs `scripts/dispatch.sh` under `keycard agent exec`), and `docs/keycard-setup.md` (the Keycard, GitHub App and Linear setup steps). They hold identifiers and host paths, not secrets; they stay out of the repo so the public history describes the design, not one machine.
+
 ## Mini
 
 The always-on host is a Mac mini running the dispatcher as a dedicated non-admin macOS user from a LaunchAgent every 30 minutes. Versions, logins, paths, the plist, and the FileVault tradeoff are in `docs/mini.md`; the plist is `templates/ai.keycard.factory.dispatch.plist`.
