@@ -80,7 +80,7 @@ cd ~/Development/factory
 KEYCARD_ZONE=1jgewf106fax3oaf70vyykwj2i keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- scripts/dispatch.sh
 ```
 
-A LaunchAgent lives in the user's GUI session: it starts when `softwarefactory` logs in, which automatic login does at every boot (next section). Reboot test 2026-10-27: Tailscale and the agent came back on their own and the RunAtLoad sweep exited 0.
+A LaunchAgent lives in the user's GUI session: it starts when `softwarefactory` logs in, which automatic login does at every boot (next section). Reboot test 2026-10-27: Tailscale and the agent came back on their own and the RunAtLoad sweep exited 0. Brokered-Linear test 2026-10-27: with the Linear plugin disabled and no MCP servers in the factory processes, a RunAtLoad sweep read P-KIM-206, claimed KIM-574 (In Progress, assigned, `factory: run …` comment), and the worker opened kmaida/plan-my-today#14 and moved it to In Review, every Linear write through `scripts/linear.sh` with the brokered token.
 
 ## Always-on (admin, as `kimmaida`)
 
