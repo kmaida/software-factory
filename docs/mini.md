@@ -22,7 +22,7 @@ Set up 2026-10-26. The mini runs the dispatcher every 30 minutes as a dedicated,
 | jq | 1.7.1 | macOS built-in (`/usr/bin/jq`) |
 | keycard | 0.0.38 | `brew install --cask keycardai/tap/keycard` (binary cask, no admin) |
 | claude | 2.1.310 | native installer in `~/.local/bin`; self-updates in `~/.local/share/claude/versions` |
-| Claude Code plugin `linear@claude-plugins-official` | 58267944f921 | `claude plugin install linear@claude-plugins-official` |
+| Claude Code plugin `linear@claude-plugins-official` | disabled | was the unbrokered Linear path until 2026-10-27; `claude plugin disable linear@claude-plugins-official` once `urn:linear:factory` works |
 
 `~/.zshrc` and `~/.zprofile` put `/opt/homebrew/bin` on PATH and run `fnm env --use-on-cd`. Launchd does not read either, so the plist carries its own PATH (below). Codex is not installed; the judge runs in GitHub Actions.
 
@@ -42,11 +42,10 @@ Set up 2026-10-26. The mini runs the dispatcher every 30 minutes as a dedicated,
 | Session | How it was created | Check |
 |---|---|---|
 | Claude Code | claude.ai device/browser login (Keycard enterprise org, as Kim) | `claude auth status` |
-| Keycard | `keycard auth signin --device --org p48htojvia150hqw8n22g00d4i --zone 1jgewf106fax3oaf70vyykwj2i` (two codes: org, then zone), then `keycard auth resource urn:github:factory --zone 1jgewf106fax3oaf70vyykwj2i` | `keycard credential read --zone 1jgewf106fax3oaf70vyykwj2i urn:github:factory` |
+| Keycard | `keycard auth signin --device --org p48htojvia150hqw8n22g00d4i --zone 1jgewf106fax3oaf70vyykwj2i` (two codes: org, then zone), then one consent per resource: `keycard auth resource --zone 1jgewf106fax3oaf70vyykwj2i urn:github:factory` and `... urn:linear:factory` | `keycard credential read --zone 1jgewf106fax3oaf70vyykwj2i urn:github:factory` and `... urn:linear:factory` |
 | GitHub (Kim, for cloning the private plugin repo and this PR) | `gh auth login -h github.com -p https -w` | `gh auth status` |
-| Linear MCP | the claude.ai Linear connector comes with the Claude login and is already connected; the plugin's own server (`plugin:linear:linear`) is a one-time browser OAuth from an interactive `claude` session via `/mcp` (done 2026-10-27, shows Connected) | `claude mcp list \| grep -i linear` |
 
-Workers never hold a GitHub token: `keycard agent exec --config keycard.toml` brokers it in as `GH_TOKEN`. Verified on the mini:
+No factory process holds a GitHub or Linear token: `keycard agent exec --config keycard.toml` brokers them in as `GH_TOKEN` and `LINEAR_TOKEN` (`scripts/linear.sh` is the only Linear client). The Linear MCP plugin is no longer used; the claude.ai Linear connector that comes with the Claude login stays for interactive sessions only. Verified on the mini:
 
 ```bash
 cd ~/Documents/Development/factory
@@ -54,11 +53,12 @@ keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- gh
 keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- gh api -X POST \
   repos/kmaida/plan-my-today/statuses/$(git -C ~/Documents/Development/plan-my-today rev-parse origin/main) \
   -f state=success -f context=factory/judge-claude                                                      # HTTP 403
+keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- scripts/linear.sh issues P-KIM-206 | jq .project.name   # "Plan My Today"
 ```
 
 ## The LaunchAgent
 
-`templates/ai.keycard.factory.dispatch.plist` runs `claude -p "/factory:factory-dispatch" --permission-mode bypassPermissions` with `KEYCARD_ZONE` set, every 1800 s and once at load. Install or update:
+`templates/ai.keycard.factory.dispatch.plist` runs `keycard agent exec --config keycard.toml --zone $KEYCARD_ZONE -- scripts/dispatch.sh` every 1800 s and once at load. `dispatch.sh` checks the registry, that both tokens were brokered in, and that every registered Linear project is readable, then runs `claude -p "/factory:factory-dispatch" --permission-mode bypassPermissions`. A missing consent, a rejected token or an unreadable project is a non-zero `sweep exit` with the reason in `dispatch.err.log`. Install or update:
 
 ```bash
 sed "s|__HOME__|$HOME|g" ~/Documents/Development/factory/templates/ai.keycard.factory.dispatch.plist \
@@ -72,7 +72,8 @@ tail -f ~/.factory/logs/dispatch.log
 Fire one sweep now: `launchctl kickstart gui/$(id -u)/ai.keycard.factory.dispatch`. Stop the schedule: `launchctl bootout gui/$(id -u)/ai.keycard.factory.dispatch` (the repo-level pause is `gh variable set FACTORY_PAUSED -b true -R kmaida/plan-my-today`). By hand, from a terminal, never from inside a Claude session:
 
 ```bash
-KEYCARD_ZONE=1jgewf106fax3oaf70vyykwj2i claude -p "/factory:factory-dispatch" --plugin-dir ~/Documents/Development/factory --permission-mode bypassPermissions
+cd ~/Documents/Development/factory
+KEYCARD_ZONE=1jgewf106fax3oaf70vyykwj2i keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- scripts/dispatch.sh
 ```
 
 A LaunchAgent lives in the user's GUI session: it starts when `softwarefactory` logs in, which automatic login does at every boot (next section). Reboot test 2026-10-27: Tailscale and the agent came back on their own and the RunAtLoad sweep exited 0.
