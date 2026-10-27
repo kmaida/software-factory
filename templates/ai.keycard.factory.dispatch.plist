@@ -4,7 +4,10 @@
 <dict>
   <!-- Factory dispatcher on the Mac mini. Install: see docs/mini.md (replace __HOME__ with the
        softwarefactory user's home, then launchctl bootstrap gui/$(id -u)). One sweep every 30 minutes
-       and one at load; the dispatch skill is idempotent so an overlap wastes a sweep, nothing more. -->
+       and one at load; the dispatch skill is idempotent so an overlap wastes a sweep, nothing more.
+       The sweep runs under keycard agent exec: GH_TOKEN and LINEAR_TOKEN are brokered in from the zone's
+       resources, so a missing consent or a rejected token is a non-zero "sweep exit" with the reason in
+       dispatch.err.log, never a sweep that silently reports nothing to do. -->
   <key>Label</key>
   <string>ai.keycard.factory.dispatch</string>
 
@@ -12,7 +15,7 @@
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>echo "=== $(date -u +%FT%TZ) sweep start"; claude -p "/factory:factory-dispatch" --plugin-dir "$HOME/Documents/Development/factory" --permission-mode bypassPermissions; echo "=== $(date -u +%FT%TZ) sweep exit $?"</string>
+    <string>echo "=== $(date -u +%FT%TZ) sweep start"; keycard agent exec --config "$HOME/Documents/Development/factory/keycard.toml" --zone "$KEYCARD_ZONE" -- "$HOME/Documents/Development/factory/scripts/dispatch.sh"; echo "=== $(date -u +%FT%TZ) sweep exit $?"</string>
   </array>
 
   <key>EnvironmentVariables</key>
