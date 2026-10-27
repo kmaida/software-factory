@@ -70,11 +70,11 @@ Count existing `factory: retry N` comments. Next N = count + 1. If N >= 2: state
 
 ### Judge findings (what the worker needs to act on a verdict)
 
-The status descriptions are 140 characters; the findings live in the judge run's transcript artifact. For the head SHA:
+The status descriptions are 140 characters; the findings live in the judge run's transcript artifacts, one per reviewer job. For the head SHA:
 ```bash
 run=$(gh run list -R <r> --workflow factory-judge.yml --json databaseId,headSha --jq '[.[]|select(.headSha=="<sha>")][0].databaseId')
-gh run download "$run" -R <r> -n "judge-transcripts-<sha>" -D "$d"
-for m in claude codex; do echo "## $m"; grep -E '^(- |\* |[0-9]+\. |VERDICT)' "$d/$m.txt" | tail -15; done
+for m in claude codex; do gh run download "$run" -R <r> -n "judge-$m-<sha>" -D "$d/$m"; done
+for m in claude codex; do echo "## $m"; grep -E '^(- |\* |[0-9]+\. |VERDICT)' "$d/$m/$m.txt" | tail -15; done
 ```
 Append that output to the retry comment under `Judge findings at <sha>:`, with: "Keep the existing PR and push to its branch. Out of scope is unchanged." (Pipe the whole comment to `"$L" comment <ID> -`.) A worker must never be sent back without the findings; an empty retry just repeats the same mistake.
 
