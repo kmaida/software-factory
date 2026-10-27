@@ -39,7 +39,7 @@ Load the project's issues: `"$L" issues <project id>` prints `{project, issues}`
 | `👩🏻‍💻 In Progress` | newest `factory:` comment older than 2h | PR exists for branch `factory/<ID>` → state `👓 In Review`; else retry (below) |
 | `👓 In Review` | PR merged | state `✅ Done`; comment: `factory: merged <pr-url>` |
 | `👓 In Review` | both `factory/judge-*` statuses on the head SHA (`gh api repos/<r>/commits/<sha>/status`) and either description starts with `REFUTED` | retry (below) with the judge findings |
-| `👓 In Review` | both judge statuses present, any `failure`, none `REFUTED` (i.e. `CAVEATS`) | policy `on_caveats` is `review` → comment once `factory: caveats at <sha>, needs your review`, Kim's. Otherwise (default `retry`): no `factory: retry` comment yet for this issue → retry (below) with the judge findings; a retry already happened → comment once `factory: caveats again at <sha> after a retry, needs your review`, Kim's. |
+| `👓 In Review` | both judge statuses present, any `failure`, none `REFUTED` (i.e. `CAVEATS`) | policy `on_caveats` is `review` → comment once `factory: caveats at <sha>, needs your review` followed by the judge findings (below), Kim's. Otherwise (default `retry`): no `factory: retry` comment yet for this issue → retry (below) with the judge findings; a retry already happened → comment once `factory: caveats again at <sha> after a retry, needs your review` followed by the judge findings (below), Kim's. |
 | `👓 In Review` | PR red / conflicted / closed-unmerged for over 1h | retry (below) |
 | `👀 Needs Input`, `⛔️ Blocked`, anything else | — | nothing. Kim's. |
 
@@ -91,7 +91,7 @@ tail -1 ~/.factory/logs/$id-$run.log                                            
 
 Count existing `factory: retry N` comments. Next N = count + 1. If N >= 2: state `⛔️ Blocked`, comment `factory: retry budget exhausted (<reason>)`. Else: state `🍎 To do`, comment `factory: retry N (<reason>)` followed by the judge findings (below) when the reason is a verdict. The next sweep re-dispatches it; the worker reads the retry comment and acts on the findings.
 
-### Judge findings (what the worker needs to act on a verdict)
+### Judge findings (what the worker, or Kim, needs to act on a verdict)
 
 The status descriptions are 140 characters; the findings live in the judge run's transcript artifacts, one per reviewer job. For the head SHA:
 ```bash
@@ -99,7 +99,7 @@ run=$(gh run list -R <r> --workflow factory-judge.yml --json databaseId,headSha 
 for m in claude codex; do gh run download "$run" -R <r> -n "judge-$m-<sha>" -D "$d/$m"; done
 for m in claude codex; do echo "## $m"; grep -E '^(- |\* |[0-9]+\. |VERDICT)' "$d/$m/$m.txt" | tail -15; done
 ```
-Append that output to the retry comment under `Judge findings at <sha>:`, with: "Keep the existing PR and push to its branch. Out of scope is unchanged." (Pipe the whole comment to `"$L" comment <ID> -`.) A worker must never be sent back without the findings; an empty retry just repeats the same mistake.
+Append that output to the comment under `Judge findings at <sha>:`. On a retry comment, add: "Keep the existing PR and push to its branch. Out of scope is unchanged." (Pipe the whole comment to `"$L" comment <ID> -`.) A worker must never be sent back without the findings; an empty retry just repeats the same mistake. Kim must never be asked to review a CAVEATS without them either: the status description on the PR is 140 characters and the rest lives only in the Actions artifact.
 
 ## Report
 
