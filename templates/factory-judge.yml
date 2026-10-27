@@ -1,12 +1,16 @@
 # factory-judge.yml — two independent models refute a factory PR at its exact head SHA and post
-# factory/judge-claude and factory/judge-codex commit statuses. Three jobs on fresh runners so that
-# nothing which executes PR code shares a runner with a secret or a token:
-#   checks  — permissions {}, no secrets: runs every allowed check; the STEP FAILS if any check fails, and
-#             downstream trusts only the job result (PR code can forge outputs/artifacts, not a job result)
-#   models  — API keys only, no GITHUB_TOKEN: checks out the PR with its agent config stripped, runs the
-#             models with --bare and without GITHUB_ENV/PATH/OUTPUT (so a model cannot poison later steps),
-#             emits verdicts as job outputs (never artifacts)
-#   post    — statuses:write only: fails closed to REFUTED when a verdict is missing or malformed
+# factory/judge-claude and factory/judge-codex commit statuses. Four jobs on fresh runners so that
+# nothing which executes PR code shares a runner with a secret or a token, and the two reviewers share nothing:
+#   checks        — permissions {}, no secrets: runs every allowed check; the STEP FAILS if any check fails, and
+#                   downstream trusts only the job result (PR code can forge outputs/artifacts, not a job result)
+#   judge-claude  — ANTHROPIC_API_KEY only, no GITHUB_TOKEN, own runner
+#   judge-codex   — OPENAI_API_KEY only, no GITHUB_TOKEN, own runner
+#                   Each checks out the PR with its agent config stripped and builds the same prompt from the PR body
+#                   (the worker's copy of the Linear task sections and its assumptions), the diff and the checks
+#                   transcript, all as inline text. The model's tools are read-only (Claude: --tools Read,Grep,Glob;
+#                   Codex: --sandbox read-only); nothing executes PR code here. The verdict is a job output, never
+#                   an artifact, and the model runs without GITHUB_ENV/PATH/OUTPUT so it cannot poison later steps.
+#   post          — statuses:write only: fails closed when a verdict is missing or malformed
 # Needs repo secrets ANTHROPIC_API_KEY, OPENAI_API_KEY. Prompt and policy are read from the BASE commit.
 # ponytail: untested until the first factory PR; the shape is deliberate, the CLI install lines may need a bump.
 name: factory-judge
@@ -45,11 +49,13 @@ jobs:
         if: always()
         with: { name: "judge-checks-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/check-output.txt", retention-days: 14 }
 
-  models:
+  # The two reviewer jobs are deliberately near-identical and separate (not a matrix: matrix legs merge their
+  # outputs, last writer wins). The prompt is built per job, on the trusted runner, never in the checks job.
+  judge-claude:
     needs: checks            # runs only when every check passed; otherwise post refutes without spending API calls
     runs-on: ubuntu-latest
     permissions: {}
-    outputs: { claude: "${{ steps.out.outputs.claude }}", codex: "${{ steps.out.outputs.codex }}" }
+    outputs: { verdict: "${{ steps.out.outputs.verdict }}" }
     steps:
       - uses: actions/checkout@v4
         with: { ref: "${{ github.event.pull_request.head.sha }}", fetch-depth: 0, persist-credentials: false }
@@ -57,50 +63,83 @@ jobs:
         run: rm -rf .claude .codex .mcp.json CLAUDE.md AGENTS.md .cursor .github/copilot-instructions.md
       - uses: actions/download-artifact@v4
         with: { name: "judge-checks-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/checks" }
-      - name: Fill the refute prompt (literal substitution; PR title and check transcript are untrusted data)
-        env: { TITLE: "${{ github.event.pull_request.title }}", URL: "${{ github.event.pull_request.html_url }}", OK: "1" }
+      - name: Build the prompt (one-pass literal substitution; PR title/body, diff and check transcript are untrusted data)
+        env: { TITLE: "${{ github.event.pull_request.title }}", BODY: "${{ github.event.pull_request.body }}", URL: "${{ github.event.pull_request.html_url }}" }
         run: |
           git show "$BASE:.factory/refute-prompt.md" > "$RUNNER_TEMP/refute-prompt.md"
+          git diff "$BASE" "$HEAD" > "$RUNNER_TEMP/diff.patch"
           python3 - <<'PY'
-          import os; t=os.environ["RUNNER_TEMP"]
-          p=open(f"{t}/refute-prompt.md").read()
-          for k,v in {"{{ISSUE_TITLE}}":os.environ["TITLE"],"{{PR_URL}}":os.environ["URL"],"{{HEAD_SHA}}":os.environ["HEAD"],"{{BASE_SHA}}":os.environ["BASE"],
-                      "{{DONE_WHEN}}":"every command in .factory/policy.json `checks` (already executed on a clean runner; output below — do NOT run installs or checks yourself)"}.items():
-              p=p.replace(k,v)
-          out=open(f"{t}/checks/check-output.txt").read()[-20000:]
-          p+=f"\n\n## Check output (all checks passed: {os.environ['OK']=='1'})\n```\n{out}\n```\n"
+          import os, re; t=os.environ["RUNNER_TEMP"]; e=os.environ
+          d=open(f"{t}/diff.patch",errors="replace").read()
+          v={"PR_TITLE":e["TITLE"],"PR_BODY":e["BODY"],"PR_URL":e["URL"],"HEAD_SHA":e["HEAD"],"BASE_SHA":e["BASE"],
+             "DIFF":d[:150000]+("\n[diff truncated by CI; read the files]" if len(d)>150000 else ""),
+             "CHECK_OUTPUT":open(f"{t}/checks/check-output.txt",errors="replace").read()[-20000:]}
+          p=re.sub(r"\{\{(\w+)\}\}",lambda m:v.get(m[1],m[0]),open(f"{t}/refute-prompt.md").read())   # one pass: substituted text is never re-scanned
           open(f"{t}/prompt.md","w").write(p)
           PY
-      - name: Attacker A — Claude
+      - name: Claude reviews (read-only tools, agent config off, no GITHUB_ENV/PATH/OUTPUT)
         env: { ANTHROPIC_API_KEY: "${{ secrets.ANTHROPIC_API_KEY }}" }
         run: |
           npm i -g @anthropic-ai/claude-code@2.1.176 >/dev/null 2>&1   # pinned; bump deliberately
-          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE claude -p "$(cat "$RUNNER_TEMP/prompt.md")" --bare --permission-mode acceptEdits --max-turns 40 > "$RUNNER_TEMP/claude.txt" 2>&1 || true
-          grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)\s*$' "$RUNNER_TEMP/claude.txt" | tail -1 | awk '{print $2}' > "$RUNNER_TEMP/claude.verdict" || true   # whole line only; never the prompt's instruction text
-      - name: Attacker B — Codex
+          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE claude -p "$(cat "$RUNNER_TEMP/prompt.md")" --bare --tools "Read,Grep,Glob" --max-turns 40 > "$RUNNER_TEMP/claude.txt" 2>&1 || true
+      - name: Verdict as job output (whole line only, sanitized; anything else becomes CAVEATS downstream)
+        id: out
+        run: |
+          echo "verdict=$(grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)\s*$' "$RUNNER_TEMP/claude.txt" | tail -1 | awk '{print $2}' | tr -cd 'A-Z')" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: "judge-claude-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/claude.txt\n${{ runner.temp }}/prompt.md", retention-days: 14 }
+
+  judge-codex:
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs: { verdict: "${{ steps.out.outputs.verdict }}" }
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ github.event.pull_request.head.sha }}", fetch-depth: 0, persist-credentials: false }
+      - name: Strip PR-controlled agent config (hooks, settings, instructions) before any model runs
+        run: rm -rf .claude .codex .mcp.json CLAUDE.md AGENTS.md .cursor .github/copilot-instructions.md
+      - uses: actions/download-artifact@v4
+        with: { name: "judge-checks-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/checks" }
+      - name: Build the prompt (one-pass literal substitution; PR title/body, diff and check transcript are untrusted data)
+        env: { TITLE: "${{ github.event.pull_request.title }}", BODY: "${{ github.event.pull_request.body }}", URL: "${{ github.event.pull_request.html_url }}" }
+        run: |
+          git show "$BASE:.factory/refute-prompt.md" > "$RUNNER_TEMP/refute-prompt.md"
+          git diff "$BASE" "$HEAD" > "$RUNNER_TEMP/diff.patch"
+          python3 - <<'PY'
+          import os, re; t=os.environ["RUNNER_TEMP"]; e=os.environ
+          d=open(f"{t}/diff.patch",errors="replace").read()
+          v={"PR_TITLE":e["TITLE"],"PR_BODY":e["BODY"],"PR_URL":e["URL"],"HEAD_SHA":e["HEAD"],"BASE_SHA":e["BASE"],
+             "DIFF":d[:150000]+("\n[diff truncated by CI; read the files]" if len(d)>150000 else ""),
+             "CHECK_OUTPUT":open(f"{t}/checks/check-output.txt",errors="replace").read()[-20000:]}
+          p=re.sub(r"\{\{(\w+)\}\}",lambda m:v.get(m[1],m[0]),open(f"{t}/refute-prompt.md").read())   # one pass: substituted text is never re-scanned
+          open(f"{t}/prompt.md","w").write(p)
+          PY
+      - name: Codex reviews (read-only sandbox, agent config off, no GITHUB_ENV/PATH/OUTPUT)
         env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }
         run: |
-          git checkout -q -- . && git clean -qfd
-          rm -rf .claude .codex .mcp.json CLAUDE.md AGENTS.md .cursor .github/copilot-instructions.md   # the reset restores them; strip again
           npm i -g @openai/codex@0.164.0 >/dev/null 2>&1   # pinned; bump deliberately
           # codex 0.164 does not read OPENAI_API_KEY on its own; log in into a throwaway CODEX_HOME and delete it after.
           # The key is still in this step's env (inherent to running an agent with a key); the runner is ephemeral and the key is judge-only.
           export CODEX_HOME=$(mktemp -d); chmod 700 "$CODEX_HOME"
           printenv OPENAI_API_KEY | codex login --with-api-key
-          # Codex's own bubblewrap sandbox cannot start on GitHub-hosted runners (RTM_NEWADDR EPERM), so it runs with
-          # its sandbox off. The job is the isolation boundary: fresh runner, no GitHub token, PR code never executed here.
-          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE codex exec --sandbox danger-full-access --skip-git-repo-check "$(cat "$RUNNER_TEMP/prompt.md")" > "$RUNNER_TEMP/codex.txt" 2>&1 || true
+          # read-only: the model's shell commands can read the disk (so `git diff` works) and write nothing. Codex's default
+          # Linux sandbox (bubblewrap) could not start on a GitHub-hosted runner (RTM_NEWADDR EPERM: it wants a netns);
+          # use_legacy_landlock is the namespace-free sandbox, deprecated but present in the pinned 0.164.
+          # ponytail: if the sandbox still cannot start, there is no verdict and post fails closed to CAVEATS; fix here, never fall back to danger-full-access.
+          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE codex exec --sandbox read-only --enable use_legacy_landlock --skip-git-repo-check "$(cat "$RUNNER_TEMP/prompt.md")" > "$RUNNER_TEMP/codex.txt" 2>&1 || true
           rm -rf "$CODEX_HOME"
-          grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)\s*$' "$RUNNER_TEMP/codex.txt" | tail -1 | awk '{print $2}' > "$RUNNER_TEMP/codex.verdict" || true
-      - name: Verdicts as job outputs (sanitized; anything else becomes REFUTED downstream)
+      - name: Verdict as job output (whole line only, sanitized; anything else becomes CAVEATS downstream)
         id: out
-        run: for m in claude codex; do echo "$m=$(tr -cd 'A-Z' < "$RUNNER_TEMP/$m.verdict" 2>/dev/null)" >> "$GITHUB_OUTPUT"; done
+        run: |
+          echo "verdict=$(grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)\s*$' "$RUNNER_TEMP/codex.txt" | tail -1 | awk '{print $2}' | tr -cd 'A-Z')" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: "judge-transcripts-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/*.txt", retention-days: 14 }
+        with: { name: "judge-codex-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/codex.txt\n${{ runner.temp }}/prompt.md", retention-days: 14 }
 
   post:
-    needs: [checks, models]
+    needs: [checks, judge-claude, judge-codex]
     if: always() && needs.checks.result != 'skipped'
     runs-on: ubuntu-latest
     permissions: { statuses: write }
@@ -109,8 +148,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CHECKS: ${{ needs.checks.result }}
-          V_CLAUDE: ${{ needs.models.outputs.claude }}
-          V_CODEX: ${{ needs.models.outputs.codex }}
+          V_CLAUDE: ${{ needs.judge-claude.outputs.verdict }}
+          V_CODEX: ${{ needs.judge-codex.outputs.verdict }}
         run: |
           for m in claude codex; do
             v=$([ $m = claude ] && echo "$V_CLAUDE" || echo "$V_CODEX")
