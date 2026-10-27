@@ -50,8 +50,11 @@ jobs:
         run: |
           p="$RUNNER_TEMP/policy.json"; git show "$BASE:.factory/policy.json" > "$p"
           # The containers get an EXPORT of the PR tree, never the checkout: a writable .git/config (core.fsmonitor and
-          # friends) would be executed on the host by git during actions/checkout's post-job cleanup.
-          w="$RUNNER_TEMP/w"; mkdir -p "$w"; git archive --format=tar "$HEAD" | tar -x -C "$w"
+          # friends) would be executed on the host by git during actions/checkout's post-job cleanup. Not `git archive`:
+          # it honors a PR-controlled .gitattributes `export-ignore`, which would hide a failing test from the container.
+          w="$RUNNER_TEMP/w"; mkdir -p "$w"
+          GIT_INDEX_FILE="$RUNNER_TEMP/idx" git read-tree "$HEAD" && GIT_INDEX_FILE="$RUNNER_TEMP/idx" git checkout-index -a -f --prefix="$w/"
+          [ "$(git ls-tree -r --name-only "$HEAD" | wc -l)" = "$(cd "$w" && find . -type f -o -type l | wc -l)" ] || { echo "export does not match the tree" >&2; exit 1; }
           # check_env / check_setup come from BASE policy: the same env and prep the repo's CI uses for its checks
           { echo HOME=/tmp; jq -r '.check_env // {} | to_entries[] | "\(.key)=\(.value)"' "$p"; } > "$RUNNER_TEMP/check.env"
           run() { docker run --rm -u "$(id -u):$(id -g)" --env-file "$RUNNER_TEMP/check.env" -v "$w:/w" -w /w "$@"; }
@@ -76,7 +79,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     environment: factory     # the API key is readable only when this workflow was taken from the default branch
-    outputs: { verdict: "${{ steps.out.outputs.verdict }}" }
+    outputs: { verdict: "${{ steps.out.outputs.verdict }}", attempt: "${{ steps.out.outputs.attempt }}" }
     steps:
       - uses: actions/checkout@v4
         with: { ref: "${{ github.event.pull_request.head.sha }}", fetch-depth: 0, persist-credentials: false }
@@ -107,6 +110,7 @@ jobs:
         id: out
         run: |
           echo "verdict=$(grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)\s*$' "$RUNNER_TEMP/claude.txt" | tail -1 | awk '{print $2}' | tr -cd 'A-Z')" >> "$GITHUB_OUTPUT"
+          echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"   # "re-run failed jobs" reuses this job's outputs from an earlier attempt; post refuses to mix attempts
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: "judge-claude-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/claude.txt\n${{ runner.temp }}/prompt.md", retention-days: 14 }
@@ -116,7 +120,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     environment: factory
-    outputs: { verdict: "${{ steps.out.outputs.verdict }}" }
+    outputs: { verdict: "${{ steps.out.outputs.verdict }}", attempt: "${{ steps.out.outputs.attempt }}" }
     steps:
       - uses: actions/checkout@v4
         with: { ref: "${{ github.event.pull_request.head.sha }}", fetch-depth: 0, persist-credentials: false }
@@ -156,6 +160,7 @@ jobs:
         id: out
         run: |
           echo "verdict=$(grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)\s*$' "$RUNNER_TEMP/codex.txt" | tail -1 | awk '{print $2}' | tr -cd 'A-Z')" >> "$GITHUB_OUTPUT"
+          echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: "judge-codex-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/codex.txt\n${{ runner.temp }}/prompt.md", retention-days: 14 }
@@ -173,6 +178,8 @@ jobs:
           CHECKS: ${{ needs.checks.result }}
           V_CLAUDE: ${{ needs.judge-claude.outputs.verdict }}
           V_CODEX: ${{ needs.judge-codex.outputs.verdict }}
+          A_CLAUDE: ${{ needs.judge-claude.outputs.attempt }}
+          A_CODEX: ${{ needs.judge-codex.outputs.attempt }}
           KEY: ${{ secrets.FACTORY_JUDGE_KEY }}
           N: ${{ github.event.pull_request.number }}
         run: |
@@ -180,8 +187,9 @@ jobs:
           all=1
           for m in claude codex; do
             v=$([ $m = claude ] && echo "$V_CLAUDE" || echo "$V_CODEX")
-            d=$v
+            a=$([ $m = claude ] && echo "$A_CLAUDE" || echo "$A_CODEX")
             case $v in VERIFIED|CAVEATS|REFUTED) ;; *) v=CAVEATS; echo "no verdict from $m (model error): CAVEATS";; esac   # missing → blocks merge, needs a human, no retry churn
+            [ "$a" = "$GITHUB_RUN_ATTEMPT" ] || { v=CAVEATS; echo "$m verdict is from attempt ${a:-?}, this is attempt $GITHUB_RUN_ATTEMPT (re-run failed jobs): CAVEATS"; }   # never sign a verdict this attempt did not produce
             [ "$CHECKS" = success ] || { v=REFUTED; echo "a policy check failed: REFUTED"; }                      # any failing check → refuted
             d="$v $GITHUB_RUN_ID $GITHUB_RUN_ATTEMPT $(printf '%s' "$N:$HEAD:$BASE:$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT:$m:$v" | openssl dgst -sha256 -mac HMAC -macopt "key:$KEY" | awk '{print $NF}')"
             if [ $v = VERIFIED ]; then st=success; else st=failure; all=0; fi
