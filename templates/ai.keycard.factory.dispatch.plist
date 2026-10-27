@@ -7,7 +7,9 @@
        and one at load; the dispatch skill is idempotent so an overlap wastes a sweep, nothing more.
        The sweep runs under keycard agent exec: GH_TOKEN and LINEAR_TOKEN are brokered in from the zone's
        resources, so a missing consent or a rejected token is a non-zero "sweep exit" with the reason in
-       dispatch.err.log, never a sweep that silently reports nothing to do. -->
+       dispatch.err.log, never a sweep that silently reports nothing to do.
+       Paths stay out of ~/Documents on purpose: launchd processes touching it hang on a privacy prompt or
+       are refused (docs/mini.md, "Not under ~/Documents"). -->
   <key>Label</key>
   <string>ai.keycard.factory.dispatch</string>
 
@@ -15,7 +17,7 @@
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>echo "=== $(date -u +%FT%TZ) sweep start"; keycard agent exec --config "$HOME/Documents/Development/factory/keycard.toml" --zone "$KEYCARD_ZONE" -- "$HOME/Documents/Development/factory/scripts/dispatch.sh"; echo "=== $(date -u +%FT%TZ) sweep exit $?"</string>
+    <string>echo "=== $(date -u +%FT%TZ) sweep start"; keycard agent exec --config "$HOME/Development/factory/keycard.toml" --zone "$KEYCARD_ZONE" -- "$HOME/Development/factory/scripts/dispatch.sh"; echo "=== $(date -u +%FT%TZ) sweep exit $?"</string>
   </array>
 
   <key>EnvironmentVariables</key>

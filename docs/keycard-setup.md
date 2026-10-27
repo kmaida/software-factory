@@ -43,7 +43,7 @@ Every local process, dispatch included, runs as `keycard agent exec --config key
 7. **Verify** (on the mini, in its GUI session, where the Keycard login lives):
    ```bash
    keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- gh api user --jq .login
-   keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- gh api -X POST repos/kmaida/plan-my-today/statuses/$(git -C ~/Documents/Development/plan-my-today rev-parse origin/main) -f state=success -f context=factory/judge-claude   # must 403
+   keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- gh api -X POST repos/kmaida/plan-my-today/statuses/$(git -C ~/Development/plan-my-today rev-parse origin/main) -f state=success -f context=factory/judge-claude   # must 403
    keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- scripts/linear.sh issues P-KIM-206 | jq '.project.name, (.issues | length)'   # "Plan My Today", a count
    keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- scripts/dispatch.sh    # one brokered sweep by hand
    ```
