@@ -57,15 +57,17 @@ jobs:
         run: rm -rf .claude .codex .mcp.json CLAUDE.md AGENTS.md .cursor .github/copilot-instructions.md
       - uses: actions/download-artifact@v4
         with: { name: "judge-checks-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/checks" }
-      - name: Fill the refute prompt (literal substitution; PR title and check transcript are untrusted data)
-        env: { TITLE: "${{ github.event.pull_request.title }}", URL: "${{ github.event.pull_request.html_url }}", OK: "1" }
+      - name: Fill the refute prompt (literal substitution; PR title, PR body and check transcript are untrusted data)
+        env: { TITLE: "${{ github.event.pull_request.title }}", BODY: "${{ github.event.pull_request.body }}", URL: "${{ github.event.pull_request.html_url }}", OK: "1" }
         run: |
           git show "$BASE:.factory/refute-prompt.md" > "$RUNNER_TEMP/refute-prompt.md"
           python3 - <<'PY'
           import os; t=os.environ["RUNNER_TEMP"]
           p=open(f"{t}/refute-prompt.md").read()
+          body=os.environ.get("BODY","")[:20000] or "(empty PR body)"   # the worker's task copy and assumptions live here; capped like the check output
           for k,v in {"{{ISSUE_TITLE}}":os.environ["TITLE"],"{{PR_URL}}":os.environ["URL"],"{{HEAD_SHA}}":os.environ["HEAD"],"{{BASE_SHA}}":os.environ["BASE"],
-                      "{{DONE_WHEN}}":"every command in .factory/policy.json `checks` (already executed on a clean runner; output below — do NOT run installs or checks yourself)"}.items():
+                      "{{DONE_WHEN}}":"every command in .factory/policy.json `checks` (already executed on a clean runner; output below — do NOT run installs or checks yourself)",
+                      "{{PR_BODY}}":body}.items():   # PR_BODY last, so placeholders inside the body are never expanded
               p=p.replace(k,v)
           out=open(f"{t}/checks/check-output.txt").read()[-20000:]
           p+=f"\n\n## Check output (all checks passed: {os.environ['OK']=='1'})\n```\n{out}\n```\n"
