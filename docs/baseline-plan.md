@@ -289,4 +289,12 @@ Run against `git diff main...HEAD` after A0 was implemented in the templates. Al
 | "Re-run failed jobs" reuses one judge's outputs from an earlier attempt; `post` signed both with its own attempt | BLOCKER as filed; in practice both verdicts are genuine for the same head and base | Yes | Each judge job outputs its attempt; `post` refuses to sign a verdict from another attempt |
 | Filling both contexts to the 1000-status cap blocks a later REFUTED from being recorded | MAJOR | Not a false-merge path: the only signatures it can preserve are genuine ones for that head and base; any base move invalidates them | Documented as a residual (denial of service, fails closed) |
 
+### Implementation of A0, fourth pass: REFUTED, 3 findings
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| The export's file-count check rejects legitimate trees: a filename with a newline, or an existing submodule (gitlink counted on one side only) | BLOCKER | Yes | Count blobs by object mode, excluding gitlinks; count export entries NUL-separated |
+| `check_setup` was moved after `npm ci`; a policy that prepares the lockfile in `check_setup` broke | BLOCKER | Yes, regression | Order restored: `check_setup`, then `npm ci` |
+| `checkout-index` honors the `ident` attribute, so the export is not byte-identical to HEAD | MAJOR | No: every checkout, including the one that ships, expands `$Id$` the same way; the export matches what runs anywhere | Not adopted |
+
 Not adopted, any round: "continuous external checkpoints" and "authenticated completion records" for the log, and per-run gateway authorization as a Phase A item. Each is the Phase B broker by another name; adding them to Phase A would be the same work twice.

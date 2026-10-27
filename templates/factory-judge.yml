@@ -54,12 +54,14 @@ jobs:
           # it honors a PR-controlled .gitattributes `export-ignore`, which would hide a failing test from the container.
           w="$RUNNER_TEMP/w"; mkdir -p "$w"
           GIT_INDEX_FILE="$RUNNER_TEMP/idx" git read-tree "$HEAD" && GIT_INDEX_FILE="$RUNNER_TEMP/idx" git checkout-index -a -f --prefix="$w/"
-          [ "$(git ls-tree -r --name-only "$HEAD" | wc -l)" = "$(cd "$w" && find . -type f -o -type l | wc -l)" ] || { echo "export does not match the tree" >&2; exit 1; }
+          # belt and braces: every blob in the tree is in the export (gitlinks are not checked out; names may hold newlines)
+          [ "$(git ls-tree -r --format='%(objectmode)' "$HEAD" | grep -vc '^160000$')" = "$(cd "$w" && find . \( -type f -o -type l \) -print0 | tr -dc '\0' | wc -c | tr -d ' ')" ] || { echo "export does not match the tree" >&2; exit 1; }
           # check_env / check_setup come from BASE policy: the same env and prep the repo's CI uses for its checks
           { echo HOME=/tmp; jq -r '.check_env // {} | to_entries[] | "\(.key)=\(.value)"' "$p"; } > "$RUNNER_TEMP/check.env"
           run() { docker run --rm -u "$(id -u):$(id -g)" --env-file "$RUNNER_TEMP/check.env" -v "$w:/w" -w /w "$@"; }
-          # networked container: install from the PR's lockfile (nothing executes unless BASE policy sets install_scripts), then check_setup
-          { echo "npm ci $([ "$(jq -r '.install_scripts // false' "$p")" = true ] || echo --ignore-scripts)"; jq -r '.check_setup[]?' "$p"; } > "$RUNNER_TEMP/setup.sh"
+          # networked container: check_setup first (as before: it may prepare the lockfile), then install from the PR's
+          # lockfile (nothing executes during install unless BASE policy sets install_scripts)
+          { jq -r '.check_setup[]?' "$p"; echo "npm ci $([ "$(jq -r '.install_scripts // false' "$p")" = true ] || echo --ignore-scripts)"; } > "$RUNNER_TEMP/setup.sh"
           run -v "$RUNNER_TEMP/setup.sh:/setup.sh:ro" node:24 bash -e /setup.sh
           # no-network container: the checks themselves
           out="$RUNNER_TEMP/check-output.txt"; : > "$out"; ok=1
