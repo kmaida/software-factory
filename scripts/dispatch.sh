@@ -26,4 +26,7 @@ for project in $(jq -r 'keys[]' ~/.factory/registry.json); do
   echo "preflight: $project = $(jq -r '"\(.project.name): \(.issues | length) factory issue(s)"' <<<"$out")"
 done
 
-exec claude -p "/factory:factory-dispatch" --plugin-dir "$root" --permission-mode bypassPermissions
+# No MCP servers: --strict-mcp-config with an empty config drops the claude.ai connectors that come with the Claude
+# login (Linear among them), so the only Linear path in this process is scripts/linear.sh with the brokered token.
+exec claude -p "/factory:factory-dispatch" --plugin-dir "$root" --permission-mode bypassPermissions \
+  --strict-mcp-config --mcp-config '{"mcpServers":{}}'

@@ -16,7 +16,7 @@ So Keycard gives the factory: credentials brokered into each process with nothin
 
 A local process can never post a judge status or merge because the local token has neither permission and the secrets live only in Actions.
 
-Every local process, dispatch included, runs as `keycard agent exec --config keycard.toml --zone <zone> -- <command>`. The two `[[credentials.default]]` entries in `keycard.toml` become `GH_TOKEN` and `LINEAR_TOKEN` in that process and nowhere else. If a consent is missing or a token is rejected, `agent exec` or `scripts/linear.sh` exits non-zero with the reason; the sweep never degrades to "nothing to do".
+Every local process, dispatch included, runs as `keycard agent exec --config keycard.toml --zone <zone> -- <command>`. The two `[[credentials.default]]` entries in `keycard.toml` become `GH_TOKEN` and `LINEAR_TOKEN` in that process and nowhere else. If a consent is missing or a token is rejected, `agent exec` or `scripts/linear.sh` exits non-zero with the reason; the sweep never degrades to "nothing to do". The Claude processes themselves start with `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`: the claude.ai connectors that come with the Claude login (Linear, Google, Docs, …) are a personal, unbrokered path, and a sweep run without that flag was seen reading Linear through the connector with no token at all. With it, `claude -p` reports no MCP tools.
 
 ## Kim-only steps (one time)
 
