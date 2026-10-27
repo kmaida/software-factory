@@ -16,7 +16,7 @@ Not yet (Phase 3): a sandbox the agent can't escape (the worker is a Claude Code
 - `templates/factory-merge.yml` — the only merge path.
 - `scripts/linear.sh` — the factory's whole Linear surface: list a project's `factory` issues, read one, set state by name, assign, comment, over Linear's GraphQL API with the brokered `LINEAR_TOKEN`.
 - `scripts/dispatch.sh` — sweep entrypoint: preflight (registry, brokered tokens, every registered project readable), then the dispatch skill. Fails loudly instead of reporting "nothing to do".
-- `keycard.toml` — the single Keycard config for local processes (one provider per issuer per zone: `urn:github:factory` → `GH_TOKEN`, `urn:linear:factory` → `LINEAR_TOKEN`). Setup in `docs/keycard-setup.md`.
+- `keycard.toml` — the single Keycard config for local processes (one provider per issuer per zone: `urn:github:factory` → `GH_TOKEN`, `https://api.linear.app` → `LINEAR_TOKEN`). Setup in `docs/keycard-setup.md`.
 
 Run: `KEYCARD_ZONE=<zone> keycard agent exec --config keycard.toml --zone <zone> -- scripts/dispatch.sh` from this directory. The dispatch skill runs with `--permission-mode bypassPermissions`: under `auto`, the permission classifier refuses to spawn the worker subprocess and the sweep stops to ask. Workers themselves run under `auto`. Pause: `gh variable set FACTORY_PAUSED -b true -R owner/repo`.
 
