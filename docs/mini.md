@@ -60,6 +60,15 @@ keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- gh
 keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- scripts/linear.sh issues P-KIM-206 | jq .project.name   # "Plan My Today"
 ```
 
+## Inside the worker sandbox
+
+The worker's shell runs under Claude Code's macOS seatbelt sandbox (`worker-settings.json`), and two things the dispatcher's own shell can do are impossible there. Found on the first KIM-574 run (2026-10-27), reproduced with a `claude -p` diagnostic launched the same way, and handled in `skills/factory-worker/SKILL.md` step 2:
+
+| Symptom in the sandbox | Cause | What the worker does instead |
+|---|---|---|
+| `gh api …`, `gh pr create`: `tls: failed to verify certificate: x509: OSStatus -26276`, while `curl` and `git` reach `api.github.com` fine through the same proxy | The sandbox proxy is a plain CONNECT tunnel, so the real GitHub certificate arrives. Go's macOS verifier evaluates it by asking `trustd` over XPC, which the seatbelt denies; curl and git verify against `/etc/ssl/cert.pem`. No CA environment variable changes this on darwin. | `scripts/pr.sh` opens or updates the PR and applies the `factory` label through the REST API with curl and the brokered `GH_TOKEN`. `gh auth git-credential` still works (no network), so git pushes use it as an inline `-c credential.helper`. |
+| `git config --local …`, `git remote set-url`, `git push -u`: `could not lock config file …/plan-my-today/.git/config: Operation not permitted` | The worker is in a worktree; local config lives in the main checkout's `.git/config`, outside the sandbox's writable paths. | `git -c credential.helper='!gh auth git-credential' push https://github.com/<owner/repo>.git factory/<ID>`: no config write at all. |
+
 ## The LaunchAgent
 
 `templates/ai.keycard.factory.dispatch.plist` runs `keycard agent exec --config keycard.toml --zone $KEYCARD_ZONE -- scripts/dispatch.sh` every 1800 s and once at load. `dispatch.sh` checks the registry, that both tokens were brokered in, and that every registered Linear project is readable, then runs `claude -p "/factory:factory-dispatch" --permission-mode bypassPermissions`. A missing consent, a rejected token or an unreadable project is a non-zero `sweep exit` with the reason in `dispatch.err.log`. Install or update:

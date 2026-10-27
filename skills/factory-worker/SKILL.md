@@ -27,10 +27,8 @@ Run `/fable-loop` on the task. Rules that override anything else:
 ## 2. Open the PR
 
 ```bash
-git config --local credential.helper '!gh auth git-credential'   # git uses the brokered GH_TOKEN, not Kim's keychain
-git remote set-url origin "https://github.com/<owner/repo>.git"
-git push -u origin "factory/<ID>"
-gh pr create --label factory --title "<ID>: <issue title>" --body-file - <<'B'
+git -c credential.helper='!gh auth git-credential' push "https://github.com/<owner/repo>.git" "factory/<ID>"
+"${CLAUDE_PLUGIN_ROOT}/scripts/pr.sh" open <owner/repo> "factory/<ID>" "<ID>: <issue title>" <<'B'
 Closes <issue URL>
 factory-run: <the 8-hex id from the newest `factory: run …` comment on the issue>
 
@@ -47,7 +45,12 @@ factory-run: <the 8-hex id from the newest `factory: run …` comment on the iss
 ```
 B
 ```
-If the PR already exists (retry), `git push` and `gh pr edit` the body instead.
+`<owner/repo>` is the path of `git remote get-url origin`. `pr.sh` creates the PR into the default branch, or on a retry updates the existing PR's title and body, and makes sure it carries the `factory` label; it prints the PR URL. Run the same two commands on a retry.
+
+Exactly these commands, because of where you are running:
+- `git -c credential.helper=…` and the explicit push URL, never `git config --local`, `git remote set-url`, or `push -u`. You are in a git worktree: `.git` here is a file pointing into the main checkout, and `--local` config, remote URLs and upstream tracking all live in the main checkout's `.git/config`, which is outside this worktree and read-only under the sandbox ("could not lock config file …: Operation not permitted"). `-c` sets the helper for that one command only; `gh auth git-credential` turns the brokered `GH_TOKEN` into git credentials without any network call.
+- `scripts/pr.sh` (curl against the GitHub REST API), never `gh pr create`, `gh pr edit` or `gh api`. Inside the sandbox `gh` cannot verify any TLS certificate: Go's macOS verifier asks trustd over XPC, which the seatbelt denies (`x509: OSStatus -26276`), while curl and git verify against `/etc/ssl/cert.pem`. The proxy is a plain CONNECT tunnel; no CA setting fixes this.
+- If `pr.sh` exits non-zero, its stderr is the reason: put it in a `factory:` comment, move the issue to `👀 Needs Input`, and exit. Do not re-implement its REST calls by hand.
 
 ## 3. Hand off
 
@@ -55,4 +58,4 @@ If the PR already exists (retry), `git push` and `gh pr edit` the body instead.
 
 ## Budget
 
-If `/fable-loop` hits its fix-verify bound or you cannot reach a passing check: push what exists as a draft PR (`--draft`), `"$L" state <ID> "👀 Needs Input"`, `"$L" comment <ID> -` with a `factory:` comment holding the failing output and your hypothesis, exit. Dispatch and Kim take it from there.
+If `/fable-loop` hits its fix-verify bound or you cannot reach a passing check: push what exists and open the PR as a draft (`pr.sh open … --draft`), `"$L" state <ID> "👀 Needs Input"`, `"$L" comment <ID> -` with a `factory:` comment holding the failing output and your hypothesis, exit. Dispatch and Kim take it from there.
