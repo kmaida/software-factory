@@ -30,7 +30,7 @@ Shape: a queue in front, two independent reviewers behind, a deterministic merge
 | Policy | `.factory/policy.json`: allow and deny paths, size cap, allowed check commands, env for checks, the `auto_merge` switch | Each repo, read from the base commit so a PR can't edit its own rules |
 | Credentials | One GitHub App brokered by Keycard into local processes as `GH_TOKEN` | Keycard zone `1jgewf…` |
 
-Repo for the plugin: `~/Documents/Development/factory`. Four skills, three scripts, two workflow templates. The risk gate has a nine-case self-check; nothing else has tests yet.
+Repo for the plugin: `~/Development/factory`. Four skills, three scripts, two workflow templates. The risk gate has a nine-case self-check; nothing else has tests yet.
 
 ## 🔁 One issue's life (KIM-569, the first run)
 
