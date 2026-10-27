@@ -3,6 +3,7 @@
     "enabled": true,
     "network": {
       "allowedDomains": [
+        "api.linear.app",
         "github.com",
         "api.github.com",
         "codeload.github.com",
@@ -10,7 +11,10 @@
         "registry.npmjs.org",
         "*.npmjs.org"
       ],
-      "deniedDomains": ["169.254.169.254", "metadata.google.internal"]
+      "deniedDomains": [
+        "169.254.169.254",
+        "metadata.google.internal"
+      ]
     }
   }
 }
