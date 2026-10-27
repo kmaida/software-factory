@@ -297,4 +297,10 @@ Run against `git diff main...HEAD` after A0 was implemented in the templates. Al
 | `check_setup` was moved after `npm ci`; a policy that prepares the lockfile in `check_setup` broke | BLOCKER | Yes, regression | Order restored: `check_setup`, then `npm ci` |
 | `checkout-index` honors the `ident` attribute, so the export is not byte-identical to HEAD | MAJOR | No: every checkout, including the one that ships, expands `$Id$` the same way; the export matches what runs anywhere | Not adopted |
 
+### Implementation of A0, fifth pass: REFUTED, 1 finding
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| `check_setup` entries and `npm ci` ran in one shell; a `cd` or `exit` in an entry leaked into the install, where before each entry had its own `bash -c` | BLOCKER | Yes, regression | Entries run one per `bash -c` inside the container again |
+
 Not adopted, any round: "continuous external checkpoints" and "authenticated completion records" for the log, and per-run gateway authorization as a Phase A item. Each is the Phase B broker by another name; adding them to Phase A would be the same work twice.

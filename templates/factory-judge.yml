@@ -59,10 +59,11 @@ jobs:
           # check_env / check_setup come from BASE policy: the same env and prep the repo's CI uses for its checks
           { echo HOME=/tmp; jq -r '.check_env // {} | to_entries[] | "\(.key)=\(.value)"' "$p"; } > "$RUNNER_TEMP/check.env"
           run() { docker run --rm -u "$(id -u):$(id -g)" --env-file "$RUNNER_TEMP/check.env" -v "$w:/w" -w /w "$@"; }
-          # networked container: check_setup first (as before: it may prepare the lockfile), then install from the PR's
-          # lockfile (nothing executes during install unless BASE policy sets install_scripts)
-          { jq -r '.check_setup[]?' "$p"; echo "npm ci $([ "$(jq -r '.install_scripts // false' "$p")" = true ] || echo --ignore-scripts)"; } > "$RUNNER_TEMP/setup.sh"
-          run -v "$RUNNER_TEMP/setup.sh:/setup.sh:ro" node:24 bash -e /setup.sh
+          # networked container: each check_setup entry in its own shell, as before (a `cd` or `exit` in one must not leak),
+          # then install from the PR's lockfile (nothing executes during install unless BASE policy sets install_scripts)
+          jq -r '.check_setup[]?' "$p" > "$RUNNER_TEMP/setup.list"
+          printf '%s\n' 'while IFS= read -r s; do bash -c "$s"; done < /setup.list' "npm ci $([ "$(jq -r '.install_scripts // false' "$p")" = true ] || echo --ignore-scripts)" > "$RUNNER_TEMP/setup.sh"
+          run -v "$RUNNER_TEMP/setup.sh:/setup.sh:ro" -v "$RUNNER_TEMP/setup.list:/setup.list:ro" node:24 bash -e /setup.sh
           # no-network container: the checks themselves
           out="$RUNNER_TEMP/check-output.txt"; : > "$out"; ok=1
           while IFS= read -r c; do
