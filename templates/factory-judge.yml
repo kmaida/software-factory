@@ -58,7 +58,9 @@ jobs:
           [ "$(git ls-tree -r --format='%(objectmode)' "$HEAD" | grep -vc '^160000$')" = "$(cd "$w" && find . \( -type f -o -type l \) -print0 | tr -dc '\0' | wc -c | tr -d ' ')" ] || { echo "export does not match the tree" >&2; exit 1; }
           # check_env / check_setup come from BASE policy: the same env and prep the repo's CI uses for its checks
           { echo HOME=/tmp; jq -r '.check_env // {} | to_entries[] | "\(.key)=\(.value)"' "$p"; } > "$RUNNER_TEMP/check.env"
-          run() { docker run --rm -u "$(id -u):$(id -g)" --env-file "$RUNNER_TEMP/check.env" -v "$w:/w" -w /w "$@"; }
+          # /w (the export) and /tmp (HOME: caches, anything check_setup leaves for the checks) persist across the containers
+          mkdir -p "$RUNNER_TEMP/home"
+          run() { docker run --rm -u "$(id -u):$(id -g)" --env-file "$RUNNER_TEMP/check.env" -v "$w:/w" -v "$RUNNER_TEMP/home:/tmp" -w /w "$@"; }
           # networked container: each check_setup entry in its own shell, as before (a `cd` or `exit` in one must not leak),
           # then install from the PR's lockfile (nothing executes during install unless BASE policy sets install_scripts)
           jq -r '.check_setup[]?' "$p" > "$RUNNER_TEMP/setup.list"

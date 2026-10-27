@@ -303,4 +303,10 @@ Run against `git diff main...HEAD` after A0 was implemented in the templates. Al
 |---|---|---|---|
 | `check_setup` entries and `npm ci` ran in one shell; a `cd` or `exit` in an entry leaked into the install, where before each entry had its own `bash -c` | BLOCKER | Yes, regression | Entries run one per `bash -c` inside the container again |
 
+### Implementation of A0, sixth pass: REFUTED, 1 finding
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| State that `check_setup` left outside the workspace (`/tmp`, `$HOME` caches) was gone when the checks ran in a fresh container | BLOCKER | Yes, regression for such policies | One host directory is mounted as `/tmp` (which is `HOME`) in both containers |
+
 Not adopted, any round: "continuous external checkpoints" and "authenticated completion records" for the log, and per-run gateway authorization as a Phase A item. Each is the Phase B broker by another name; adding them to Phase A would be the same work twice.
