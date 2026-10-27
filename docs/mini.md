@@ -57,6 +57,7 @@ keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- gh
 keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- gh api -X POST \
   repos/kmaida/plan-my-today/statuses/$(git -C ~/Development/plan-my-today rev-parse origin/main) \
   -f state=success -f context=factory/judge-claude                                                      # HTTP 403
+#   (proves only that the statuses permission is read-only; merge denial is a separate test in the host doc, step 8)
 keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- scripts/linear.sh issues P-KIM-206 | jq .project.name   # "Plan My Today"
 ```
 
