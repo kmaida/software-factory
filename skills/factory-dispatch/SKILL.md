@@ -11,35 +11,39 @@ One sweep. Every state has an owner. Re-check state before every action; never a
 
 ```bash
 [[ -f ~/.factory/registry.json ]] || { echo "no registry; run /factory:factory-onboard first"; exit 1; }
+[[ -n $LINEAR_TOKEN && -n $GH_TOKEN ]] || { echo "not under keycard agent exec; run scripts/dispatch.sh as documented"; exit 1; }
 mkdir -p ~/.factory/logs
+L="${CLAUDE_PLUGIN_ROOT}/scripts/linear.sh"   # the only way this skill talks to Linear
 ```
 Run one dispatcher at a time (by hand, or one LaunchAgent), with `--permission-mode bypassPermissions`: under `auto` the permission classifier refuses to spawn the worker subprocess and the sweep stops to ask, which defeats the point. Never stop to ask a question in this skill; if something cannot be done, say so in the report and move on. There is no lock; every action re-checks state first, so an accidental overlap wastes a sweep rather than corrupting anything.
 For each repo in the registry: `gh variable get FACTORY_PAUSED -R <owner/repo>` equal to `true` → skip that repo entirely.
 
-`KEYCARD_ZONE` must be set; every worker is launched through `keycard agent exec` so it holds no credentials of its own.
+`KEYCARD_ZONE` must be set. The sweep itself runs under `keycard agent exec --config keycard.toml` (`scripts/dispatch.sh` is the entrypoint; the LaunchAgent and the by-hand command both use it), which brokers `GH_TOKEN` and `LINEAR_TOKEN` in; every worker is launched the same way, so no process holds credentials of its own. All Linear reads and writes go through `$L` (`issues`, `issue`, `state`, `assign`, `comment`; `$L` with no arguments prints the contract). It exits 1 with the reason on stderr when the token is rejected or a call fails.
+
+**A Linear failure is a precondition failure, never "nothing to do".** If `$L issues <project>` fails for any registered project, print its error and `exit 1` without touching anything.
 
 ## Sweep
 
 For every project id in `~/.factory/registry.json` (value = local repo path; `owner/repo` from `git -C <path> remote get-url origin`):
 
-Load the project's issues with the Linear MCP (`list_issues` filtered by project and label `factory`, with `state`, `comments`, `attachments`, `relations`). Then apply the table top to bottom, one action per issue per sweep.
+Load the project's issues: `"$L" issues <project id>` prints `{project, issues}`; each issue carries `state`, `priority`, `createdAt`, `description`, `assignee`, `comments` (oldest first, with `createdAt`, `user`, `body`), and `blockedBy` (`[{identifier, state, resolved}]`; "no unresolved blocked-by" = every entry has `resolved: true`). Then apply the table top to bottom, one action per issue per sweep. Writes: `"$L" state <ID> "<state name>"`, `"$L" assign <ID> me`, `"$L" comment <ID> "<body>"` (or `-` with the body on stdin for multi-line comments).
 
 | Issue state | Condition | Action |
 |---|---|---|
 | `🍎 To do` | no unresolved "blocked by"; body has `## Done when`; this repo has no issue currently `In Progress` | **claim then start** (below) |
-| `🍎 To do` | body lacks `## Done when` | `save_issue` state `👀 Needs Input`; `save_comment`: `factory: needs a "## Done when" section naming one of the checks in .factory/policy.json` |
+| `🍎 To do` | body lacks `## Done when` | state `👀 Needs Input`; comment: `factory: needs a "## Done when" section naming one of the checks in .factory/policy.json` |
 | `👩🏻‍💻 In Progress` | newest `factory:` comment older than 2h | PR exists for branch `factory/<ID>` → state `👓 In Review`; else retry (below) |
 | `👓 In Review` | both `factory/judge-*` statuses on the head SHA (`gh api repos/<r>/commits/<sha>/status`) and either description starts with `REFUTED` | retry (below) with the judge findings |
-| `👓 In Review` | both judge statuses present, any `failure`, none `REFUTED` (i.e. `CAVEATS`) | policy `on_caveats` is `review` → `save_comment` once `factory: caveats at <sha>, needs your review`, Kim's. Otherwise (default `retry`): no `factory: retry` comment yet for this issue → retry (below) with the judge findings; a retry already happened → `save_comment` once `factory: caveats again at <sha> after a retry, needs your review`, Kim's. |
+| `👓 In Review` | both judge statuses present, any `failure`, none `REFUTED` (i.e. `CAVEATS`) | policy `on_caveats` is `review` → comment once `factory: caveats at <sha>, needs your review`, Kim's. Otherwise (default `retry`): no `factory: retry` comment yet for this issue → retry (below) with the judge findings; a retry already happened → comment once `factory: caveats again at <sha> after a retry, needs your review`, Kim's. |
 | `👓 In Review` | PR red / conflicted / closed-unmerged for over 1h | retry (below) |
-| `👓 In Review` | PR merged | state `✅ Done`; `save_comment`: `factory: merged <pr-url>` |
+| `👓 In Review` | PR merged | state `✅ Done`; comment: `factory: merged <pr-url>` |
 | `👀 Needs Input`, `⛔️ Blocked`, anything else | — | nothing. Kim's. |
 
 Order `To do` candidates by priority, then oldest `createdAt`.
 
 ### Claim then start
 
-1. `save_issue`: state `👩🏻‍💻 In Progress`, assignee me. `save_comment`: `factory: run <8-hex-id> <ISO timestamp>`. The claim is written **before** anything starts.
+1. `"$L" state <ID> "👩🏻‍💻 In Progress"`, `"$L" assign <ID> me`, `"$L" comment <ID> "factory: run <8-hex-id> <ISO timestamp>"`. The claim is written **before** anything starts.
 2. Start the worker, detached, logging to `~/.factory/logs/<ID>.log`:
 ```bash
 repo=<local path>; id=<ISSUE-ID>; wt="$(dirname "$repo")/$(basename "$repo")-factory-$id"
@@ -69,7 +73,7 @@ run=$(gh run list -R <r> --workflow factory-judge.yml --json databaseId,headSha 
 gh run download "$run" -R <r> -n "judge-transcripts-<sha>" -D "$d"
 for m in claude codex; do echo "## $m"; grep -E '^(- |\* |[0-9]+\. |VERDICT)' "$d/$m.txt" | tail -15; done
 ```
-Append that output to the retry comment under `Judge findings at <sha>:`, with: "Keep the existing PR and push to its branch. Out of scope is unchanged." A worker must never be sent back without the findings; an empty retry just repeats the same mistake.
+Append that output to the retry comment under `Judge findings at <sha>:`, with: "Keep the existing PR and push to its branch. Out of scope is unchanged." (Pipe the whole comment to `"$L" comment <ID> -`.) A worker must never be sent back without the findings; an empty retry just repeats the same mistake.
 
 ## Report
 
