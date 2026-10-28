@@ -60,14 +60,18 @@ elif git -C "$repo" ls-remote -q --exit-code origin "factory/$id" >/dev/null; th
 else                                                                                         # first run: the tree is origin/HEAD
   git -C "$repo" worktree add -b "factory/$id" "$wt" origin/HEAD || fail "git worktree add -b factory/$id"
   lock=$wt/npm-shrinkwrap.json; [[ -f $lock ]] || lock=$wt/package-lock.json
-  if [[ -f $lock ]]; then                                                                    # warm node_modules here, never in the worker
-    jq -e '[.. | objects | .resolved? // empty | select(startswith("https://registry.npmjs.org/") | not)] == []' "$lock" >/dev/null \
-      || fail "a dependency in ${lock##*/} does not resolve to registry.npmjs.org; the warm-up installs registry tarballs only"
+  if [[ ! -f $lock ]]; then echo "warm-up skipped: no npm lockfile"
+  elif ! jq -e '(.lockfileVersion // 0) >= 2 and ([.packages | to_entries[] | select(.key | contains("node_modules/")) | .value | select(.link != true)
+                 | select(if has("resolved") then (.resolved | startswith("https://registry.npmjs.org/") | not)
+                          else ((.version // "") | test("^[0-9]+\\.[0-9]+\\.[0-9]+") | not) end)] == [])' "$lock" >/dev/null; then
+    echo "warm-up skipped: ${lock##*/} is v1 or has a dependency that is not a registry.npmjs.org package; worker runs cold"
+  else                                                                                       # warm node_modules here, never in the worker
     (cd "$wt" && env -u GH_TOKEN -u LINEAR_TOKEN perl -e '
         setpgrp; alarm 600;                                # own process group; 10 minutes, then the whole group dies
         $SIG{ALRM} = sub { $SIG{TERM} = "IGNORE"; kill TERM => -$$; sleep 5; kill KILL => -$$ };
-        system @ARGV; exit($? ? 1 : 0)' -- npm ci --ignore-scripts --no-audit --no-fund) \
-      || { rm -rf "$wt/node_modules"; fail "npm ci --ignore-scripts in $wt (10-minute limit)"; }
+        system @ARGV; exit($? ? 1 : 0)' -- npm ci --ignore-scripts --no-audit --no-fund \
+          --registry=https://registry.npmjs.org/ --replace-registry-host=never --userconfig=/dev/null) \
+      || { git -C "$repo" worktree remove --force "$wt"; git -C "$repo" branch -D "factory/$id"; fail "npm ci --ignore-scripts in $wt (10-minute limit); worktree removed so the retry starts fresh"; }
   fi
 fi
 # The install runs only on the first run, when the worktree is exactly origin/HEAD: the lockfile and any .npmrc are base's,
@@ -76,8 +80,12 @@ fi
 # the worker, so this is the only install. Always --ignore-scripts, and the two brokered tokens are dropped from the
 # install's environment so an .npmrc `${GH_TOKEN}` has nothing to expand; scripts/pr.sh shows a script could still get
 # tokens back from keycard, which is why scripts stay off. --ignore-scripts does not cover git dependencies (a git
-# dependency's own .npmrc can point npm at a different git binary), so the lockfile guard refuses anything that is not
-# a registry tarball; a project with a git or tarball dependency runs cold and lands in Needs Input. Packages install
+# dependency's own .npmrc can point npm at a different git binary), so the lockfile guard skips the install unless the
+# lockfile is v2+ and every installed entry either resolves to a registry.npmjs.org tarball or, when npm left `resolved`
+# out (it does, for entries it had cached), has a plain semver `version`, which npm can only fetch as name@version from
+# the registry (v1 can hide a git dependency in `version`); such a project runs cold and lands in Needs Input. The CLI
+# --registry and --replace-registry-host=never outrank any .npmrc or npm_config_* in this shell, and --userconfig=/dev/null
+# drops the operator's ~/.npmrc, so the only config left is the command line and base's own .npmrc. Packages install
 # without their lifecycle scripts, so a build that needs them fails and routes to Needs Input; install_scripts: true
 # applies only in the CI judge. The 10-minute limit keeps claim-to-worker-start well inside the 2h stale threshold
 # (the worker's own budget is 90 minutes), and the group kill takes npm's children (git, ssh) with it.
