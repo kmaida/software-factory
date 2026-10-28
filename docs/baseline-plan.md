@@ -444,7 +444,7 @@ gh pr view 18 -R $R --json state,mergedAt,headRefOid,mergeCommit
 gh api "repos/$R/commits/<merge commit>" --jq '{author: .commit.author, committer: .commit.committer, verified: .commit.verification.verified, parents}'
 gh api --paginate "repos/$R/issues/18/comments"; gh api --paginate "repos/$R/issues/18/events"
 gh run view 40722444110 -R $R --json jobs --jq '.jobs[] | select(.name == "gate") | .steps[] | "\(.conclusion) \(.name)"'   # the gate run that held the key
-gh run view 40722444110 -R $R --log | sed -E $'s/^[^\\t]*\\t[^\\t]*\\t[^ ]+ //' | grep -E '^\s*(OUT|HEAD|BASE|N): '   # gh prefixes every line with job, step and timestamp; strip them, then the step env blocks: what the gate computed, as logged, not as commented
+gh run view 40722444110 -R $R --log | sed -E $'s/^[^\t]*\t[^\t]*\t[^ ]+ //' | grep -E '^\s*(OUT|HEAD|BASE|N): '   # gh prefixes every line with job, step and timestamp; strip them, then the step env blocks: what the gate computed, as logged, not as commented
 keycard agent api '/zones/{zone}/events?limit=100&order=asc&filter[from]=2026-10-27T19:00:00Z' --zone <zone> --org <org>   # then page_token=<page_info.next_page_token>
   | jq '.items[] | select(.action.action == "credentials:issue") | [.occurred_at, .entity.credential_provider, .entity.attributes.grant_type, .state.status, .session_id]'
 ```
@@ -487,5 +487,13 @@ Run against `git diff main...HEAD` after A3 was implemented (docs, `linear.sh at
 |---|---|---|---|
 | The record read "legacy entries rejected, genuine REFUTED accepted" as evidence of signature verification; legacy descriptions fail the gate's field guard before any HMAC, so the same outcomes occur with the comparison deleted. Codex ran the step's loop on fixtures: the current verifier rejects a well-formed pair with a zero signature, a copy with the comparison removed accepts it, and the two recorded cases cannot tell them apart | MAJOR | Yes, as a claim about what A3's test shows; the control itself is A0's and A0's done-when is the test that exercises it | The record says so: this test does not exercise the HMAC comparison, A0's forged-pair done-when does |
 | The recorded extraction `grep -E '^\s*(OUT\|HEAD\|BASE\|N): '` matches nothing, because `gh run view --log` prefixes every line with job, step and timestamp | MINOR | Yes, reproduced | The command strips the prefixes first; re-run against the pilot, it prints the `N`, `HEAD`, `BASE` and `OUT` lines quoted above |
+
+### Implementation of A3, fifth pass: CAVEATS, 1 finding
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| The repaired extraction was transcribed into the record with `\\t` inside the `$'…'` expression, which BSD `sed` reads as a literal backslash and `t`, so the prefixes stay and the grep is empty again; the command that was actually run had single backslashes | MINOR | Yes, reproduced | The record carries the command as run; the line was then copied out of this file verbatim and run against the pilot, and it prints the `OUT` line |
+
+Applied without another pass, as with A1's eighth and A2's sixth. Five passes: 3, 2, 1, 2, 1 findings. The shape: the mechanism (`linear.sh attach`, the wrapper) was done after two passes; the other seven findings were about the record itself, which kept citing as a witness something a PR-added workflow could alter (the PR comment) or reading as proof something that proved less than claimed (the legacy entries, the `always()` wording), until the only witnesses left were the signed status list, the gate's logged step env, and Keycard's rows. That is A3's point made against its own record.
 
 Two things the test showed that the item did not say. A commit pushed with the brokered App installation token (`06a6c35`, committer "Kim's Software Factory", `verified: true`) looks GitHub-verified, but the App token is the shared identity, so "verified" means "pushed with the App's token," not "pushed by the merge job"; the merge App's *merge commits* are the independent record, not every commit the App's name appears on. And the `post` job does not post when the `checks` job is skipped (unlabeled PR, or a base that is not the default branch); that is by design (no signed status exists until a labeled run on the default branch), and it means an unlabeled PR has no entry in the independent record at all.
