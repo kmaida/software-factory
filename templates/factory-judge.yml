@@ -189,11 +189,14 @@ jobs:
           # The key is still in this step's env (inherent to running an agent with a key); the runner is ephemeral and the key is judge-only.
           export CODEX_HOME=$(mktemp -d); chmod 700 "$CODEX_HOME"
           printenv OPENAI_API_KEY | "$codex" login --with-api-key
-          # read-only: the model's shell commands can read the disk (so `git diff` works) and write nothing. Codex's default
-          # Linux sandbox (bubblewrap) could not start on a GitHub-hosted runner (RTM_NEWADDR EPERM: it wants a netns);
-          # use_legacy_landlock is the namespace-free sandbox, deprecated but present in the pinned 0.164.
+          # read-only: the model's shell commands can read the disk (so `git diff` works) and write nothing. Codex's Linux
+          # sandbox (bubblewrap) needs an unprivileged user namespace, which Ubuntu 24.04 runners refuse by AppArmor policy
+          # (seen as RTM_NEWADDR EPERM when it set up the netns). Lifting that one restriction is the documented fix; the
+          # deprecated use_legacy_landlock fallback tried before let codex start but failed every command, so it reviewed
+          # from the diff alone and reported CAVEATS on itself.
           # ponytail: if the sandbox still cannot start, there is no verdict and post fails closed to CAVEATS; fix here, never fall back to danger-full-access.
-          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE "$codex" exec --sandbox read-only --enable use_legacy_landlock --skip-git-repo-check "$(cat "$RUNNER_TEMP/prompt.md")" > "$RUNNER_TEMP/codex.txt" 2>&1 || true
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 >/dev/null
+          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE "$codex" exec --sandbox read-only --skip-git-repo-check "$(cat "$RUNNER_TEMP/prompt.md")" > "$RUNNER_TEMP/codex.txt" 2>&1 || true
           rm -rf "$CODEX_HOME"
       - name: Verdict as job output (whole line only, sanitized; anything else becomes CAVEATS downstream)
         id: out
