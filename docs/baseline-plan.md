@@ -1,6 +1,6 @@
 # Closing the gaps against the agentbaseline.org reference architecture
 
-Status: plan, 2026-10-27, revision 9. Nothing here is implemented yet. Revisions 1 through 7 were refuted by Codex; revision 8 came back CAVEATS with two wording fixes, applied here without another pass. The findings and what changed are at the end.
+Status: plan, 2026-10-27, revision 9. A0 landed 2026-10-27 (PR 14) and A1 on 2026-10-28; A2 through A8 are not implemented. Revisions 1 through 7 were refuted by Codex; revision 8 came back CAVEATS with two wording fixes, applied here without another pass. The findings and what changed are at the end.
 
 **Headline, found in revision 7:** today, before any of this plan, a worker PR that adds a workflow file can read `FACTORY_APP_PRIVATE_KEY`, `ANTHROPIC_API_KEY`, and `OPENAI_API_KEY`, because they are repository secrets and same-repo `pull_request` workflows receive repository secrets. The worker skill's "never edit `.github/`" is prose. A0 fixes this first; nothing else in Phase A matters until it lands.
 
@@ -17,8 +17,8 @@ One fact that shapes every residual below: **dispatch and the worker are the sam
 | Boundary | Enforced by today | Gap |
 |---|---|---|
 | 1 Sandbox | Worker: Claude Code seatbelt, non-admin `softwarefactory` user on the mini. Judge: ephemeral Actions runner, `permissions: {}`, no secrets in the job that runs PR code. | Worker sandbox is a developer-machine sandbox, not one the agent can't escape. |
-| 2 Network | `worker-settings.json` allowlist + `auto` classifier, inside the agent. Keycard brokers tokens in. Metadata IPs denied. No MCP servers. | Not default-deny, and the control lives inside the agent process. npm registry is open. |
-| 3 Supply chain | Policy denies manifests and lockfiles at merge. Judge CLIs pinned by version. | Admission happens at merge, not at fetch. Pins are by tag/version, not content. No model gateway. **The judge workflow itself is PR-mutable (A0).** |
+| 2 Network | `worker-settings.json` allowlist + `auto` classifier, inside the agent. Keycard brokers tokens in. Metadata IPs and the npm registry denied; dispatch installs `node_modules` from the committed lockfile with `--ignore-scripts` before the worker starts (A1). No MCP servers. | Not default-deny, and the control lives inside the agent process. |
+| 3 Supply chain | Policy denies manifests and lockfiles at merge. Judge workflow and prompt come from base and PR code runs only in containers (A0). Workers cannot fetch packages (A1). Judge CLIs pinned by version. | Pins are by tag/version, not content. No model gateway. |
 | 4 Identity | Keycard broker + zone audit log. Merge App key only in Actions. Statuses only from CI. | Level 1 shape. The brokered token is a repo-wide bearer shared by dispatch and worker; "only your branch and issue" is prose in the worker skill, not an enforced scope. Profile is split between the repo (`policy.json`) and the plugin checkout on the mini (`worker-settings.json`, skills), and neither half is authenticated. |
 | Record | Keycard audit + GitHub statuses + Actions logs + Linear comments share a run id. | `~/.factory/logs` and every Linear comment are written by the shared identity, so neither is independent of the worker. |
 
@@ -76,7 +76,7 @@ Change:
 
 Done when: a worker that runs `npm install left-pad` sees a sandbox denial for `registry.npmjs.org` in its log; a fresh worktree passes `npm test` with no outbound connection from the worker's process group to the registry (verified from the `pf` log in A4, or from the sandbox log before A4 lands).
 
-Residual: `npm install github:owner/repo` and `npm install https://…/x.tgz` still work, because `codeload.github.com` and `objects.githubusercontent.com` stay allowed for git and the `npm` client is not what is denied. So do `curl | sh` from an allowed host, and a package already in `~/.npm/_cacache`. What A1 closes is the default path that runs third-party code with one command; it does not close deliberate download-and-execute. The seatbelt confines the write set; the tokens in the worker's environment are the exposure, and only Phase B's credential-free worker removes them.
+Residual: `npm install github:owner/repo` and `npm install https://…/x.tgz` still work, because `codeload.github.com` and `objects.githubusercontent.com` stay allowed for git and the `npm` client is not what is denied. So do `curl | sh` from an allowed host, and a package already in `~/.npm/_cacache`. The deny list names the registry and its common mirrors (yarnpkg, npmmirror, GitHub Packages) by hostname; a mirror not on the list reaches the `auto` classifier, and an IP literal is not a hostname at all. A4 is the layer that sees addresses. What A1 closes is the default path that runs third-party code with one command; it does not close deliberate download-and-execute. The seatbelt confines the write set; the tokens in the worker's environment are the exposure, and only Phase B's credential-free worker removes them.
 
 ### A2. Pin by content, install from trusted sources (boundary 3)
 

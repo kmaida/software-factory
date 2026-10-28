@@ -58,6 +58,14 @@ if [[ -d $wt ]]; then                                                           
 elif git -C "$repo" ls-remote -q --exit-code origin "factory/$id" >/dev/null; then           # retry, worktree gone: track the branch
   git -C "$repo" worktree add "$wt" "factory/$id" || fail "git worktree add $wt from factory/$id"
 else git -C "$repo" worktree add -b "factory/$id" "$wt" origin/HEAD || fail "git worktree add -b factory/$id"; fi   # first run
+if [[ -f $wt/package-lock.json && ! -d $wt/node_modules ]]; then                           # fresh worktree: install here, never in the worker
+  (cd "$wt" && npm ci --ignore-scripts --no-audit --no-fund) || fail "npm ci --ignore-scripts in $wt"
+fi
+# worker-settings.json denies registry.npmjs.org to the worker, so node_modules must exist before it starts. Always
+# --ignore-scripts: this shell holds the brokered tokens and the login keychain, and scripts/pr.sh shows any process
+# in this uid can get tokens back from keycard. A project whose dependencies need install scripts runs cold and its
+# checks fail, which routes the issue to Needs Input; install_scripts: true applies only in the CI judge.
+# ponytail: npm only; add pnpm/yarn when a registered project uses one.
 ```
 3. Start the worker, detached, logging to `~/.factory/logs/<ID>-<run>.log` (one file per run; a retry does not overwrite the previous run's log):
 ```bash
