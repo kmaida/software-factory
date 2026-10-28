@@ -63,8 +63,9 @@ else                                                                            
   if [[ ! -f $lock ]]; then echo "warm-up skipped: no npm lockfile"
   elif ! jq -e '(.lockfileVersion // 0) >= 2 and ([.packages | to_entries[] | select(.key | contains("node_modules/")) | .value | select(.link != true)
                  | select(if has("resolved") then (.resolved | startswith("https://registry.npmjs.org/") | not)
-                          else ((.version // "") | test("^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$") | not) end)] == [])' "$lock" >/dev/null \
-    || ! (cd "$wt" && git ls-files -z -- package.json '*/package.json' ':!*node_modules*' | xargs -0 jq -n -e \
+                          else ((.version // "") | test("^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$") | not) end)] == [])
+                 and ([.packages[] | (.dependencies, .devDependencies, .optionalDependencies, .peerDependencies) // empty | .. | strings | select(test("[:/#]"))] == [])' "$lock" >/dev/null \
+    || ! (cd "$wt" && git ls-files -z -- package.json '*/package.json' | xargs -0 jq -n -e \
          '[inputs | [.dependencies, .devDependencies, .optionalDependencies, .peerDependencies, .overrides | .. | strings | select(test("[:/#]"))] == []] | all') >/dev/null; then
     echo "warm-up skipped: ${lock##*/} is v1, or it or a package.json names a dependency that is not a registry.npmjs.org package; worker runs cold"
   else                                                                                       # warm node_modules here, never in the worker
@@ -72,7 +73,7 @@ else                                                                            
         setpgrp; alarm 300;                                # own process group; 5 minutes, then the whole group dies
         $SIG{ALRM} = sub { $SIG{TERM} = "IGNORE"; kill TERM => -$$; sleep 5; kill KILL => -$$ };
         system @ARGV; exit($? ? 1 : 0)' -- npm ci --ignore-scripts --no-audit --no-fund \
-          --registry=https://registry.npmjs.org/ --replace-registry-host=never --userconfig=/dev/null --globalconfig=/var/empty/npmrc) \
+          --registry=https://registry.npmjs.org/ --replace-registry-host=never --userconfig=/dev/null --globalconfig=/var/empty/npmrc --git=/usr/bin/false) \
       || { git -C "$repo" worktree remove --force "$wt"; git -C "$repo" branch -D "factory/$id"; fail "npm ci --ignore-scripts in $wt (5-minute limit); worktree removed so the retry starts fresh"; }
   fi
 fi
@@ -86,10 +87,13 @@ fi
 # dependency's own .npmrc can point npm at a different git binary), so the lockfile guard skips the install unless the
 # lockfile is v2+ and every installed entry either resolves to a registry.npmjs.org tarball or, when npm left `resolved`
 # out (it does, for entries it had cached), has a plain semver `version`, which npm can only fetch as name@version from
-# the registry (v1 can hide a git dependency in `version`), and every dependency spec in every tracked package.json
-# (overrides included) is a plain range with no `:`, `/` or `#`: npm ci builds the ideal tree from the manifests before it
-# checks them against the lockfile, so a git URL declared only in a manifest is fetched first and rejected after. Such
-# a project runs cold and lands in Needs Input. With
+# the registry (v1 can hide a git dependency in `version`), no dependency map inside the lockfile names a URL, and every
+# dependency spec in every tracked package.json (overrides included) is a plain range with no `:`, `/` or `#`: npm ci
+# builds the ideal tree from the manifests before it checks them against the lockfile, so a git URL declared only in a
+# manifest, or only in a lockfile entry's own dependency map, is fetched first and rejected after. Such a project runs
+# cold and lands in Needs Input. The guards are what we can read; --git=/usr/bin/false is the backstop for the shapes
+# we cannot: npm runs the configured git binary for every git fetch, so any git dependency that slips past the guards
+# fails at clone, before anything the dependency controls can run. With
 # --userconfig at /dev/null, --globalconfig at a path that does not exist (npm refuses the same path twice) and the
 # environment scrubbed, npm's configuration is the command line
 # and base's own .npmrc, nothing else; base's .npmrc is trusted exactly as far as base's lockfile is (a scoped registry
