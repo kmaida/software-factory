@@ -56,12 +56,14 @@ jobs:
         if: steps.pr.outputs.skip != '1' && steps.pr.outputs.factory == 'true'
         uses: actions/checkout@v4
         with: { ref: "${{ github.event.repository.default_branch }}", fetch-depth: 0 }
-      - name: CI green? (judge statuses excluded; the gate checks those)
+      - name: CI green? (the judge's statuses and jobs, and this workflow's own job, are excluded; the gate checks the verdicts)
         if: steps.pr.outputs.skip != '1' && steps.pr.outputs.factory == 'true'
         id: ci
         env: { GH_TOKEN: "${{ github.token }}", N: "${{ steps.pr.outputs.number }}" }
         run: |
-          bad=$(gh pr checks "$N" -R "$GITHUB_REPOSITORY" --json name,state --jq '[.[] | select(.name|startswith("factory/judge-")|not) | select(.state!="SUCCESS")] | length')
+          # The judge's `post` job fails by design unless both verdicts are VERIFIED, and this job is in progress while
+          # it looks; neither is CI. Only the repo's own workflows count here.
+          bad=$(gh pr checks "$N" -R "$GITHUB_REPOSITORY" --json name,state,workflow --jq '[.[] | select(.name|startswith("factory/judge-")|not) | select(.workflow!="factory-judge" and .workflow!="factory-merge") | select(.state!="SUCCESS")] | length')
           echo "ok=$([ "$bad" = 0 ] && echo 1 || echo 0)" >> "$GITHUB_OUTPUT"
       - name: Verify signed verdicts (highest (run, attempt) valid signature per model must be VERIFIED; both from one attempt)
         if: steps.ci.outputs.ok == '1'
@@ -103,7 +105,8 @@ jobs:
           { echo "out<<$d"; printf '%s\n' "$out"; echo "$d"; } >> "$GITHUB_OUTPUT"
           echo "verdict=$v" >> "$GITHUB_OUTPUT"   # written last, after the untrusted block
       - name: Comment if review
-        if: steps.gate.outputs.verdict == 'review' || steps.sig.outputs.ok == '0'
+        # a skipped step's output is null, and null == '0' is TRUE in an expression (both coerce to 0): check the outcome first
+        if: steps.gate.outputs.verdict == 'review' || (steps.sig.outcome == 'success' && steps.sig.outputs.ok == '0')
         env: { GH_TOKEN: "${{ github.token }}", N: "${{ steps.pr.outputs.number }}", OUT: "${{ steps.gate.outputs.out || steps.sig.outputs.out }}" }
         run: |
           gh pr comment "$N" -R "$GITHUB_REPOSITORY" -b "factory: not auto-mergeable — $OUT"
