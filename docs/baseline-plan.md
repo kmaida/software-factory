@@ -422,3 +422,9 @@ Run against `git diff main...HEAD` after A2 was implemented in the templates.
 |---|---|---|---|
 | The "live entry" test was an enumeration: an `allow` list naming one action, or a `target-branch` other than the default, passes it and still covers none of the factory's pins | MAJOR | Yes | No liveness test. An existing entry for the same ecosystem and directory stops onboarding with the entry quoted in the report; reconciling it is Kim's |
 | Optional packages may be absent unconditionally, so a missing current-platform native package passed the assertion and `install.cjs` returned success leaving the placeholder | MINOR | Yes | Each install step runs its CLI's `--version` before the key step; the placeholder exits 1 |
+
+### Implementation of A2, fifth pass: REFUTED, 1 finding
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| Onboarding looked for `dependabot.yml` only; a repo using `dependabot.yaml` would get a second file instead of a merge | MAJOR | Yes | Onboarding checks both names and merges into whichever exists |
