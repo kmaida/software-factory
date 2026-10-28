@@ -1,7 +1,7 @@
 # Software factory: what we built and how it follows the agentbaseline reference architecture
 
 Author: Kim Maida, with Claude Code (Fable 5.1)
-Last updated: Oct 26, 2026
+Last updated: Oct 28, 2026
 Status: Phase 1, running on one repo (plan-my-today). Phase 2 (auto-merge) gated on metrics. Phase 3 (Mac mini + egress proxy) waiting on hardware.
 
 Purpose of this doc: a record of what we built in one day, how each piece lines up with the [agentbaseline software factory reference architecture](https://agentbaseline.org/reference-architecture), and the parts that broke on the way. Raw material for a demo, a blog post, or a video later. The plugin itself lives in this repo; the plan that produced it is in `~/.claude/plans/i-do-a-lot-lucky-micali.md`.
@@ -56,7 +56,7 @@ The reference names components and four boundaries, then defines three autonomy 
 | Egress proxy (attaches credentials; agent never holds them) | Keycard brokers `GH_TOKEN` into the process. For the worker's shell commands, Claude Code's sandbox refuses hosts outside `worker-settings.json` under `auto` mode | Partial (a real default-deny proxy outside the agent is Phase 3) |
 | Supply chain firewall | Workers can't touch lockfiles or manifests at all (policy deny). Judge CLIs pinned by version | Partial (no admission point or cooldown for packages) |
 | Model gateway | None; Claude Code and Codex talk to their providers directly | Phase 3 |
-| Tamper-evident record linked by run id | Keycard audit log + GitHub statuses + Actions logs + Linear comments share one run id. `~/.factory/logs` is agent-writable | Partial |
+| Tamper-evident record linked by run id | Independent of the worker: the signed `factory/judge-*` statuses, the judge and merge run logs, the merge App's commits, Keycard's exchange log. Context only: Linear, the PR body, `~/.factory/logs` (see "The record" below) | Partial (the run id itself is carried only by the worker-written records; A7) |
 | Monitoring agent (Level 3) | None; `scripts/stats.sh` counts merges and reverts by hand | Not started |
 
 ### Boundary 1: sandbox
@@ -74,6 +74,16 @@ Two cheap controls do most of the work for now. Workers can't change the root `p
 ### Boundary 4: identity and access
 
 This is the boundary Keycard is for, and it's where the document and the product disagreed with each other the most. Details in the next section. Net result: every local factory process acts as me, through one brokered GitHub credential it never sees on disk; anything that could forge an approval or merge runs where no local process has the token.
+
+### The record: which pieces are independent of the worker
+
+Dispatch and the worker run as the same uid and the same Keycard principal, so they hold the same `GH_TOKEN` and `LINEAR_TOKEN`. Anything one of them writes, the other could have written or edited. So the record is sorted by who else could have produced it, not by where it is stored:
+
+- **Independent as to authorship and deletion:** the HMAC-signed `factory/judge-*` entries in the full commit status list (`GET /repos/:r/commits/:sha/statuses`). The list is append-only, and only a run of the judge workflow taken from `main` can produce a valid signature. Forged entries can be added beside them and fail the signature; genuine ones cannot be removed.
+- **Independent as to authorship only:** the logs of `pull_request_target` runs of `factory-judge.yml` and `factory-merge.yml` (a PR cannot redefine them; a PR-added workflow with `actions: write` can delete them); the merge App's squash commits, now that the App key lives in the `factory` environment where no PR-added workflow can read it; Keycard's zone audit log, which records every credential exchange (not the API calls made afterwards with the exported bearer).
+- **Context only:** Linear comments, the PR body, and `~/.factory/logs`. All written by the shared identity. Dispatch attaches the worker's log to the Linear issue when the worker exits, titled as context, so it is easy to find; it is never evidence.
+
+The test that this sorting is right: with the local log out of reach and the Linear claim comment edited to a different run id, reconstruct a pilot run from GitHub and Keycard alone. Done on 2026-10-28 for plan-my-today PR 18 at `fd01e5d`: head SHA, both signed verdicts, the absence of a merge at that head, and the token exchanges in the window all came back from `gh` and `keycard agent api`, and none of them carries the factory run id the edited comment claims. The commands and the result are in `docs/baseline-plan.md` under the A3 review record. One nuance: a commit pushed with the brokered App installation token shows as GitHub-verified with the App as committer. That proves the push used the App's token, which is the shared identity, not which process held it.
 
 ## 🔑 What Keycard does here, and three things I had to learn
 

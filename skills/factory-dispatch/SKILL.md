@@ -106,19 +106,23 @@ fi
 # holds at most 11 repos before the lock needs renewing from inside the sweep.
 # ponytail: npm only; add pnpm/yarn when a registered project uses one.
 ```
-3. Start the worker, detached, logging to `~/.factory/logs/<ID>-<run>.log` (one file per run; a retry does not overwrite the previous run's log):
+3. Start the worker, detached, logging to `~/.factory/logs/<ID>-<run>.log` (one file per run; a retry does not overwrite the previous run's log). When the worker exits, the wrapper attaches that log to the Linear issue, titled as context: it is written by the worker's own uid, so it is never evidence (the signed `factory/judge-*` statuses, the Actions logs and the Keycard audit log are; see A3 in `docs/baseline-plan.md`).
 ```bash
-( cd "$wt" && perl -e '
-    setpgrp; alarm 5400;                                   # own process group; 90 minutes wall clock
-    $SIG{ALRM} = sub { warn "factory: 90-minute timeout, killing process group $$\n";
-                       $SIG{TERM} = "IGNORE"; kill TERM => -$$; sleep 10; kill KILL => -$$ };
-    system @ARGV; exit($? >> 8)' -- \
-    keycard agent exec --config "${CLAUDE_PLUGIN_ROOT}/keycard.toml" --zone "$KEYCARD_ZONE" -- \
-      claude -p "/factory:factory-worker $id" --plugin-dir "${CLAUDE_PLUGIN_ROOT}" \
-        --settings "${CLAUDE_PLUGIN_ROOT}/worker-settings.json" --permission-mode auto --max-turns 80 \
-        --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
-  ) > ~/.factory/logs/$id-$run.log 2>&1 &
+log=~/.factory/logs/$id-$run.log
+( ( cd "$wt" && perl -e '
+      setpgrp; alarm 5400;                                   # own process group; 90 minutes wall clock
+      $SIG{ALRM} = sub { warn "factory: 90-minute timeout, killing process group $$\n";
+                         $SIG{TERM} = "IGNORE"; kill TERM => -$$; sleep 10; kill KILL => -$$ };
+      system @ARGV; exit($? >> 8)' -- \
+      keycard agent exec --config "${CLAUDE_PLUGIN_ROOT}/keycard.toml" --zone "$KEYCARD_ZONE" -- \
+        claude -p "/factory:factory-worker $id" --plugin-dir "${CLAUDE_PLUGIN_ROOT}" \
+          --settings "${CLAUDE_PLUGIN_ROOT}/worker-settings.json" --permission-mode auto --max-turns 80 \
+          --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+    ) > "$log" 2>&1
+  "$L" attach "$id" "$log" "worker log $id-$run (context, not evidence: same uid as the worker)" >> "$log" 2>&1 ) &
 # budget: 80 turns and 90 minutes wall clock per run; worker-settings.json is the egress allowlist for the worker's shell commands.
+# The attach runs after the worker has exited (timeout kill included) with dispatch's own brokered LINEAR_TOKEN; its output
+# lands at the end of the log, after the upload has read it. Dispatch does not wait for either.
 # The timeout kills the whole process group (keycard, claude, and every shell command the worker spawned), not just the
 # top process: `alarm; exec` would hand SIGALRM to keycard alone and leave its children running.
 # No MCP servers in the worker (same flags as dispatch.sh): the claude.ai connectors that come with the Claude login, Linear

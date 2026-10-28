@@ -7,6 +7,7 @@
 #   linear.sh state <ID> "<state name>"    move the issue to the workflow state with that name (emoji included)
 #   linear.sh assign <ID> [me]             assign the issue to the token's user
 #   linear.sh comment <ID> <body|->        add a comment (body as the argument, or on stdin with -)
+#   linear.sh attach <ID> <file> [title]   upload a file to Linear's file store and link it in the issue's Resources
 #
 # <project> is the Linear project identifier (P-KIM-206), its slug id, or its UUID. <ID> is an issue identifier (KIM-123).
 # Each issue is printed as: identifier, id, title, description, priority, createdAt, url, branchName, state, stateType,
@@ -147,6 +148,24 @@ case $cmd in
     gql 'mutation($iid: String!, $body: String!) { commentCreate(input: { issueId: $iid, body: $body }) { success comment { url } } }' \
         "$(jq -n --arg iid "$iid" --arg body "$body" '{iid: $iid, body: $body}')" \
       | jq -r '.commentCreate.comment.url'
+    ;;
+  attach)
+    # fileUpload returns a signed PUT URL plus the headers that are part of the signature; send them verbatim, then
+    # link the asset URL as an issue attachment. The file is context written by the same uid as the worker, never evidence.
+    [[ $# -ge 3 ]] || usage
+    file=$3; title=${4:-$(basename "$file")}
+    [[ -f $file ]] || die "attach: no such file: $file"
+    size=$(stat -f %z "$file" 2>/dev/null || stat -c %s "$file")
+    iid=$(issue_uuid "$id")
+    up=$(gql 'mutation($ct: String!, $fn: String!, $sz: Int!) { fileUpload(contentType: $ct, filename: $fn, size: $sz) {
+                success uploadFile { uploadUrl assetUrl headers { key value } } } }' \
+         "$(jq -n --arg fn "$(basename "$file")" --argjson sz "$size" '{ct: "text/plain", fn: $fn, sz: $sz}')")
+    hdrs=(); while IFS= read -r h; do hdrs+=(-H "$h"); done < <(jq -r '.fileUpload.uploadFile.headers[] | "\(.key): \(.value)"' <<<"$up")
+    curl -fsS -o /dev/null -X PUT --data-binary "@$file" -H 'Content-Type: text/plain' "${hdrs[@]}" "$(jq -r '.fileUpload.uploadFile.uploadUrl' <<<"$up")" \
+      || die "attach: upload of $file to Linear's file store failed"
+    gql 'mutation($iid: String!, $url: String!, $title: String!) { attachmentCreate(input: { issueId: $iid, url: $url, title: $title }) { success attachment { url } } }' \
+        "$(jq -n --arg iid "$iid" --arg url "$(jq -r '.fileUpload.uploadFile.assetUrl' <<<"$up")" --arg title "$title" '{iid: $iid, url: $url, title: $title}')" \
+      | jq -r '.attachmentCreate.attachment.url'
     ;;
   *) usage ;;
 esac
