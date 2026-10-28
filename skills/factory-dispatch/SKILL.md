@@ -57,7 +57,54 @@ if [[ -d $wt ]]; then                                                           
   git -C "$wt" pull -q --rebase origin "factory/$id" || { git -C "$wt" rebase --abort 2>/dev/null; fail "git pull --rebase in $wt"; }
 elif git -C "$repo" ls-remote -q --exit-code origin "factory/$id" >/dev/null; then           # retry, worktree gone: track the branch
   git -C "$repo" worktree add "$wt" "factory/$id" || fail "git worktree add $wt from factory/$id"
-else git -C "$repo" worktree add -b "factory/$id" "$wt" origin/HEAD || fail "git worktree add -b factory/$id"; fi   # first run
+else                                                                                         # first run: the tree is origin/HEAD
+  git -C "$repo" worktree add -b "factory/$id" "$wt" origin/HEAD || fail "git worktree add -b factory/$id"
+  lock=$wt/npm-shrinkwrap.json; [[ -f $lock ]] || lock=$wt/package-lock.json
+  if [[ ! -f $lock ]]; then echo "warm-up skipped: no npm lockfile"
+  elif ! jq -e '(.lockfileVersion // 0) >= 2 and ([.packages | to_entries[] | select(.key | contains("node_modules/")) | .value | select(.link != true)
+                 | select(if has("resolved") then (.resolved | startswith("https://registry.npmjs.org/") | not)
+                          else ((.version // "") | test("^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$") | not) end)] == [])
+                 and ([.packages[] | (.dependencies, .devDependencies, .optionalDependencies, .peerDependencies) // empty | .. | strings | select(test("[:/#]"))] == [])' "$lock" >/dev/null \
+    || ! (cd "$wt" && git ls-files -z -- package.json '*/package.json' | xargs -0 jq -n -e \
+         '[inputs | [.dependencies, .devDependencies, .optionalDependencies, .peerDependencies, .overrides | .. | strings | select(test("[:/#]"))] == []] | all') >/dev/null; then
+    echo "warm-up skipped: ${lock##*/} is v1, or it or a package.json names a dependency that is not a registry.npmjs.org package; worker runs cold"
+  else                                                                                       # warm node_modules here, never in the worker
+    (cd "$wt" && env -i HOME="$HOME" PATH="$PATH" perl -e '
+        setpgrp; alarm 300;                                # own process group; 5 minutes, then the whole group dies
+        $SIG{ALRM} = sub { $SIG{TERM} = "IGNORE"; kill TERM => -$$; sleep 5; kill KILL => -$$ };
+        system @ARGV; exit($? ? 1 : 0)' -- npm ci --ignore-scripts --no-audit --no-fund \
+          --registry=https://registry.npmjs.org/ --replace-registry-host=never --userconfig=/dev/null --globalconfig=/var/empty/npmrc \
+          --git=/usr/bin/false --proxy=http://127.0.0.1:9 --https-proxy=http://127.0.0.1:9 --noproxy=registry.npmjs.org) \
+      || { git -C "$repo" worktree remove --force "$wt"; git -C "$repo" branch -D "factory/$id"; fail "npm ci --ignore-scripts in $wt (5-minute limit); worktree removed so the retry starts fresh"; }
+  fi
+fi
+# The install runs only on the first run, when the worktree is exactly origin/HEAD: the lockfile and any .npmrc are base's,
+# which review already trusts. A retry worktree carries the worker's branch, so dispatch never installs from it; a worker
+# that broke its node_modules fails its own checks and lands in Needs Input. worker-settings.json denies the registry to
+# the worker, so this is the only install. Always --ignore-scripts, and the install's environment is only HOME and PATH,
+# so an .npmrc `${GH_TOKEN}` has nothing to expand and no npm_config_* (scoped registries included) survives; scripts/pr.sh
+# shows a script could still get
+# tokens back from keycard, which is why scripts stay off. --ignore-scripts does not cover git dependencies (a git
+# dependency's own .npmrc can point npm at a different git binary), so the lockfile guard skips the install unless the
+# lockfile is v2+ and every installed entry either resolves to a registry.npmjs.org tarball or, when npm left `resolved`
+# out (it does, for entries it had cached), has a plain semver `version`, which npm can only fetch as name@version from
+# the registry (v1 can hide a git dependency in `version`), no dependency map inside the lockfile names a URL, and every
+# dependency spec in every tracked package.json (overrides included) is a plain range with no `:`, `/` or `#`: npm ci
+# builds the ideal tree from the manifests before it checks them against the lockfile, so a git URL declared only in a
+# manifest, or only in a lockfile entry's own dependency map, is fetched first and rejected after. Such a project runs
+# cold and lands in Needs Input. The guards are what we can read; the backstop for the shapes we cannot is on the
+# installer itself: --git=/usr/bin/false makes every git fetch fail at clone, and every HTTP request except to
+# registry.npmjs.org and its subdomains (npm's own; --noproxy matches by suffix) goes to a proxy on 127.0.0.1:9 where
+# nothing listens, so a codeload tarball or any other host that npm resolves its way to fails at connect. With
+# --userconfig at /dev/null, --globalconfig at a path that does not exist (npm refuses the same path twice) and the
+# environment scrubbed, npm's configuration is the command line
+# and base's own .npmrc, nothing else; base's .npmrc is trusted exactly as far as base's lockfile is (a scoped registry
+# set there is honored). Packages install without their lifecycle scripts, so a build that needs them fails and routes
+# to Needs Input; install_scripts: true applies only in the CI judge. The 5-minute limit keeps claim-to-worker-start
+# well inside the 2h stale threshold (the worker's own budget is 90 minutes), and the group kill takes npm's children
+# with it. ponytail: the sweep lock goes stale at 60 minutes and each registered repo may spend 5 here, so the registry
+# holds at most 11 repos before the lock needs renewing from inside the sweep.
+# ponytail: npm only; add pnpm/yarn when a registered project uses one.
 ```
 3. Start the worker, detached, logging to `~/.factory/logs/<ID>-<run>.log` (one file per run; a retry does not overwrite the previous run's log):
 ```bash

@@ -1,6 +1,6 @@
 # Closing the gaps against the agentbaseline.org reference architecture
 
-Status: plan, 2026-10-27, revision 9. Nothing here is implemented yet. Revisions 1 through 7 were refuted by Codex; revision 8 came back CAVEATS with two wording fixes, applied here without another pass. The findings and what changed are at the end.
+Status: plan, 2026-10-27, revision 9. A0 landed 2026-10-27 (PR 14) and A1 on 2026-10-28; A2 through A8 are not implemented. Revisions 1 through 7 were refuted by Codex; revision 8 came back CAVEATS with two wording fixes, applied here without another pass. The findings and what changed are at the end.
 
 **Headline, found in revision 7:** today, before any of this plan, a worker PR that adds a workflow file can read `FACTORY_APP_PRIVATE_KEY`, `ANTHROPIC_API_KEY`, and `OPENAI_API_KEY`, because they are repository secrets and same-repo `pull_request` workflows receive repository secrets. The worker skill's "never edit `.github/`" is prose. A0 fixes this first; nothing else in Phase A matters until it lands.
 
@@ -17,8 +17,8 @@ One fact that shapes every residual below: **dispatch and the worker are the sam
 | Boundary | Enforced by today | Gap |
 |---|---|---|
 | 1 Sandbox | Worker: Claude Code seatbelt, non-admin `softwarefactory` user on the mini. Judge: ephemeral Actions runner, `permissions: {}`, no secrets in the job that runs PR code. | Worker sandbox is a developer-machine sandbox, not one the agent can't escape. |
-| 2 Network | `worker-settings.json` allowlist + `auto` classifier, inside the agent. Keycard brokers tokens in. Metadata IPs denied. No MCP servers. | Not default-deny, and the control lives inside the agent process. npm registry is open. |
-| 3 Supply chain | Policy denies manifests and lockfiles at merge. Judge CLIs pinned by version. | Admission happens at merge, not at fetch. Pins are by tag/version, not content. No model gateway. **The judge workflow itself is PR-mutable (A0).** |
+| 2 Network | `worker-settings.json` allowlist + `auto` classifier, inside the agent. Keycard brokers tokens in. Metadata IPs and the npm registry denied; dispatch installs `node_modules` from the committed lockfile with `--ignore-scripts` before the worker starts (A1). No MCP servers. | Not default-deny, and the control lives inside the agent process. |
+| 3 Supply chain | Policy denies manifests and lockfiles at merge. Judge workflow and prompt come from base and PR code runs only in containers (A0). Workers cannot reach the npm registry or its common mirrors; dispatch installs from the base lockfile, first run only (A1). Judge CLIs pinned by version. | Pins are by tag/version, not content. No model gateway. |
 | 4 Identity | Keycard broker + zone audit log. Merge App key only in Actions. Statuses only from CI. | Level 1 shape. The brokered token is a repo-wide bearer shared by dispatch and worker; "only your branch and issue" is prose in the worker skill, not an enforced scope. Profile is split between the repo (`policy.json`) and the plugin checkout on the mini (`worker-settings.json`, skills), and neither half is authenticated. |
 | Record | Keycard audit + GitHub statuses + Actions logs + Linear comments share a run id. | `~/.factory/logs` and every Linear comment are written by the shared identity, so neither is independent of the worker. |
 
@@ -72,11 +72,11 @@ Workers are forbidden from changing manifests, so they have no legitimate reason
 
 Change:
 1. Move the npm registry hosts from `allowedDomains` to `deniedDomains` in `worker-settings.json`. Absence from the allowlist only routes to the classifier; denial is explicit. This denies the registry, not the `npm` client.
-2. Dispatch warms `node_modules` once per fresh worktree, before the worker starts, with `npm ci --ignore-scripts` against the committed lockfile. Always `--ignore-scripts`: dispatch runs as the logged-in uid with keychain access, and `scripts/pr.sh:24` shows that any process in that uid can re-invoke `keycard agent exec` and get tokens back, so unsetting two variables does not make an install-script credential-free. Projects whose dependencies need install scripts are not supported by the warm-up; their worker runs on a cold `node_modules` and `checks` fail, which routes the issue to Needs Input. The judge's `checks` job in CI (no secrets, no keychain) is where `install_scripts: true` in base policy may enable scripts.
+2. Dispatch warms `node_modules` once per fresh worktree, before the worker starts, with `npm ci --ignore-scripts` against the committed lockfile. Always `--ignore-scripts`: dispatch runs as the logged-in uid with keychain access, and `scripts/pr.sh:24` shows that any process in that uid can re-invoke `keycard agent exec` and get tokens back, so unsetting two variables does not make an install-script credential-free. Projects whose dependencies need install scripts are not supported by the warm-up; their packages install without their lifecycle work, so a `checks` command that needs it fails, which routes the issue to Needs Input. The warm-up installs registry tarballs only: `--ignore-scripts` does not stop a git dependency's own `.npmrc` from choosing the git binary npm runs, so the install is skipped unless the lockfile is v2 or newer and every installed entry either resolves to a `registry.npmjs.org` tarball or, where npm omitted `resolved`, has a plain semver `version` (a v1 lockfile can carry a git dependency in `version` alone; a v2+ git dependency always has a `resolved` URL), no dependency map inside the lockfile names a URL, and every dependency spec in every tracked `package.json`, `overrides` included, is a plain range with no `:`, `/` or `#` (`npm ci` resolves the manifests before it checks them against the lockfile, so a git URL declared only in a manifest, or only in a lockfile entry's own dependency map, is fetched before it is rejected); that project runs cold. The guards cover the shapes we can read; the backstop for the rest is on the installer: `--git=/usr/bin/false` makes every git fetch fail at clone, and `--proxy`/`--https-proxy` at `http://127.0.0.1:9` with `--noproxy=registry.npmjs.org` sends every other HTTP request to a port where nothing listens, so a `github:` shorthand that npm would fetch from codeload without git, or any host an incomplete lockfile resolves its way to, fails at connect. What dispatch can download during the warm-up is `registry.npmjs.org` and its subdomains (`--noproxy` matches by suffix; they are npm's own), nothing else. The install runs with an environment of only `HOME` and `PATH`, `--userconfig=/dev/null`, `--globalconfig` at a nonexistent path (npm refuses one path for both), `--registry=https://registry.npmjs.org/` and `--replace-registry-host=never`, so npm's configuration is the command line plus base's own `.npmrc`, which is trusted exactly as far as base's lockfile is. The install is bounded at 5 minutes per repo; the sweep lock goes stale at 60, so the registry holds at most 11 repos before the lock needs renewing. The judge's `checks` job in CI (no secrets, no keychain) is where `install_scripts: true` in base policy may enable scripts.
 
 Done when: a worker that runs `npm install left-pad` sees a sandbox denial for `registry.npmjs.org` in its log; a fresh worktree passes `npm test` with no outbound connection from the worker's process group to the registry (verified from the `pf` log in A4, or from the sandbox log before A4 lands).
 
-Residual: `npm install github:owner/repo` and `npm install https://…/x.tgz` still work, because `codeload.github.com` and `objects.githubusercontent.com` stay allowed for git and the `npm` client is not what is denied. So do `curl | sh` from an allowed host, and a package already in `~/.npm/_cacache`. What A1 closes is the default path that runs third-party code with one command; it does not close deliberate download-and-execute. The seatbelt confines the write set; the tokens in the worker's environment are the exposure, and only Phase B's credential-free worker removes them.
+Residual: `npm install github:owner/repo` and `npm install https://…/x.tgz` still work, because `codeload.github.com` and `objects.githubusercontent.com` stay allowed for git and the `npm` client is not what is denied. So do `curl | sh` from an allowed host, and a package already in `~/.npm/_cacache`. The deny list names the registry and its common mirrors (yarnpkg, npmmirror, GitHub Packages) by hostname; a mirror not on the list reaches the `auto` classifier, and an IP literal is not a hostname at all. A4 is the layer that sees addresses. The warm-up is npm only (`package-lock.json` or `npm-shrinkwrap.json`) and runs only on the first run from the base tree; a retry worktree is the worker's branch and is never installed from. pnpm and yarn projects get no warm-up, so onboarding one is premature until it does. A `checks` or `check_setup` command that itself fetches from the registry (`npx <pkg>@<ver>`) fails in the worker, though CI's setup container still has network; pin such tools as devDependencies instead. What A1 closes is the default path that runs third-party code with one command; it does not close deliberate download-and-execute. The seatbelt confines the write set; the tokens in the worker's environment are the exposure, and only Phase B's credential-free worker removes them.
 
 ### A2. Pin by content, install from trusted sources (boundary 3)
 
@@ -314,3 +314,76 @@ Run against `git diff main...HEAD` after A0 was implemented in the templates. Al
 "No new findings beyond the documented residuals and dispositions." Seven passes on the implementation: 5, 3, 3, 3, 1, 1, 0 findings. Four of the sixteen were pre-existing holes in the judge template (python import from the PR checkout, `pull_request` trigger, repository secrets, status-by-name gate); the rest were defects in this branch's own first drafts, three of them regressions that a reviewer with the old template open caught.
 
 Not adopted, any round: "continuous external checkpoints" and "authenticated completion records" for the log, and per-run gateway authorization as a Phase A item. Each is the Phase B broker by another name; adding them to Phase A would be the same work twice.
+
+### Implementation of A1: Codex review of the diff, REFUTED, 7 findings
+
+Run against `git diff main...HEAD` after A1 was implemented (deny list, dispatch warm-up, docs).
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| The warm-up also ran on retry, where the worktree is the worker's branch: a worker can push a lockfile pointing at its own host plus an `.npmrc` with `_authToken=${GH_TOKEN}`, delete `node_modules`, and dispatch installs from it with the token in its environment | BLOCKER | Yes | Install only on the first run, when the tree is `origin/HEAD`; the two brokered tokens are dropped from the install's environment |
+| `! -d node_modules` is not "installed": a failed `npm ci` leaves a partial directory that the next run skips | MAJOR | Yes | A failed install removes `node_modules` and fails prep; retries never install, so a broken tree fails its checks and routes to Needs Input |
+| No deadline on the install; a long one pushes the worker's 90 minutes past the 2h stale threshold and the dispatcher past its 60-minute lock | MAJOR | Yes | `alarm 600` around `npm ci` |
+| `npm-shrinkwrap.json`, pnpm and yarn projects skip the warm-up while the worker is told its dependencies were installed | MAJOR | Yes | Shrinkwrap accepted; the worker skill says "if the repo has an npm lockfile"; pnpm/yarn named as a residual |
+| A `checks` or `check_setup` command that fetches from the registry itself (`npx`) now fails locally while CI's networked setup still works | MAJOR | Yes, as a residual | Named in the residual with the fix (pin as a devDependency) |
+| The verification shown (two curl 403s, an empty scratch project) does not establish the done-when: it needs a dependency-bearing fixture that passes its suite cold with no registry reachable | MAJOR | Yes | Re-verified on an export of the pilot repo: warm-up from its lockfile with the registry reachable, then `npm test` with the registry denied |
+| README, writeup and the plan table said "cannot fetch and run a package"; the residual says otherwise | MINOR | Yes | Wording narrowed to the registry and its mirrors |
+| "Runs cold" misdescribes `--ignore-scripts`: packages install, their lifecycle work does not | MINOR | Yes | Reworded |
+
+Pre-existing, not adopted here: the README's "no local process holds a credential" overstates what Keycard brokering gives (dispatch and workers hold the brokered tokens for the run); that is the Phase B credential-free worker.
+
+### Implementation of A1, second pass: REFUTED, 4 findings
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| `--ignore-scripts` does not make a git dependency code-free: the dependency's own `.npmrc` can name the git executable npm runs, and dispatch installs outside any sandbox with keychain access | BLOCKER | Yes | The warm-up refuses a lockfile with any `resolved` URL that is not a `registry.npmjs.org` tarball; such a project runs cold |
+| `alarm 600; exec` kills npm alone; git or ssh children survive outside every timeout | MAJOR | Yes, reproduced by Codex | Same construction as the worker launch: own process group, TERM then KILL to the group |
+| The worker skill promised an install whenever a lockfile exists; a recreated retry worktree gets none | MINOR | Yes | Reworded: first run only, registry tarballs only, uncached requests |
+| A1's own text still said "cold `node_modules`" after the record claimed the wording was fixed | MINOR | Yes | Fixed in the plan item |
+
+### Implementation of A1, third pass: REFUTED, 4 findings
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| The `resolved`-URL guard misses a v1 lockfile, which can carry `git+ssh://…` in `version` with no `resolved`; Codex ran the predicate and npm's parser to show it | BLOCKER | Yes | Guard requires `lockfileVersion >= 2` and, on every `node_modules/` entry that is not a workspace link, a registry tarball `resolved` or, where npm omitted `resolved` (173 of the pilot's entries), a plain semver `version` |
+| npm rewrites an accepted `registry.npmjs.org` URL to whatever registry `.npmrc` or `npm_config_registry` names, so the URL check did not constrain the destination | MAJOR | Yes | `--registry=https://registry.npmjs.org/ --replace-registry-host=never --userconfig=/dev/null` on the command line; verified that `npm_config_registry` pointing at a denied mirror still installs from npmjs only. Pass 4 showed `@scope:registry` still got through; see below |
+| A guard refusal called `fail` after the worktree existed; the retry then tried to pull a branch never pushed and the issue went to Blocked instead of running cold | MAJOR | Yes | Refusal skips the install and the worker starts cold; a failed install removes the worktree and branch so the retry starts fresh |
+| The worker skill still promised an install on every first run | MINOR | Yes | Conditioned on an eligible lockfile |
+
+### Implementation of A1, fourth pass: REFUTED, 3 findings
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| `@scope:registry` from `npm_config_*` or the global config still redirects an accepted entry that has no `resolved`; Codex ran npm's config loader with the three flags and `npm_config_@example:registry` and got yarnpkg | MAJOR | Yes | The install's environment is `HOME` and `PATH` only, plus `--globalconfig` at a nonexistent path; npm's config is now the command line and base's `.npmrc`, which is trusted as far as base's lockfile is. Verified on the pilot export with `npm_config_@biomejs:registry` pointing at the yarn mirror: the unscrubbed install requested `@biomejs/biome` from the mirror, the scrubbed one installed all 669 packages from npmjs |
+| The 10-minute bound is per install; a sweep over several repos could outlive the 60-minute dispatch lock | MAJOR | Yes | 5 minutes per install (the pilot takes 12 s) and a stated ceiling of 11 registered repos before the lock needs renewing from inside the sweep |
+| The semver check was a prefix match: `1.2.3garbage` and `1.2.3/../x` passed, and npm reads the latter as a local path | MINOR | Yes | Full semver match, anchored |
+
+### Implementation of A1, fifth pass: REFUTED, 1 finding
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| `npm ci` builds the ideal tree from `package.json` before validating it against the lockfile, so a git dependency declared only in a manifest is fetched (Codex traced Arborist to `pacote.manifest` for the git URL with `ignoreScripts=true`) even when the lockfile passes the guard | BLOCKER | Yes | The guard also requires every dependency spec in every tracked `package.json`, `overrides` included, to be a plain range with no `:`, `/` or `#` |
+
+### Implementation of A1, sixth pass: REFUTED, 3 findings
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| A registry-resolved lockfile entry whose own `dependencies` map names a git URL, with that package's installed entry missing, passes both guards; Arborist calls `pacote.manifest` for the git URL before validation | BLOCKER | Yes | The lockfile predicate also refuses a URL-ish spec in any entry's dependency maps; and `--git=/usr/bin/false` on the command line makes every git fetch fail at clone, whatever shape got it there |
+| `':!*node_modules*'` also excluded tracked workspaces such as `packages/node_modules-tools/package.json` | BLOCKER | Yes | No exclusion: every tracked `package.json` is inspected |
+| The worker skill still promised an install given an eligible lockfile, though the manifest guard can refuse independently | MINOR | Yes | The worker is told to check for `node_modules`, not assume it |
+
+### Implementation of A1, seventh pass: REFUTED, 3 findings
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| With an incomplete lockfile (declared dependency, no installed entry) Arborist fetches the dependency's registry metadata and follows a transitive `github:owner/repo#<sha>`, which pacote fetches as a codeload tarball with no git involved, so `--git=/usr/bin/false` does not stop it; a download-policy bypass, not code execution | MAJOR | Yes | `--proxy` and `--https-proxy` at `http://127.0.0.1:9` with `--noproxy=registry.npmjs.org`: every request except to the registry goes to a port where nothing listens |
+| The policy template's `package.json` and lockfile deny patterns match the root only; `src/package.json` matches `src/*` and would auto-merge | MAJOR | Yes, pre-existing | Not adopted here: a nested manifest changes module type for that directory, not what the root lockfile installs; the writeup now says "root". A policy-template fix is its own change |
+| "The one-command path is closed" omitted the npm cache residual | MINOR | Yes | Wording |
+
+### Implementation of A1, eighth pass: CAVEATS, 1 finding
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| `--noproxy=registry.npmjs.org` also exempts its subdomains (npm's `getProxy` returned `DIRECT` for `child.registry.npmjs.org`), so "every request except to registry.npmjs.org" overstated the match; yarnpkg and codeload correctly took the dead proxy | MINOR | Yes | Wording: the registry and its subdomains, which are npm's own |
+
+"The earlier concrete bypasses are addressed; CI's networked installation and offline checks match the revised description." Applied without another pass, as with the plan's revision 8. Eight passes on the implementation: 7, 4, 4, 3, 1, 3, 3, 1 findings. The shape of the review: the first two passes were about trust (whose lockfile, whose environment), the next five were npm's resolver reaching the network before validation through one lockfile or manifest shape after another, which the guards chased and the installer-side backstops (`--git=/usr/bin/false`, dead proxy with `--noproxy` for the registry) finally closed as a class.
