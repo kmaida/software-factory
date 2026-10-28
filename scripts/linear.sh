@@ -160,12 +160,14 @@ case $cmd in
     up=$(gql 'mutation($ct: String!, $fn: String!, $sz: Int!) { fileUpload(contentType: $ct, filename: $fn, size: $sz) {
                 success uploadFile { uploadUrl assetUrl headers { key value } } } }' \
          "$(jq -n --arg fn "$(basename "$file")" --argjson sz "$size" '{ct: "text/plain", fn: $fn, sz: $sz}')")
+    jq -e '.fileUpload.success and (.fileUpload.uploadFile.uploadUrl | type == "string")' <<<"$up" >/dev/null || die "attach: Linear refused the upload: $(head -c 300 <<<"$up")"
     hdrs=(); while IFS= read -r h; do hdrs+=(-H "$h"); done < <(jq -r '.fileUpload.uploadFile.headers[] | "\(.key): \(.value)"' <<<"$up")
     curl -fsS -o /dev/null -X PUT --data-binary "@$file" -H 'Content-Type: text/plain' "${hdrs[@]}" "$(jq -r '.fileUpload.uploadFile.uploadUrl' <<<"$up")" \
       || die "attach: upload of $file to Linear's file store failed"
-    gql 'mutation($iid: String!, $url: String!, $title: String!) { attachmentCreate(input: { issueId: $iid, url: $url, title: $title }) { success attachment { url } } }' \
-        "$(jq -n --arg iid "$iid" --arg url "$(jq -r '.fileUpload.uploadFile.assetUrl' <<<"$up")" --arg title "$title" '{iid: $iid, url: $url, title: $title}')" \
-      | jq -r '.attachmentCreate.attachment.url'
+    at=$(gql 'mutation($iid: String!, $url: String!, $title: String!) { attachmentCreate(input: { issueId: $iid, url: $url, title: $title }) { success attachment { url } } }' \
+        "$(jq -n --arg iid "$iid" --arg url "$(jq -r '.fileUpload.uploadFile.assetUrl' <<<"$up")" --arg title "$title" '{iid: $iid, url: $url, title: $title}')")
+    # a mutation can answer success:false without a top-level error; that is a failed attach, not a null URL
+    jq -er '.attachmentCreate | select(.success == true) | .attachment.url' <<<"$at" || die "attach: Linear refused the attachment: $(head -c 300 <<<"$at")"
     ;;
   *) usage ;;
 esac
