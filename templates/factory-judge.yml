@@ -114,7 +114,13 @@ jobs:
           git show "$BASE:.factory/judge-tools/package-lock.json" > "$t/package-lock.json"
           jq -r '.packages | to_entries[] | select(.value.integrity) | "\(.key) \(.value.integrity)"' "$t/package-lock.json"   # which tools judged this PR, in the log
           (cd "$t" && npm ci --ignore-scripts --no-audit --no-fund --userconfig=/dev/null --globalconfig="$RUNNER_TEMP/no-globalconfig")
+          # what is installed is what BASE's lockfile says, not HEAD's: assert the versions, and log the executables' hashes
+          for p in @anthropic-ai/claude-code @openai/codex; do
+            want=$(jq -r --arg p "node_modules/$p" '.packages[$p].version' "$t/package-lock.json"); have=$(jq -r .version "$t/node_modules/$p/package.json")
+            [ "$want" = "$have" ] || { echo "installed $p $have, BASE lockfile says $want" >&2; exit 1; }
+          done
           node "$t/node_modules/@anthropic-ai/claude-code/install.cjs"   # the one script that runs: copies the integrity-checked native binary over its placeholder
+          sha256sum "$t/node_modules/@anthropic-ai/claude-code/bin/claude.exe"   # identity of the judge binary, in the log
       - name: Claude reviews (read-only tools, agent config off, no GITHUB_ENV/PATH/OUTPUT)
         env: { ANTHROPIC_API_KEY: "${{ secrets.ANTHROPIC_API_KEY }}" }
         run: |
@@ -163,19 +169,24 @@ jobs:
           git show "$BASE:.factory/judge-tools/package-lock.json" > "$t/package-lock.json"
           jq -r '.packages | to_entries[] | select(.value.integrity) | "\(.key) \(.value.integrity)"' "$t/package-lock.json"   # which tools judged this PR, in the log
           (cd "$t" && npm ci --ignore-scripts --no-audit --no-fund --userconfig=/dev/null --globalconfig="$RUNNER_TEMP/no-globalconfig")
+          # what is installed is what BASE's lockfile says, not HEAD's: assert the versions, and log the executables' hashes
+          for p in @anthropic-ai/claude-code @openai/codex; do
+            want=$(jq -r --arg p "node_modules/$p" '.packages[$p].version' "$t/package-lock.json"); have=$(jq -r .version "$t/node_modules/$p/package.json")
+            [ "$want" = "$have" ] || { echo "installed $p $have, BASE lockfile says $want" >&2; exit 1; }
+          done
       - name: Codex reviews (read-only sandbox, agent config off, no GITHUB_ENV/PATH/OUTPUT)
         env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }
         run: |
-          export PATH="$RUNNER_TEMP/tools/node_modules/.bin:$PATH"   # codex from BASE's lockfile, installed in the step above
+          codex="$RUNNER_TEMP/tools/node_modules/.bin/codex"; sha256sum "$(readlink -f "$codex")"   # from BASE's lockfile, installed in the step above
           # codex 0.164 does not read OPENAI_API_KEY on its own; log in into a throwaway CODEX_HOME and delete it after.
           # The key is still in this step's env (inherent to running an agent with a key); the runner is ephemeral and the key is judge-only.
           export CODEX_HOME=$(mktemp -d); chmod 700 "$CODEX_HOME"
-          printenv OPENAI_API_KEY | codex login --with-api-key
+          printenv OPENAI_API_KEY | "$codex" login --with-api-key
           # read-only: the model's shell commands can read the disk (so `git diff` works) and write nothing. Codex's default
           # Linux sandbox (bubblewrap) could not start on a GitHub-hosted runner (RTM_NEWADDR EPERM: it wants a netns);
           # use_legacy_landlock is the namespace-free sandbox, deprecated but present in the pinned 0.164.
           # ponytail: if the sandbox still cannot start, there is no verdict and post fails closed to CAVEATS; fix here, never fall back to danger-full-access.
-          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE codex exec --sandbox read-only --enable use_legacy_landlock --skip-git-repo-check "$(cat "$RUNNER_TEMP/prompt.md")" > "$RUNNER_TEMP/codex.txt" 2>&1 || true
+          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE "$codex" exec --sandbox read-only --enable use_legacy_landlock --skip-git-repo-check "$(cat "$RUNNER_TEMP/prompt.md")" > "$RUNNER_TEMP/codex.txt" 2>&1 || true
           rm -rf "$CODEX_HOME"
       - name: Verdict as job output (whole line only, sanitized; anything else becomes CAVEATS downstream)
         id: out
