@@ -122,6 +122,7 @@ jobs:
               else [ "$opt" = true ] || { echo "$k is missing and not optional" >&2; exit 1; }; fi
             done
           node "$t/node_modules/@anthropic-ai/claude-code/install.cjs"   # the one script that runs: copies the integrity-checked native binary over its placeholder
+          "$t/node_modules/.bin/claude" --version   # the placeholder exits 1: proves this platform's native package was installed and selected
           find "$t/node_modules" -type f -perm -u+x -exec sha256sum {} +   # every executable the judge can run, by hash, in the log (launchers and the native binaries they spawn)
       - name: Claude reviews (read-only tools, agent config off, no GITHUB_ENV/PATH/OUTPUT)
         env: { ANTHROPIC_API_KEY: "${{ secrets.ANTHROPIC_API_KEY }}" }
@@ -178,6 +179,7 @@ jobs:
               if [ -f "$t/$k/package.json" ]; then have=$(jq -r .version "$t/$k/package.json"); [ "$want" = "$have" ] || { echo "installed $k $have, BASE lockfile says $want" >&2; exit 1; }
               else [ "$opt" = true ] || { echo "$k is missing and not optional" >&2; exit 1; }; fi
             done
+          "$t/node_modules/.bin/codex" --version   # fails unless this platform's native package was installed and selected
           find "$t/node_modules" -type f -perm -u+x -exec sha256sum {} +   # every executable the judge can run, by hash, in the log (the launcher and the native binary it spawns)
       - name: Codex reviews (read-only sandbox, agent config off, no GITHUB_ENV/PATH/OUTPUT)
         env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }

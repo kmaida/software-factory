@@ -413,5 +413,12 @@ Run against `git diff main...HEAD` after A2 was implemented in the templates.
 
 | Finding | Severity | Valid? | What changed |
 |---|---|---|---|
-| Onboarding kept an existing Dependabot entry for the same ecosystem and directory even when `open-pull-requests-limit: 0` disables it; the required updates would silently never arrive | MAJOR | Yes, reproduced | An existing entry counts only if it is live (no zero limit, no `ignore` over these packages); otherwise onboarding reports it and stops |
+| Onboarding kept an existing Dependabot entry for the same ecosystem and directory even when `open-pull-requests-limit: 0` disables it; the required updates would silently never arrive | MAJOR | Yes, reproduced | An existing entry counts only if it is live (no zero limit, no `ignore` over these packages); otherwise onboarding reports it and stops. Superseded in pass 4 |
 | The version assertion covered the two top-level CLIs, not "each installed package" | MINOR | Yes | Every lockfile entry is asserted present at its locked version, or absent only as an optional package for another platform |
+
+### Implementation of A2, fourth pass: REFUTED, 2 findings
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| The "live entry" test was an enumeration: an `allow` list naming one action, or a `target-branch` other than the default, passes it and still covers none of the factory's pins | MAJOR | Yes | No liveness test. An existing entry for the same ecosystem and directory stops onboarding with the entry quoted in the report; reconciling it is Kim's |
+| Optional packages may be absent unconditionally, so a missing current-platform native package passed the assertion and `install.cjs` returned success leaving the placeholder | MINOR | Yes | Each install step runs its CLI's `--version` before the key step; the placeholder exits 1 |
