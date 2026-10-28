@@ -72,7 +72,7 @@ Workers are forbidden from changing manifests, so they have no legitimate reason
 
 Change:
 1. Move the npm registry hosts from `allowedDomains` to `deniedDomains` in `worker-settings.json`. Absence from the allowlist only routes to the classifier; denial is explicit. This denies the registry, not the `npm` client.
-2. Dispatch warms `node_modules` once per fresh worktree, before the worker starts, with `npm ci --ignore-scripts` against the committed lockfile. Always `--ignore-scripts`: dispatch runs as the logged-in uid with keychain access, and `scripts/pr.sh:24` shows that any process in that uid can re-invoke `keycard agent exec` and get tokens back, so unsetting two variables does not make an install-script credential-free. Projects whose dependencies need install scripts are not supported by the warm-up; their worker runs on a cold `node_modules` and `checks` fail, which routes the issue to Needs Input. The judge's `checks` job in CI (no secrets, no keychain) is where `install_scripts: true` in base policy may enable scripts.
+2. Dispatch warms `node_modules` once per fresh worktree, before the worker starts, with `npm ci --ignore-scripts` against the committed lockfile. Always `--ignore-scripts`: dispatch runs as the logged-in uid with keychain access, and `scripts/pr.sh:24` shows that any process in that uid can re-invoke `keycard agent exec` and get tokens back, so unsetting two variables does not make an install-script credential-free. Projects whose dependencies need install scripts are not supported by the warm-up; their packages install without their lifecycle work, so a `checks` command that needs it fails, which routes the issue to Needs Input. The warm-up installs registry tarballs only: `--ignore-scripts` does not stop a git dependency's own `.npmrc` from choosing the git binary npm runs, so a lockfile with any non-registry `resolved` URL is refused and that project runs cold. The judge's `checks` job in CI (no secrets, no keychain) is where `install_scripts: true` in base policy may enable scripts.
 
 Done when: a worker that runs `npm install left-pad` sees a sandbox denial for `registry.npmjs.org` in its log; a fresh worktree passes `npm test` with no outbound connection from the worker's process group to the registry (verified from the `pf` log in A4, or from the sandbox log before A4 lands).
 
@@ -331,3 +331,12 @@ Run against `git diff main...HEAD` after A1 was implemented (deny list, dispatch
 | "Runs cold" misdescribes `--ignore-scripts`: packages install, their lifecycle work does not | MINOR | Yes | Reworded |
 
 Pre-existing, not adopted here: the README's "no local process holds a credential" overstates what Keycard brokering gives (dispatch and workers hold the brokered tokens for the run); that is the Phase B credential-free worker.
+
+### Implementation of A1, second pass: REFUTED, 4 findings
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| `--ignore-scripts` does not make a git dependency code-free: the dependency's own `.npmrc` can name the git executable npm runs, and dispatch installs outside any sandbox with keychain access | BLOCKER | Yes | The warm-up refuses a lockfile with any `resolved` URL that is not a `registry.npmjs.org` tarball; such a project runs cold |
+| `alarm 600; exec` kills npm alone; git or ssh children survive outside every timeout | MAJOR | Yes, reproduced by Codex | Same construction as the worker launch: own process group, TERM then KILL to the group |
+| The worker skill promised an install whenever a lockfile exists; a recreated retry worktree gets none | MINOR | Yes | Reworded: first run only, registry tarballs only, uncached requests |
+| A1's own text still said "cold `node_modules`" after the record claimed the wording was fixed | MINOR | Yes | Fixed in the plan item |

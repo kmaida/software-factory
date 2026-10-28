@@ -59,8 +59,14 @@ elif git -C "$repo" ls-remote -q --exit-code origin "factory/$id" >/dev/null; th
   git -C "$repo" worktree add "$wt" "factory/$id" || fail "git worktree add $wt from factory/$id"
 else                                                                                         # first run: the tree is origin/HEAD
   git -C "$repo" worktree add -b "factory/$id" "$wt" origin/HEAD || fail "git worktree add -b factory/$id"
-  if [[ -f $wt/package-lock.json || -f $wt/npm-shrinkwrap.json ]]; then                     # warm node_modules here, never in the worker
-    (cd "$wt" && env -u GH_TOKEN -u LINEAR_TOKEN perl -e 'alarm 600; exec @ARGV' -- npm ci --ignore-scripts --no-audit --no-fund) \
+  lock=$wt/npm-shrinkwrap.json; [[ -f $lock ]] || lock=$wt/package-lock.json
+  if [[ -f $lock ]]; then                                                                    # warm node_modules here, never in the worker
+    jq -e '[.. | objects | .resolved? // empty | select(startswith("https://registry.npmjs.org/") | not)] == []' "$lock" >/dev/null \
+      || fail "a dependency in ${lock##*/} does not resolve to registry.npmjs.org; the warm-up installs registry tarballs only"
+    (cd "$wt" && env -u GH_TOKEN -u LINEAR_TOKEN perl -e '
+        setpgrp; alarm 600;                                # own process group; 10 minutes, then the whole group dies
+        $SIG{ALRM} = sub { $SIG{TERM} = "IGNORE"; kill TERM => -$$; sleep 5; kill KILL => -$$ };
+        system @ARGV; exit($? ? 1 : 0)' -- npm ci --ignore-scripts --no-audit --no-fund) \
       || { rm -rf "$wt/node_modules"; fail "npm ci --ignore-scripts in $wt (10-minute limit)"; }
   fi
 fi
@@ -69,9 +75,12 @@ fi
 # that broke its node_modules fails its own checks and lands in Needs Input. worker-settings.json denies the registry to
 # the worker, so this is the only install. Always --ignore-scripts, and the two brokered tokens are dropped from the
 # install's environment so an .npmrc `${GH_TOKEN}` has nothing to expand; scripts/pr.sh shows a script could still get
-# tokens back from keycard, which is why scripts stay off. Packages install without their lifecycle scripts, so a build
-# that needs them fails and routes to Needs Input; install_scripts: true applies only in the CI judge. The 10-minute
-# limit keeps claim-to-worker-start well inside the 2h stale threshold (the worker's own budget is 90 minutes).
+# tokens back from keycard, which is why scripts stay off. --ignore-scripts does not cover git dependencies (a git
+# dependency's own .npmrc can point npm at a different git binary), so the lockfile guard refuses anything that is not
+# a registry tarball; a project with a git or tarball dependency runs cold and lands in Needs Input. Packages install
+# without their lifecycle scripts, so a build that needs them fails and routes to Needs Input; install_scripts: true
+# applies only in the CI judge. The 10-minute limit keeps claim-to-worker-start well inside the 2h stale threshold
+# (the worker's own budget is 90 minutes), and the group kill takes npm's children (git, ssh) with it.
 # ponytail: npm only; add pnpm/yarn when a registered project uses one.
 ```
 3. Start the worker, detached, logging to `~/.factory/logs/<ID>-<run>.log` (one file per run; a retry does not overwrite the previous run's log):
