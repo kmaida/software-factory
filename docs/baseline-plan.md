@@ -1,6 +1,6 @@
 # Closing the gaps against the agentbaseline.org reference architecture
 
-Status: plan, 2026-10-27, revision 9. A0 landed 2026-10-27 (PR 14) and A1 on 2026-10-28; A2 through A8 are not implemented. Revisions 1 through 7 were refuted by Codex; revision 8 came back CAVEATS with two wording fixes, applied here without another pass. The findings and what changed are at the end.
+Status: plan, 2026-10-27, revision 9. A0 landed 2026-10-27 (PR 14) and A1 on 2026-10-28. A2 is implemented in the templates (2026-10-28) and awaits the pilot's re-onboard for its CI acceptance. A3 through A8 are not implemented. Revisions 1 through 7 were refuted by Codex; revision 8 came back CAVEATS with two wording fixes, applied here without another pass. The findings and what changed are at the end.
 
 **Headline, found in revision 7:** today, before any of this plan, a worker PR that adds a workflow file can read `FACTORY_APP_PRIVATE_KEY`, `ANTHROPIC_API_KEY`, and `OPENAI_API_KEY`, because they are repository secrets and same-repo `pull_request` workflows receive repository secrets. The worker skill's "never edit `.github/`" is prose. A0 fixes this first; nothing else in Phase A matters until it lands.
 
@@ -18,7 +18,7 @@ One fact that shapes every residual below: **dispatch and the worker are the sam
 |---|---|---|
 | 1 Sandbox | Worker: Claude Code seatbelt, non-admin `softwarefactory` user on the mini. Judge: ephemeral Actions runner, `permissions: {}`, no secrets in the job that runs PR code. | Worker sandbox is a developer-machine sandbox, not one the agent can't escape. |
 | 2 Network | `worker-settings.json` allowlist + `auto` classifier, inside the agent. Keycard brokers tokens in. Metadata IPs and the npm registry denied; dispatch installs `node_modules` from the committed lockfile with `--ignore-scripts` before the worker starts (A1). No MCP servers. | Not default-deny, and the control lives inside the agent process. |
-| 3 Supply chain | Policy denies manifests and lockfiles at merge. Judge workflow and prompt come from base and PR code runs only in containers (A0). Workers cannot reach the npm registry or its common mirrors; dispatch installs from the base lockfile, first run only (A1). Judge CLIs pinned by version. | Pins are by tag/version, not content. No model gateway. |
+| 3 Supply chain | Policy denies manifests and lockfiles at merge. Judge workflow and prompt come from base and PR code runs only in containers (A0). Workers cannot reach the npm registry or its common mirrors; dispatch installs from the base lockfile, first run only (A1). Actions pinned by commit SHA; the judge CLIs installed from the base commit's lockfile, by integrity, before the API key is in the environment; Dependabot moves both by PR (A2, in the templates; the pilot has not been re-onboarded onto them yet). | No model gateway. |
 | 4 Identity | Keycard broker + zone audit log. Merge App key only in Actions. Statuses only from CI. | Level 1 shape. The brokered token is a repo-wide bearer shared by dispatch and worker; "only your branch and issue" is prose in the worker skill, not an enforced scope. Profile is split between the repo (`policy.json`) and the plugin checkout on the mini (`worker-settings.json`, skills), and neither half is authenticated. |
 | Record | Keycard audit + GitHub statuses + Actions logs + Linear comments share a run id. | `~/.factory/logs` and every Linear comment are written by the shared identity, so neither is independent of the worker. |
 
@@ -83,11 +83,11 @@ Residual: `npm install github:owner/repo` and `npm install https://…/x.tgz` st
 In both workflow templates:
 - every `uses:` pinned to a full 40-hex commit SHA with the tag in a trailing comment;
 - the judge's `checks` job runs `npm ci --ignore-scripts` unless base `policy.json` sets `install_scripts: true`;
-- the two CLI installs stop being `npm i -g <name>@<version>` resolved at run time. The plugin ships `templates/judge-tools/package.json` + `package-lock.json` with both CLIs as pinned dependencies; onboarding copies them to `.factory/judge-tools/` in the target repo; each model job installs from **base** (`git show "$BASE:.factory/judge-tools/package-lock.json"`) into `$RUNNER_TEMP/tools` with `npm ci --ignore-scripts`, calls the binary by path, and does this in a step **before** the step that exposes the API key. The PR checkout is never the source of the tools that judge it.
+- the two CLI installs stop being `npm i -g <name>@<version>` resolved at run time. The plugin ships `templates/judge-tools/package.json` + `package-lock.json` with both CLIs as pinned dependencies; onboarding copies them to `.factory/judge-tools/` in the target repo; each model job installs from **base** (`git show "$BASE:.factory/judge-tools/package-lock.json"`) into `$RUNNER_TEMP/tools` with `npm ci --ignore-scripts`, calls the binary by path, and does this in a step **before** the step that exposes the API key. The PR checkout is never the source of the tools that judge it. One script does run during that install: `@anthropic-ai/claude-code`'s own `install.cjs`, called explicitly after `npm ci --ignore-scripts`, because its `bin/claude.exe` is a placeholder until that script copies the platform's native binary (an integrity-checked optional dependency) over it; it resolves everything relative to its own package directory, never the cwd. After the install, the step asserts each installed package's version against the base lockfile and logs the sha256 of every executable file in the tools tree, launchers and the native binaries they spawn alike.
 
 Dependabot config for `github-actions` and `.factory/judge-tools`, so pins move by PR, which the gate's `.github/*` and `.factory/*` deny routes to me.
 
-Done when: `grep -ohE '(^|[ {])uses: *[^ ,}]+' templates/*.yml | grep -vE '@[0-9a-f]{40}$'` prints nothing (the leading anchor keeps `statuses: write` out of the match; today it prints five `@v` tags) (every `uses:` occurrence is extracted wherever it sits in the YAML, including inline `{ uses: … }` maps, and the allowed format is validated rather than forbidden prefixes enumerated); a PR that edits `.factory/judge-tools/package-lock.json` to point at a different package is judged with the base tools (the Actions log shows the base lockfile's integrity hashes); the install step for each model job runs with no `*_API_KEY` in its environment (assert with `env | grep -c _API_KEY` = 0 in that step); both `factory/judge-*` statuses are `success` on the pilot repo after the change.
+Done when: `scripts/check-pins.sh` exits 0 (it walks the parsed YAML for every `uses` key wherever it sits, including inline maps and quoted keys, which a line-oriented grep misses, and validates the allowed format rather than enumerating forbidden prefixes); a PR that edits `.factory/judge-tools/package-lock.json` to point at a different package is judged with the base tools (the Actions log shows the base lockfile's integrity hashes, the version assertion passes against base, and the sha256 lines for every executable in the tools tree, launchers and the native binaries they spawn, are identical to those of a run on an unmodified PR); the install step for each model job runs with no `*_API_KEY` in its environment (assert with `env | grep -c _API_KEY` = 0 in that step); both `factory/judge-*` statuses are `success` on the pilot repo after the change.
 
 Residual: npm's integrity field verifies the tarball, not its provenance. Transitive deps are fixed, not vetted.
 
@@ -387,3 +387,48 @@ Pre-existing, not adopted here: the README's "no local process holds a credentia
 | `--noproxy=registry.npmjs.org` also exempts its subdomains (npm's `getProxy` returned `DIRECT` for `child.registry.npmjs.org`), so "every request except to registry.npmjs.org" overstated the match; yarnpkg and codeload correctly took the dead proxy | MINOR | Yes | Wording: the registry and its subdomains, which are npm's own |
 
 "The earlier concrete bypasses are addressed; CI's networked installation and offline checks match the revised description." Applied without another pass, as with the plan's revision 8. Eight passes on the implementation: 7, 4, 4, 3, 1, 3, 3, 1 findings. The shape of the review: the first two passes were about trust (whose lockfile, whose environment), the next five were npm's resolver reaching the network before validation through one lockfile or manifest shape after another, which the guards chased and the installer-side backstops (`--git=/usr/bin/false`, dead proxy with `--noproxy` for the registry) finally closed as a class.
+
+### Implementation of A2: Codex review of the diff, REFUTED, 6 findings
+
+Run against `git diff main...HEAD` after A2 was implemented in the templates.
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| The plan said A2 "landed" though the pilot has not run the new templates; macOS `--version` checks do not establish an Ubuntu workflow | MAJOR | Yes | Status line and table say implemented in the templates, pending the pilot re-onboard |
+| The done-when `uses:` grep passes a quoted-key inline map such as `{"uses": "actions/checkout@v4"}`; Codex reproduced it | MAJOR | Yes, pre-existing in the plan | `scripts/check-pins.sh` walks the parsed YAML; the plan's done-when names it |
+| Printing the base lockfile's integrity hashes proves which file was printed, not which tools ran | MAJOR | Yes | The install step asserts each installed package's version against the base lockfile and logs the executables' sha256; the done-when compares those lines across runs |
+| Onboarding would overwrite an existing `dependabot.yml` and silently stop a repo's own dependency updates | MAJOR | Yes | Onboarding merges the two entries into an existing file and never replaces it |
+| Codex was found through `PATH` though the plan says "by path" | MINOR | Yes | Absolute path for login and exec |
+| The `install.cjs` exception was undocumented | MINOR | Yes | Named in the plan item, with what it resolves relative to |
+
+### Implementation of A2, second pass: REFUTED, 3 findings
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| `check-pins.sh` accepted `./.github/actions/evil@<40 hex>`: GitHub reads `./…` as a workspace-local action, so the suffix is a directory name and the code is the PR's | MAJOR | Yes, reproduced | The checker requires the remote form `owner/repo[/path]@<40 hex>`; local paths and `docker://` cannot match |
+| `.bin/codex` is a launcher that spawns the platform package's native binary; hashing the launcher and asserting top-level versions leaves a swapped native binary unobserved | MAJOR | Yes | The install step hashes every executable file in the tools tree, so the native binaries are in the log too |
+| The writeup described the controls as operational while the pilot is on the old templates | MINOR | Yes | Qualified |
+
+### Implementation of A2, third pass: REFUTED, 2 findings
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| Onboarding kept an existing Dependabot entry for the same ecosystem and directory even when `open-pull-requests-limit: 0` disables it; the required updates would silently never arrive | MAJOR | Yes, reproduced | An existing entry counts only if it is live (no zero limit, no `ignore` over these packages); otherwise onboarding reports it and stops. Superseded in pass 4 |
+| The version assertion covered the two top-level CLIs, not "each installed package" | MINOR | Yes | Every lockfile entry is asserted present at its locked version, or absent only as an optional package for another platform |
+
+### Implementation of A2, fourth pass: REFUTED, 2 findings
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| The "live entry" test was an enumeration: an `allow` list naming one action, or a `target-branch` other than the default, passes it and still covers none of the factory's pins | MAJOR | Yes | No liveness test. An existing entry for the same ecosystem and directory stops onboarding with the entry quoted in the report; reconciling it is Kim's |
+| Optional packages may be absent unconditionally, so a missing current-platform native package passed the assertion and `install.cjs` returned success leaving the placeholder | MINOR | Yes | Each install step runs its CLI's `--version` before the key step; the placeholder exits 1 |
+
+### Implementation of A2, fifth pass: REFUTED, 1 finding
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| Onboarding looked for `dependabot.yml` only; a repo using `dependabot.yaml` would get a second file instead of a merge | MAJOR | Yes | Onboarding checks both names and merges into whichever exists |
+
+### Implementation of A2, sixth pass: CAVEATS, no new findings
+
+"The earlier fixes close their reported findings; I found no additional PR-controlled install path, API-key exposure during installation, or regression attributable to this branch." The caveat is the acceptance still owed: the Ubuntu install, the altered-lockfile comparison, and both judge statuses green on the pilot, all of which need the pilot re-onboarded onto these templates. Six passes: 6, 3, 2, 2, 1, 0 findings. Two of the twelve were pre-existing (the plan's own grep-based done-when, and its "integrity hashes in the log" criterion); the rest were this branch's, four of them in the onboarding prose for an existing Dependabot file, which ended as "stop and report" rather than a growing list of conditions.

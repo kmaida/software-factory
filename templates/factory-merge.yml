@@ -54,7 +54,7 @@ jobs:
           [ "$b" = "$DEFAULT" ] || { gh pr comment "$n" -R "$GITHUB_REPOSITORY" -b "factory: not auto-mergeable — review: base $b is not $DEFAULT"; echo skip=1 >> "$GITHUB_OUTPUT"; }
       - name: Checkout base (PR code is only ever diffed, never run)
         if: steps.pr.outputs.skip != '1' && steps.pr.outputs.factory == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
         with: { ref: "${{ github.event.repository.default_branch }}", fetch-depth: 0 }
       - name: CI green? (the judge's statuses and jobs, and this workflow's own job, are excluded; the gate checks the verdicts)
         if: steps.pr.outputs.skip != '1' && steps.pr.outputs.factory == 'true'
@@ -113,7 +113,7 @@ jobs:
       - name: App token
         if: steps.gate.outputs.verdict == 'low'
         id: app
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349   # v2.2.2
         with: { app-id: "${{ vars.FACTORY_APP_ID }}", private-key: "${{ secrets.FACTORY_APP_PRIVATE_KEY }}" }
       - name: Merge (re-check the base at the last instant; --match-head-commit binds only the head)
         if: steps.gate.outputs.verdict == 'low'

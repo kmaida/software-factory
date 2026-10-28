@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
         with: { ref: "${{ github.event.pull_request.head.sha }}", fetch-depth: 0, persist-credentials: false }
       - name: Run every allowed check from BASE policy in throwaway containers (PR code never runs on the runner)
         id: run
@@ -73,7 +73,7 @@ jobs:
             if run --network none node:24 bash -c "$c" >> "$out" 2>&1; then echo "exit 0" >> "$out"; else echo "exit $?" >> "$out"; ok=0; fi
           done < <(jq -r '.checks[]' "$p")
           [ "$ok" = 1 ]   # job result is the only signal downstream trusts
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
         if: always()
         with: { name: "judge-checks-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/check-output.txt", retention-days: 14 }
 
@@ -86,11 +86,11 @@ jobs:
     environment: factory     # the API key is readable only when this workflow was taken from the default branch
     outputs: { verdict: "${{ steps.out.outputs.verdict }}", attempt: "${{ steps.out.outputs.attempt }}" }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
         with: { ref: "${{ github.event.pull_request.head.sha }}", fetch-depth: 0, persist-credentials: false }
       - name: Strip PR-controlled agent config (hooks, settings, instructions) before any model runs
         run: rm -rf .claude .codex .mcp.json CLAUDE.md AGENTS.md .cursor .github/copilot-instructions.md
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4.3.0
         with: { name: "judge-checks-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/checks" }
       - name: Build the prompt (one-pass literal substitution; PR title/body, diff and check transcript are untrusted data)
         env: { TITLE: "${{ github.event.pull_request.title }}", BODY: "${{ github.event.pull_request.body }}", URL: "${{ github.event.pull_request.html_url }}" }
@@ -106,17 +106,34 @@ jobs:
           p=re.sub(r"\{\{(\w+)\}\}",lambda m:v.get(m[1],m[0]),open(f"{t}/refute-prompt.md").read())   # one pass: substituted text is never re-scanned
           open(f"{t}/prompt.md","w").write(p)
           PY
+      - name: Install the judge CLIs from BASE's lockfile (no API key in this step; the PR checkout is never the source of its own judge)
+        run: |
+          [ "$(env | grep -c _API_KEY)" = 0 ] || { echo "an API key is in the install step's environment" >&2; exit 1; }
+          t="$RUNNER_TEMP/tools"; mkdir -p "$t"
+          git show "$BASE:.factory/judge-tools/package.json" > "$t/package.json"
+          git show "$BASE:.factory/judge-tools/package-lock.json" > "$t/package-lock.json"
+          jq -r '.packages | to_entries[] | select(.value.integrity) | "\(.key) \(.value.integrity)"' "$t/package-lock.json"   # which tools judged this PR, in the log
+          (cd "$t" && npm ci --ignore-scripts --no-audit --no-fund --userconfig=/dev/null --globalconfig="$RUNNER_TEMP/no-globalconfig")
+          # what is installed is what BASE's lockfile says, not HEAD's: every entry present at its locked version, or absent only
+          # because it is an optional package for another platform; then every executable's hash, in the log
+          jq -r '.packages | to_entries[] | select(.key != "") | "\(.key) \(.value.version) \(.value.optional // false)"' "$t/package-lock.json" \
+          | while read -r k want opt; do
+              if [ -f "$t/$k/package.json" ]; then have=$(jq -r .version "$t/$k/package.json"); [ "$want" = "$have" ] || { echo "installed $k $have, BASE lockfile says $want" >&2; exit 1; }
+              else [ "$opt" = true ] || { echo "$k is missing and not optional" >&2; exit 1; }; fi
+            done
+          node "$t/node_modules/@anthropic-ai/claude-code/install.cjs"   # the one script that runs: copies the integrity-checked native binary over its placeholder
+          "$t/node_modules/.bin/claude" --version   # the placeholder exits 1: proves this platform's native package was installed and selected
+          find "$t/node_modules" -type f -perm -u+x -exec sha256sum {} +   # every executable the judge can run, by hash, in the log (launchers and the native binaries they spawn)
       - name: Claude reviews (read-only tools, agent config off, no GITHUB_ENV/PATH/OUTPUT)
         env: { ANTHROPIC_API_KEY: "${{ secrets.ANTHROPIC_API_KEY }}" }
         run: |
-          npm i -g @anthropic-ai/claude-code@2.1.176 >/dev/null 2>&1   # pinned; bump deliberately
-          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE claude -p "$(cat "$RUNNER_TEMP/prompt.md")" --bare --tools "Read,Grep,Glob" --max-turns 40 > "$RUNNER_TEMP/claude.txt" 2>&1 || true
+          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE "$RUNNER_TEMP/tools/node_modules/.bin/claude" -p "$(cat "$RUNNER_TEMP/prompt.md")" --bare --tools "Read,Grep,Glob" --max-turns 40 > "$RUNNER_TEMP/claude.txt" 2>&1 || true
       - name: Verdict as job output (whole line only, sanitized; anything else becomes CAVEATS downstream)
         id: out
         run: |
           echo "verdict=$(grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)\s*$' "$RUNNER_TEMP/claude.txt" | tail -1 | awk '{print $2}' | tr -cd 'A-Z')" >> "$GITHUB_OUTPUT"
           echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"   # "re-run failed jobs" reuses this job's outputs from an earlier attempt; post refuses to mix attempts
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
         if: always()
         with: { name: "judge-claude-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/claude.txt\n${{ runner.temp }}/prompt.md", retention-days: 14 }
 
@@ -127,11 +144,11 @@ jobs:
     environment: factory
     outputs: { verdict: "${{ steps.out.outputs.verdict }}", attempt: "${{ steps.out.outputs.attempt }}" }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4.4.0
         with: { ref: "${{ github.event.pull_request.head.sha }}", fetch-depth: 0, persist-credentials: false }
       - name: Strip PR-controlled agent config (hooks, settings, instructions) before any model runs
         run: rm -rf .claude .codex .mcp.json CLAUDE.md AGENTS.md .cursor .github/copilot-instructions.md
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093   # v4.3.0
         with: { name: "judge-checks-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/checks" }
       - name: Build the prompt (one-pass literal substitution; PR title/body, diff and check transcript are untrusted data)
         env: { TITLE: "${{ github.event.pull_request.title }}", BODY: "${{ github.event.pull_request.body }}", URL: "${{ github.event.pull_request.html_url }}" }
@@ -147,14 +164,31 @@ jobs:
           p=re.sub(r"\{\{(\w+)\}\}",lambda m:v.get(m[1],m[0]),open(f"{t}/refute-prompt.md").read())   # one pass: substituted text is never re-scanned
           open(f"{t}/prompt.md","w").write(p)
           PY
+      - name: Install the judge CLIs from BASE's lockfile (no API key in this step; the PR checkout is never the source of its own judge)
+        run: |
+          [ "$(env | grep -c _API_KEY)" = 0 ] || { echo "an API key is in the install step's environment" >&2; exit 1; }
+          t="$RUNNER_TEMP/tools"; mkdir -p "$t"
+          git show "$BASE:.factory/judge-tools/package.json" > "$t/package.json"
+          git show "$BASE:.factory/judge-tools/package-lock.json" > "$t/package-lock.json"
+          jq -r '.packages | to_entries[] | select(.value.integrity) | "\(.key) \(.value.integrity)"' "$t/package-lock.json"   # which tools judged this PR, in the log
+          (cd "$t" && npm ci --ignore-scripts --no-audit --no-fund --userconfig=/dev/null --globalconfig="$RUNNER_TEMP/no-globalconfig")
+          # what is installed is what BASE's lockfile says, not HEAD's: every entry present at its locked version, or absent only
+          # because it is an optional package for another platform; then every executable's hash, in the log
+          jq -r '.packages | to_entries[] | select(.key != "") | "\(.key) \(.value.version) \(.value.optional // false)"' "$t/package-lock.json" \
+          | while read -r k want opt; do
+              if [ -f "$t/$k/package.json" ]; then have=$(jq -r .version "$t/$k/package.json"); [ "$want" = "$have" ] || { echo "installed $k $have, BASE lockfile says $want" >&2; exit 1; }
+              else [ "$opt" = true ] || { echo "$k is missing and not optional" >&2; exit 1; }; fi
+            done
+          "$t/node_modules/.bin/codex" --version   # fails unless this platform's native package was installed and selected
+          find "$t/node_modules" -type f -perm -u+x -exec sha256sum {} +   # every executable the judge can run, by hash, in the log (the launcher and the native binary it spawns)
       - name: Codex reviews (read-only sandbox, agent config off, no GITHUB_ENV/PATH/OUTPUT)
         env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }
         run: |
-          npm i -g @openai/codex@0.164.0 >/dev/null 2>&1   # pinned; bump deliberately
+          codex="$RUNNER_TEMP/tools/node_modules/.bin/codex"   # from BASE's lockfile, installed and hashed in the step above
           # codex 0.164 does not read OPENAI_API_KEY on its own; log in into a throwaway CODEX_HOME and delete it after.
           # The key is still in this step's env (inherent to running an agent with a key); the runner is ephemeral and the key is judge-only.
           export CODEX_HOME=$(mktemp -d); chmod 700 "$CODEX_HOME"
-          printenv OPENAI_API_KEY | codex login --with-api-key
+          printenv OPENAI_API_KEY | "$codex" login --with-api-key
           # read-only: the model's shell commands can read the disk (so `git diff` works) and write nothing. Codex's Linux
           # sandbox (bubblewrap) needs an unprivileged user namespace, which Ubuntu 24.04 runners refuse by AppArmor policy
           # (seen as RTM_NEWADDR EPERM when it set up the netns). Lifting that one restriction is the documented fix; the
@@ -162,14 +196,14 @@ jobs:
           # from the diff alone and reported CAVEATS on itself.
           # ponytail: if the sandbox still cannot start, there is no verdict and post fails closed to CAVEATS; fix here, never fall back to danger-full-access.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 >/dev/null
-          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE codex exec --sandbox read-only --skip-git-repo-check "$(cat "$RUNNER_TEMP/prompt.md")" > "$RUNNER_TEMP/codex.txt" 2>&1 || true
+          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE "$codex" exec --sandbox read-only --skip-git-repo-check "$(cat "$RUNNER_TEMP/prompt.md")" > "$RUNNER_TEMP/codex.txt" 2>&1 || true
           rm -rf "$CODEX_HOME"
       - name: Verdict as job output (whole line only, sanitized; anything else becomes CAVEATS downstream)
         id: out
         run: |
           echo "verdict=$(grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)\s*$' "$RUNNER_TEMP/codex.txt" | tail -1 | awk '{print $2}' | tr -cd 'A-Z')" >> "$GITHUB_OUTPUT"
           echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.6.2
         if: always()
         with: { name: "judge-codex-${{ github.event.pull_request.head.sha }}", path: "${{ runner.temp }}/codex.txt\n${{ runner.temp }}/prompt.md", retention-days: 14 }
 
