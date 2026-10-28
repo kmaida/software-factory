@@ -19,6 +19,7 @@ On a branch `factory/onboard` from the default branch:
 - `.factory/policy.json` from `${CLAUDE_PLUGIN_ROOT}/templates/policy.json`, edited from the preflight: `allow` = the repo's source and test dirs, `checks` = its real test/build commands, `launch` = its dev command, `auto_merge` false unless tests + CI exist (and even then leave false; Phase 2 flips it).
 - `.factory/risk-gate.sh` = copy of `${CLAUDE_PLUGIN_ROOT}/scripts/risk-gate.sh` (the merge workflow reads it from the base commit).
 - `.github/workflows/factory-merge.yml` and `.github/workflows/factory-judge.yml` from the templates; `.factory/refute-prompt.md` from `templates/refute-prompt.md` (the judge reads it from the base commit).
+- `.factory/judge-tools/package.json` and `package-lock.json` from `templates/judge-tools/` (the judge installs its two CLIs from the base commit's copy, never from the PR); `.github/dependabot.yml` from `templates/dependabot.yml` so the action SHAs and the CLI pins move by PR, which policy routes to Kim.
 - Append `${CLAUDE_PLUGIN_ROOT}/templates/CLAUDE-factory.md` to `CLAUDE.md` (create if absent). Never replace existing content.
 - Run `/fewer-permission-prompts` if `.claude/settings.json` has no allowlist yet.
 

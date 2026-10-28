@@ -1,0 +1,10 @@
+{
+  "name": "factory-judge-tools",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The two judge CLIs, pinned by lockfile. Installed from the base commit into $RUNNER_TEMP/tools by factory-judge.yml; bump by PR (Dependabot).",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.176",
+    "@openai/codex": "0.164.0"
+  }
+}
