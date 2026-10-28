@@ -63,32 +63,36 @@ else                                                                            
   if [[ ! -f $lock ]]; then echo "warm-up skipped: no npm lockfile"
   elif ! jq -e '(.lockfileVersion // 0) >= 2 and ([.packages | to_entries[] | select(.key | contains("node_modules/")) | .value | select(.link != true)
                  | select(if has("resolved") then (.resolved | startswith("https://registry.npmjs.org/") | not)
-                          else ((.version // "") | test("^[0-9]+\\.[0-9]+\\.[0-9]+") | not) end)] == [])' "$lock" >/dev/null; then
+                          else ((.version // "") | test("^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$") | not) end)] == [])' "$lock" >/dev/null; then
     echo "warm-up skipped: ${lock##*/} is v1 or has a dependency that is not a registry.npmjs.org package; worker runs cold"
   else                                                                                       # warm node_modules here, never in the worker
-    (cd "$wt" && env -u GH_TOKEN -u LINEAR_TOKEN perl -e '
-        setpgrp; alarm 600;                                # own process group; 10 minutes, then the whole group dies
+    (cd "$wt" && env -i HOME="$HOME" PATH="$PATH" perl -e '
+        setpgrp; alarm 300;                                # own process group; 5 minutes, then the whole group dies
         $SIG{ALRM} = sub { $SIG{TERM} = "IGNORE"; kill TERM => -$$; sleep 5; kill KILL => -$$ };
         system @ARGV; exit($? ? 1 : 0)' -- npm ci --ignore-scripts --no-audit --no-fund \
-          --registry=https://registry.npmjs.org/ --replace-registry-host=never --userconfig=/dev/null) \
-      || { git -C "$repo" worktree remove --force "$wt"; git -C "$repo" branch -D "factory/$id"; fail "npm ci --ignore-scripts in $wt (10-minute limit); worktree removed so the retry starts fresh"; }
+          --registry=https://registry.npmjs.org/ --replace-registry-host=never --userconfig=/dev/null --globalconfig=/var/empty/npmrc) \
+      || { git -C "$repo" worktree remove --force "$wt"; git -C "$repo" branch -D "factory/$id"; fail "npm ci --ignore-scripts in $wt (5-minute limit); worktree removed so the retry starts fresh"; }
   fi
 fi
 # The install runs only on the first run, when the worktree is exactly origin/HEAD: the lockfile and any .npmrc are base's,
 # which review already trusts. A retry worktree carries the worker's branch, so dispatch never installs from it; a worker
 # that broke its node_modules fails its own checks and lands in Needs Input. worker-settings.json denies the registry to
-# the worker, so this is the only install. Always --ignore-scripts, and the two brokered tokens are dropped from the
-# install's environment so an .npmrc `${GH_TOKEN}` has nothing to expand; scripts/pr.sh shows a script could still get
+# the worker, so this is the only install. Always --ignore-scripts, and the install's environment is only HOME and PATH,
+# so an .npmrc `${GH_TOKEN}` has nothing to expand and no npm_config_* (scoped registries included) survives; scripts/pr.sh
+# shows a script could still get
 # tokens back from keycard, which is why scripts stay off. --ignore-scripts does not cover git dependencies (a git
 # dependency's own .npmrc can point npm at a different git binary), so the lockfile guard skips the install unless the
 # lockfile is v2+ and every installed entry either resolves to a registry.npmjs.org tarball or, when npm left `resolved`
 # out (it does, for entries it had cached), has a plain semver `version`, which npm can only fetch as name@version from
-# the registry (v1 can hide a git dependency in `version`); such a project runs cold and lands in Needs Input. The CLI
-# --registry and --replace-registry-host=never outrank any .npmrc or npm_config_* in this shell, and --userconfig=/dev/null
-# drops the operator's ~/.npmrc, so the only config left is the command line and base's own .npmrc. Packages install
-# without their lifecycle scripts, so a build that needs them fails and routes to Needs Input; install_scripts: true
-# applies only in the CI judge. The 10-minute limit keeps claim-to-worker-start well inside the 2h stale threshold
-# (the worker's own budget is 90 minutes), and the group kill takes npm's children (git, ssh) with it.
+# the registry (v1 can hide a git dependency in `version`); such a project runs cold and lands in Needs Input. With
+# --userconfig at /dev/null, --globalconfig at a path that does not exist (npm refuses the same path twice) and the
+# environment scrubbed, npm's configuration is the command line
+# and base's own .npmrc, nothing else; base's .npmrc is trusted exactly as far as base's lockfile is (a scoped registry
+# set there is honored). Packages install without their lifecycle scripts, so a build that needs them fails and routes
+# to Needs Input; install_scripts: true applies only in the CI judge. The 5-minute limit keeps claim-to-worker-start
+# well inside the 2h stale threshold (the worker's own budget is 90 minutes), and the group kill takes npm's children
+# with it. ponytail: the sweep lock goes stale at 60 minutes and each registered repo may spend 5 here, so the registry
+# holds at most 11 repos before the lock needs renewing from inside the sweep.
 # ponytail: npm only; add pnpm/yarn when a registered project uses one.
 ```
 3. Start the worker, detached, logging to `~/.factory/logs/<ID>-<run>.log` (one file per run; a retry does not overwrite the previous run's log):
