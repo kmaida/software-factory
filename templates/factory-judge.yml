@@ -114,11 +114,13 @@ jobs:
           git show "$BASE:.factory/judge-tools/package-lock.json" > "$t/package-lock.json"
           jq -r '.packages | to_entries[] | select(.value.integrity) | "\(.key) \(.value.integrity)"' "$t/package-lock.json"   # which tools judged this PR, in the log
           (cd "$t" && npm ci --ignore-scripts --no-audit --no-fund --userconfig=/dev/null --globalconfig="$RUNNER_TEMP/no-globalconfig")
-          # what is installed is what BASE's lockfile says, not HEAD's: assert the versions, and log the executables' hashes
-          for p in @anthropic-ai/claude-code @openai/codex; do
-            want=$(jq -r --arg p "node_modules/$p" '.packages[$p].version' "$t/package-lock.json"); have=$(jq -r .version "$t/node_modules/$p/package.json")
-            [ "$want" = "$have" ] || { echo "installed $p $have, BASE lockfile says $want" >&2; exit 1; }
-          done
+          # what is installed is what BASE's lockfile says, not HEAD's: every entry present at its locked version, or absent only
+          # because it is an optional package for another platform; then every executable's hash, in the log
+          jq -r '.packages | to_entries[] | select(.key != "") | "\(.key) \(.value.version) \(.value.optional // false)"' "$t/package-lock.json" \
+          | while read -r k want opt; do
+              if [ -f "$t/$k/package.json" ]; then have=$(jq -r .version "$t/$k/package.json"); [ "$want" = "$have" ] || { echo "installed $k $have, BASE lockfile says $want" >&2; exit 1; }
+              else [ "$opt" = true ] || { echo "$k is missing and not optional" >&2; exit 1; }; fi
+            done
           node "$t/node_modules/@anthropic-ai/claude-code/install.cjs"   # the one script that runs: copies the integrity-checked native binary over its placeholder
           find "$t/node_modules" -type f -perm -u+x -exec sha256sum {} +   # every executable the judge can run, by hash, in the log (launchers and the native binaries they spawn)
       - name: Claude reviews (read-only tools, agent config off, no GITHUB_ENV/PATH/OUTPUT)
@@ -169,11 +171,13 @@ jobs:
           git show "$BASE:.factory/judge-tools/package-lock.json" > "$t/package-lock.json"
           jq -r '.packages | to_entries[] | select(.value.integrity) | "\(.key) \(.value.integrity)"' "$t/package-lock.json"   # which tools judged this PR, in the log
           (cd "$t" && npm ci --ignore-scripts --no-audit --no-fund --userconfig=/dev/null --globalconfig="$RUNNER_TEMP/no-globalconfig")
-          # what is installed is what BASE's lockfile says, not HEAD's: assert the versions, and log the executables' hashes
-          for p in @anthropic-ai/claude-code @openai/codex; do
-            want=$(jq -r --arg p "node_modules/$p" '.packages[$p].version' "$t/package-lock.json"); have=$(jq -r .version "$t/node_modules/$p/package.json")
-            [ "$want" = "$have" ] || { echo "installed $p $have, BASE lockfile says $want" >&2; exit 1; }
-          done
+          # what is installed is what BASE's lockfile says, not HEAD's: every entry present at its locked version, or absent only
+          # because it is an optional package for another platform; then every executable's hash, in the log
+          jq -r '.packages | to_entries[] | select(.key != "") | "\(.key) \(.value.version) \(.value.optional // false)"' "$t/package-lock.json" \
+          | while read -r k want opt; do
+              if [ -f "$t/$k/package.json" ]; then have=$(jq -r .version "$t/$k/package.json"); [ "$want" = "$have" ] || { echo "installed $k $have, BASE lockfile says $want" >&2; exit 1; }
+              else [ "$opt" = true ] || { echo "$k is missing and not optional" >&2; exit 1; }; fi
+            done
           find "$t/node_modules" -type f -perm -u+x -exec sha256sum {} +   # every executable the judge can run, by hash, in the log (the launcher and the native binary it spawns)
       - name: Codex reviews (read-only sandbox, agent config off, no GITHUB_ENV/PATH/OUTPUT)
         env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }

@@ -408,3 +408,10 @@ Run against `git diff main...HEAD` after A2 was implemented in the templates.
 | `check-pins.sh` accepted `./.github/actions/evil@<40 hex>`: GitHub reads `./…` as a workspace-local action, so the suffix is a directory name and the code is the PR's | MAJOR | Yes, reproduced | The checker requires the remote form `owner/repo[/path]@<40 hex>`; local paths and `docker://` cannot match |
 | `.bin/codex` is a launcher that spawns the platform package's native binary; hashing the launcher and asserting top-level versions leaves a swapped native binary unobserved | MAJOR | Yes | The install step hashes every executable file in the tools tree, so the native binaries are in the log too |
 | The writeup described the controls as operational while the pilot is on the old templates | MINOR | Yes | Qualified |
+
+### Implementation of A2, third pass: REFUTED, 2 findings
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| Onboarding kept an existing Dependabot entry for the same ecosystem and directory even when `open-pull-requests-limit: 0` disables it; the required updates would silently never arrive | MAJOR | Yes, reproduced | An existing entry counts only if it is live (no zero limit, no `ignore` over these packages); otherwise onboarding reports it and stops |
+| The version assertion covered the two top-level CLIs, not "each installed package" | MINOR | Yes | Every lockfile entry is asserted present at its locked version, or absent only as an optional package for another platform |
