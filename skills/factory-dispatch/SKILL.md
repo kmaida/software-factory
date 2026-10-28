@@ -114,8 +114,9 @@ log=~/.factory/logs/$id-$run.log
     $SIG{ALRM} = sub { warn "factory: 90-minute timeout, killing process group $$\n";
                        $SIG{TERM} = "IGNORE"; kill TERM => -$$; sleep 10;
                        kill KILL => grep { $_ != $$ } split " ", qx(pgrep -g $$) };   # the group minus this wrapper, which still attaches the log
-    my $rc = system(@ARGV) >> 8;
-    system $ENV{L}, "attach", $ENV{FID}, $ENV{FLOG}, "worker log $ENV{FID} (context, not evidence: same uid as the worker)";
+    my $rc = system(@ARGV) >> 8; alarm 0;                  # the deadline was for the worker, not for the upload
+    system($ENV{L}, "attach", $ENV{FID}, $ENV{FLOG}, "worker log $ENV{FID} (context, not evidence: same uid as the worker)") == 0
+      or warn "factory: could not attach the log to $ENV{FID}\n";
     exit $rc' -- \
     keycard agent exec --config "${CLAUDE_PLUGIN_ROOT}/keycard.toml" --zone "$KEYCARD_ZONE" -- \
       claude -p "/factory:factory-worker $id" --plugin-dir "${CLAUDE_PLUGIN_ROOT}" \
