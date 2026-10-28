@@ -94,8 +94,8 @@ fi
 # manifest, or only in a lockfile entry's own dependency map, is fetched first and rejected after. Such a project runs
 # cold and lands in Needs Input. The guards are what we can read; the backstop for the shapes we cannot is on the
 # installer itself: --git=/usr/bin/false makes every git fetch fail at clone, and every HTTP request except to
-# registry.npmjs.org goes to a proxy on 127.0.0.1:9 where nothing listens (--noproxy exempts only the registry), so a
-# codeload tarball or any other host that npm resolves its way to fails at connect. With
+# registry.npmjs.org and its subdomains (npm's own; --noproxy matches by suffix) goes to a proxy on 127.0.0.1:9 where
+# nothing listens, so a codeload tarball or any other host that npm resolves its way to fails at connect. With
 # --userconfig at /dev/null, --globalconfig at a path that does not exist (npm refuses the same path twice) and the
 # environment scrubbed, npm's configuration is the command line
 # and base's own .npmrc, nothing else; base's .npmrc is trusted exactly as far as base's lockfile is (a scoped registry
