@@ -69,7 +69,7 @@ Default-deny isn't there yet. What is there: Claude Code's sandbox proxy refuses
 
 ### Boundary 3: supply chain
 
-Two cheap controls do most of the work for now. Workers can't change `package.json` or any lockfile, so a worker PR can't introduce a dependency; the gate forces review if it tries. Workers can't fetch one from the registry either: it and its common mirrors are denied to the worker process, so the one-command path to running third-party code is closed (git and tarball URLs on allowed hosts, and deliberate download-and-execute, are not). The judge installs pinned versions of both CLIs so an upstream release can't change verdict behavior unannounced. We don't verify images or attach SBOMs.
+Two cheap controls do most of the work for now. Workers can't change the root `package.json` or lockfile, so a worker PR can't introduce a dependency; the gate forces review if it tries (a nested `src/package.json` matches the allow list, which changes module type for that directory but not what the root lockfile installs). Workers can't fetch one from the registry either: it and its common mirrors are denied to the worker process, so the one-command path to running third-party code is closed except for packages already in the worker's npm cache (git and tarball URLs on allowed hosts, and deliberate download-and-execute, are not closed). The judge installs pinned versions of both CLIs so an upstream release can't change verdict behavior unannounced. We don't verify images or attach SBOMs.
 
 ### Boundary 4: identity and access
 

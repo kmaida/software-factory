@@ -73,7 +73,8 @@ else                                                                            
         setpgrp; alarm 300;                                # own process group; 5 minutes, then the whole group dies
         $SIG{ALRM} = sub { $SIG{TERM} = "IGNORE"; kill TERM => -$$; sleep 5; kill KILL => -$$ };
         system @ARGV; exit($? ? 1 : 0)' -- npm ci --ignore-scripts --no-audit --no-fund \
-          --registry=https://registry.npmjs.org/ --replace-registry-host=never --userconfig=/dev/null --globalconfig=/var/empty/npmrc --git=/usr/bin/false) \
+          --registry=https://registry.npmjs.org/ --replace-registry-host=never --userconfig=/dev/null --globalconfig=/var/empty/npmrc \
+          --git=/usr/bin/false --proxy=http://127.0.0.1:9 --https-proxy=http://127.0.0.1:9 --noproxy=registry.npmjs.org) \
       || { git -C "$repo" worktree remove --force "$wt"; git -C "$repo" branch -D "factory/$id"; fail "npm ci --ignore-scripts in $wt (5-minute limit); worktree removed so the retry starts fresh"; }
   fi
 fi
@@ -91,9 +92,10 @@ fi
 # dependency spec in every tracked package.json (overrides included) is a plain range with no `:`, `/` or `#`: npm ci
 # builds the ideal tree from the manifests before it checks them against the lockfile, so a git URL declared only in a
 # manifest, or only in a lockfile entry's own dependency map, is fetched first and rejected after. Such a project runs
-# cold and lands in Needs Input. The guards are what we can read; --git=/usr/bin/false is the backstop for the shapes
-# we cannot: npm runs the configured git binary for every git fetch, so any git dependency that slips past the guards
-# fails at clone, before anything the dependency controls can run. With
+# cold and lands in Needs Input. The guards are what we can read; the backstop for the shapes we cannot is on the
+# installer itself: --git=/usr/bin/false makes every git fetch fail at clone, and every HTTP request except to
+# registry.npmjs.org goes to a proxy on 127.0.0.1:9 where nothing listens (--noproxy exempts only the registry), so a
+# codeload tarball or any other host that npm resolves its way to fails at connect. With
 # --userconfig at /dev/null, --globalconfig at a path that does not exist (npm refuses the same path twice) and the
 # environment scrubbed, npm's configuration is the command line
 # and base's own .npmrc, nothing else; base's .npmrc is trusted exactly as far as base's lockfile is (a scoped registry
