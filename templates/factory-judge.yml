@@ -120,7 +120,7 @@ jobs:
             [ "$want" = "$have" ] || { echo "installed $p $have, BASE lockfile says $want" >&2; exit 1; }
           done
           node "$t/node_modules/@anthropic-ai/claude-code/install.cjs"   # the one script that runs: copies the integrity-checked native binary over its placeholder
-          sha256sum "$t/node_modules/@anthropic-ai/claude-code/bin/claude.exe"   # identity of the judge binary, in the log
+          find "$t/node_modules" -type f -perm -u+x -exec sha256sum {} +   # every executable the judge can run, by hash, in the log (launchers and the native binaries they spawn)
       - name: Claude reviews (read-only tools, agent config off, no GITHUB_ENV/PATH/OUTPUT)
         env: { ANTHROPIC_API_KEY: "${{ secrets.ANTHROPIC_API_KEY }}" }
         run: |
@@ -174,10 +174,11 @@ jobs:
             want=$(jq -r --arg p "node_modules/$p" '.packages[$p].version' "$t/package-lock.json"); have=$(jq -r .version "$t/node_modules/$p/package.json")
             [ "$want" = "$have" ] || { echo "installed $p $have, BASE lockfile says $want" >&2; exit 1; }
           done
+          find "$t/node_modules" -type f -perm -u+x -exec sha256sum {} +   # every executable the judge can run, by hash, in the log (the launcher and the native binary it spawns)
       - name: Codex reviews (read-only sandbox, agent config off, no GITHUB_ENV/PATH/OUTPUT)
         env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }
         run: |
-          codex="$RUNNER_TEMP/tools/node_modules/.bin/codex"; sha256sum "$(readlink -f "$codex")"   # from BASE's lockfile, installed in the step above
+          codex="$RUNNER_TEMP/tools/node_modules/.bin/codex"   # from BASE's lockfile, installed and hashed in the step above
           # codex 0.164 does not read OPENAI_API_KEY on its own; log in into a throwaway CODEX_HOME and delete it after.
           # The key is still in this step's env (inherent to running an agent with a key); the runner is ephemeral and the key is judge-only.
           export CODEX_HOME=$(mktemp -d); chmod 700 "$CODEX_HOME"
