@@ -428,3 +428,7 @@ Run against `git diff main...HEAD` after A2 was implemented in the templates.
 | Finding | Severity | Valid? | What changed |
 |---|---|---|---|
 | Onboarding looked for `dependabot.yml` only; a repo using `dependabot.yaml` would get a second file instead of a merge | MAJOR | Yes | Onboarding checks both names and merges into whichever exists |
+
+### Implementation of A2, sixth pass: CAVEATS, no new findings
+
+"The earlier fixes close their reported findings; I found no additional PR-controlled install path, API-key exposure during installation, or regression attributable to this branch." The caveat is the acceptance still owed: the Ubuntu install, the altered-lockfile comparison, and both judge statuses green on the pilot, all of which need the pilot re-onboarded onto these templates. Six passes: 6, 3, 2, 2, 1, 0 findings. Two of the twelve were pre-existing (the plan's own grep-based done-when, and its "integrity hashes in the log" criterion); the rest were this branch's, four of them in the onboarding prose for an existing Dependabot file, which ended as "stop and report" rather than a growing list of conditions.
