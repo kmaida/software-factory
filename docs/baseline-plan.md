@@ -18,7 +18,7 @@ One fact that shapes every residual below: **dispatch and the worker are the sam
 |---|---|---|
 | 1 Sandbox | Worker: Claude Code seatbelt, non-admin `softwarefactory` user on the mini. Judge: ephemeral Actions runner, `permissions: {}`, no secrets in the job that runs PR code. | Worker sandbox is a developer-machine sandbox, not one the agent can't escape. |
 | 2 Network | `worker-settings.json` allowlist + `auto` classifier, inside the agent. Keycard brokers tokens in. Metadata IPs and the npm registry denied; dispatch installs `node_modules` from the committed lockfile with `--ignore-scripts` before the worker starts (A1). No MCP servers. | Not default-deny, and the control lives inside the agent process. |
-| 3 Supply chain | Policy denies manifests and lockfiles at merge. Judge workflow and prompt come from base and PR code runs only in containers (A0). Workers cannot fetch packages (A1). Judge CLIs pinned by version. | Pins are by tag/version, not content. No model gateway. |
+| 3 Supply chain | Policy denies manifests and lockfiles at merge. Judge workflow and prompt come from base and PR code runs only in containers (A0). Workers cannot reach the npm registry or its common mirrors; dispatch installs from the base lockfile, first run only (A1). Judge CLIs pinned by version. | Pins are by tag/version, not content. No model gateway. |
 | 4 Identity | Keycard broker + zone audit log. Merge App key only in Actions. Statuses only from CI. | Level 1 shape. The brokered token is a repo-wide bearer shared by dispatch and worker; "only your branch and issue" is prose in the worker skill, not an enforced scope. Profile is split between the repo (`policy.json`) and the plugin checkout on the mini (`worker-settings.json`, skills), and neither half is authenticated. |
 | Record | Keycard audit + GitHub statuses + Actions logs + Linear comments share a run id. | `~/.factory/logs` and every Linear comment are written by the shared identity, so neither is independent of the worker. |
 
@@ -76,7 +76,7 @@ Change:
 
 Done when: a worker that runs `npm install left-pad` sees a sandbox denial for `registry.npmjs.org` in its log; a fresh worktree passes `npm test` with no outbound connection from the worker's process group to the registry (verified from the `pf` log in A4, or from the sandbox log before A4 lands).
 
-Residual: `npm install github:owner/repo` and `npm install https://…/x.tgz` still work, because `codeload.github.com` and `objects.githubusercontent.com` stay allowed for git and the `npm` client is not what is denied. So do `curl | sh` from an allowed host, and a package already in `~/.npm/_cacache`. The deny list names the registry and its common mirrors (yarnpkg, npmmirror, GitHub Packages) by hostname; a mirror not on the list reaches the `auto` classifier, and an IP literal is not a hostname at all. A4 is the layer that sees addresses. What A1 closes is the default path that runs third-party code with one command; it does not close deliberate download-and-execute. The seatbelt confines the write set; the tokens in the worker's environment are the exposure, and only Phase B's credential-free worker removes them.
+Residual: `npm install github:owner/repo` and `npm install https://…/x.tgz` still work, because `codeload.github.com` and `objects.githubusercontent.com` stay allowed for git and the `npm` client is not what is denied. So do `curl | sh` from an allowed host, and a package already in `~/.npm/_cacache`. The deny list names the registry and its common mirrors (yarnpkg, npmmirror, GitHub Packages) by hostname; a mirror not on the list reaches the `auto` classifier, and an IP literal is not a hostname at all. A4 is the layer that sees addresses. The warm-up is npm only (`package-lock.json` or `npm-shrinkwrap.json`) and runs only on the first run from the base tree; a retry worktree is the worker's branch and is never installed from. pnpm and yarn projects get no warm-up, so onboarding one is premature until it does. What A1 closes is the default path that runs third-party code with one command; it does not close deliberate download-and-execute. The seatbelt confines the write set; the tokens in the worker's environment are the exposure, and only Phase B's credential-free worker removes them.
 
 ### A2. Pin by content, install from trusted sources (boundary 3)
 
@@ -314,3 +314,19 @@ Run against `git diff main...HEAD` after A0 was implemented in the templates. Al
 "No new findings beyond the documented residuals and dispositions." Seven passes on the implementation: 5, 3, 3, 3, 1, 1, 0 findings. Four of the sixteen were pre-existing holes in the judge template (python import from the PR checkout, `pull_request` trigger, repository secrets, status-by-name gate); the rest were defects in this branch's own first drafts, three of them regressions that a reviewer with the old template open caught.
 
 Not adopted, any round: "continuous external checkpoints" and "authenticated completion records" for the log, and per-run gateway authorization as a Phase A item. Each is the Phase B broker by another name; adding them to Phase A would be the same work twice.
+
+### Implementation of A1: Codex review of the diff, REFUTED, 7 findings
+
+Run against `git diff main...HEAD` after A1 was implemented (deny list, dispatch warm-up, docs).
+
+| Finding | Severity | Valid? | What changed |
+|---|---|---|---|
+| The warm-up also ran on retry, where the worktree is the worker's branch: a worker can push a lockfile pointing at its own host plus an `.npmrc` with `_authToken=${GH_TOKEN}`, delete `node_modules`, and dispatch installs from it with the token in its environment | BLOCKER | Yes | Install only on the first run, when the tree is `origin/HEAD`; the two brokered tokens are dropped from the install's environment |
+| `! -d node_modules` is not "installed": a failed `npm ci` leaves a partial directory that the next run skips | MAJOR | Yes | A failed install removes `node_modules` and fails prep; retries never install, so a broken tree fails its checks and routes to Needs Input |
+| No deadline on the install; a long one pushes the worker's 90 minutes past the 2h stale threshold and the dispatcher past its 60-minute lock | MAJOR | Yes | `alarm 600` around `npm ci` |
+| `npm-shrinkwrap.json`, pnpm and yarn projects skip the warm-up while the worker is told its dependencies were installed | MAJOR | Yes | Shrinkwrap accepted; the worker skill says "if the repo has an npm lockfile"; pnpm/yarn named as a residual |
+| The verification shown (two curl 403s, an empty scratch project) does not establish the done-when: it needs a dependency-bearing fixture that passes its suite cold with no registry reachable | MAJOR | Yes | Re-verified on an export of the pilot repo: warm-up from its lockfile with the registry reachable, then `npm test` with the registry denied |
+| README, writeup and the plan table said "cannot fetch and run a package"; the residual says otherwise | MINOR | Yes | Wording narrowed to the registry and its mirrors |
+| "Runs cold" misdescribes `--ignore-scripts`: packages install, their lifecycle work does not | MINOR | Yes | Reworded |
+
+Pre-existing, not adopted here: the README's "no local process holds a credential" overstates what Keycard brokering gives (dispatch and workers hold the brokered tokens for the run); that is the Phase B credential-free worker.

@@ -65,11 +65,11 @@ The worker runs inside Claude Code's seatbelt sandbox on my laptop. Writes are c
 
 ### Boundary 2: network
 
-Default-deny isn't there yet. What is there: Claude Code's sandbox proxy refuses hosts outside the allowlist unless the command names them and the classifier approves, and cloud metadata endpoints and the npm registry are on the deny list (a worker's `npm install` fails at connect; dispatch installs `node_modules` from the lockfile with `--ignore-scripts` before the worker starts). The Keycard egress proxy on the mini is the Phase 3 answer, and it closes this boundary and the sandbox one together.
+Default-deny isn't there yet. What is there: Claude Code's sandbox proxy refuses hosts outside the allowlist unless the command names them and the classifier approves, and cloud metadata endpoints and the npm registry are on the deny list (a worker's `npm install` from the registry or its common mirrors fails at connect; dispatch installs `node_modules` from the base lockfile with `--ignore-scripts` before the worker starts). The Keycard egress proxy on the mini is the Phase 3 answer, and it closes this boundary and the sandbox one together.
 
 ### Boundary 3: supply chain
 
-Two cheap controls do most of the work for now. Workers can't change `package.json` or any lockfile, so a worker PR can't introduce a dependency; the gate forces review if it tries. Workers can't fetch one either: the registry is denied to the worker process, so the one-command path to running third-party code is closed (deliberate download-and-execute from an allowed host is not). The judge installs pinned versions of both CLIs so an upstream release can't change verdict behavior unannounced. We don't verify images or attach SBOMs.
+Two cheap controls do most of the work for now. Workers can't change `package.json` or any lockfile, so a worker PR can't introduce a dependency; the gate forces review if it tries. Workers can't fetch one from the registry either: it and its common mirrors are denied to the worker process, so the one-command path to running third-party code is closed (git and tarball URLs on allowed hosts, and deliberate download-and-execute, are not). The judge installs pinned versions of both CLIs so an upstream release can't change verdict behavior unannounced. We don't verify images or attach SBOMs.
 
 ### Boundary 4: identity and access
 
