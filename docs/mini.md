@@ -30,7 +30,7 @@ Set up 2026-10-26. The mini runs the dispatcher every 30 minutes as a dedicated,
 
 | Path | What |
 |---|---|
-| `~/Development/factory` | this plugin (`--plugin-dir`). Moved out of `~/Documents` on 2026-10-27: see "Not under ~/Documents" below. |
+| `~/Development/software-factory` | this plugin (`--plugin-dir`). Moved out of `~/Documents` on 2026-10-27: see "Not under ~/Documents" below. |
 | `~/Development/plan-my-today` | pilot repo; worktrees land beside it as `plan-my-today-factory-<ID>` |
 | `~/.factory/registry.json` | `{"P-KIM-206": "/Users/softwarefactory/Development/plan-my-today"}` |
 | `~/.factory/logs/dispatch.log`, `dispatch.err.log` | LaunchAgent stdout / stderr, one `=== <UTC> sweep start/exit` pair per sweep |
@@ -52,7 +52,7 @@ macOS privacy protection (TCC) covers Desktop, Documents and Downloads. A launch
 No factory process holds a GitHub or Linear token: `keycard agent exec --config keycard.toml` brokers them in as `GH_TOKEN` and `LINEAR_TOKEN` (`scripts/linear.sh` is the only Linear client). The Linear MCP plugin is disabled, and dispatch and workers run `claude -p` with `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`, so the claude.ai connectors that come with the Claude login (Linear included) exist only in interactive sessions. Verified on the mini:
 
 ```bash
-cd ~/Development/factory
+cd ~/Development/software-factory
 keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- gh api user --jq .login   # kmaida
 keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- gh api -X POST \
   repos/kmaida/plan-my-today/statuses/$(git -C ~/Development/plan-my-today rev-parse origin/main) \
@@ -75,7 +75,7 @@ The worker's shell runs under Claude Code's macOS seatbelt sandbox (`worker-sett
 `templates/ai.keycard.factory.dispatch.plist` runs `keycard agent exec --config keycard.toml --zone $KEYCARD_ZONE -- scripts/dispatch.sh` every 1800 s and once at load. `dispatch.sh` checks the registry, that both tokens were brokered in, and that every registered Linear project is readable, then runs `claude -p "/factory:factory-dispatch" --permission-mode bypassPermissions`. A missing consent, a rejected token or an unreadable project is a non-zero `sweep exit` with the reason in `dispatch.err.log`. Install or update:
 
 ```bash
-sed "s|__HOME__|$HOME|g" ~/Development/factory/templates/ai.keycard.factory.dispatch.plist \
+sed "s|__HOME__|$HOME|g" ~/Development/software-factory/templates/ai.keycard.factory.dispatch.plist \
   > ~/Library/LaunchAgents/ai.keycard.factory.dispatch.plist
 launchctl bootout gui/$(id -u)/ai.keycard.factory.dispatch 2>/dev/null
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.keycard.factory.dispatch.plist
@@ -86,7 +86,7 @@ tail -f ~/.factory/logs/dispatch.log
 Fire one sweep now: `launchctl kickstart gui/$(id -u)/ai.keycard.factory.dispatch`. Stop the schedule: `launchctl bootout gui/$(id -u)/ai.keycard.factory.dispatch` (the repo-level pause is `gh variable set FACTORY_PAUSED -b true -R kmaida/plan-my-today`). By hand, from a terminal, never from inside a Claude session:
 
 ```bash
-cd ~/Development/factory
+cd ~/Development/software-factory
 KEYCARD_ZONE=1jgewf106fax3oaf70vyykwj2i keycard agent exec --config keycard.toml --zone 1jgewf106fax3oaf70vyykwj2i -- scripts/dispatch.sh
 ```
 
