@@ -1,0 +1,203 @@
+#!/bin/bash
+# factory: orchestrator for the software factory. See factory.md.
+#   factory run <task-file>   validate job, mint run, docker run the sandbox, write manifest + log
+#   factory stop <run_id>     kill the container, block new dispatch, record the incident
+# Compatible with the macOS /bin/bash (3.2). Needs: docker, git, jq.
+set -euo pipefail
+# Docker Desktop keeps its CLI inside the app bundle unless the /usr/local/bin symlinks were installed.
+command -v docker >/dev/null || PATH="/Applications/Docker.app/Contents/Resources/bin:$PATH"
+
+FACTORY_DIR="$(cd "$(dirname "$0")" && pwd)"
+RUNS="$FACTORY_DIR/runs"
+LOCK="$FACTORY_DIR/.lock"   # one concurrent job; held by `factory run`, removed on exit
+HALT="$FACTORY_DIR/HALT"    # written by `factory stop`; blocks dispatch until a human removes it
+IMAGE="factory-sandbox"
+TIMEOUT_SEC=3600
+KEYCARD_ZONE="https://1jgewf106fax3oaf70vyykwj2i.keycard.cloud"   # software factory zone; brokers the Claude credential
+ANTHROPIC_RESOURCE="https://api.anthropic.com"
+# Anthropic Workload Identity Federation: Keycard's token is exchanged here for a 1h API token. None of these are secrets.
+ANTHROPIC_ORG="91a560ee-bb99-440e-be20-49feb465f8cf"
+ANTHROPIC_SERVICE_ACCOUNT="svac_01WjGbnYgXZB4GCXZgy9peKs"
+ANTHROPIC_WORKSPACE="wrkspc_01MdoKfH7Q8tMGuuWx1Fgrnk"
+ANTHROPIC_FEDERATION_RULE="fdrl_014KGxaZmUmk5veFbJ8uibXB"
+GITHUB_APP_ID="Iv23liCLESgW74Wn2Ie2"     # GitHub App client id (accepted as JWT issuer); the private key lives in Keycard Vault
+GITHUB_APP_KEY_RESOURCE="urn:factory:github-app-key"
+GITHUB_APP_INSTALLATION="176545264"
+
+die()   { echo "factory: $*" >&2; exit 1; }
+usage() { echo "usage: factory run <task-file> | factory stop <run_id>" >&2; exit 2; }
+now()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# ---------------------------------------------------------------- run
+run_id= work= cname= logf=
+cleanup() {
+  [ -n "$cname" ] && docker rm -f "$cname" >/dev/null 2>&1 || true
+  [ -n "$work" ] && rm -rf "$work"
+  rm -rf "$LOCK"
+}
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+keycard_token() {  # keycard_token <resource>: client-credentials token for this Application; client secret via curl config on stdin, not argv
+  printf 'user = "%s:%s"\n' "$(cat "$FACTORY_SECRETS_DIR/keycard_client_id")" "$(cat "$FACTORY_SECRETS_DIR/keycard_client_secret")" \
+  | curl -sS -K - "$KEYCARD_ZONE/oauth/2/token" -d grant_type=client_credentials -d "resource=$1" \
+  | jq -r '.access_token // empty'
+}
+mint_github_token() {  # mint_github_token <repo-name> <pem>: 1h installation token scoped to that repo, contents+pull_requests write
+  t=$(date +%s)
+  hdr=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+  pld=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((t-60)) $((t+540)) "$GITHUB_APP_ID" | b64url)
+  sig=$(printf '%s.%s' "$hdr" "$pld" | openssl dgst -sha256 -sign <(printf '%s\n' "$2") -binary | b64url)   # key never touches disk
+  printf 'header = "Authorization: Bearer %s.%s.%s"\n' "$hdr" "$pld" "$sig" \
+  | curl -sS -K - -X POST "https://api.github.com/app/installations/$GITHUB_APP_INSTALLATION/access_tokens" \
+      -H "Accept: application/vnd.github+json" \
+      -d "{\"repositories\":[\"$1\"],\"permissions\":{\"contents\":\"write\",\"pull_requests\":\"write\"}}" \
+  | jq -r '.token // empty'
+}
+log() {  # log <text>: one factory-side line in log.jsonl
+  jq -nc --arg r "$run_id" --arg t "$1" '{run_id:$r, ts:(now|todate), event:{type:"factory", text:$t}}' >> "$logf"
+}
+
+cmd_run() {
+  task="${1:-}"; [ -n "$task" ] || usage
+  [ -f "$task" ] || die "task file not found: $task"
+  command -v docker >/dev/null || die "docker not found; install Docker Desktop or OrbStack"
+  docker info >/dev/null 2>&1 || die "docker daemon is not running"
+  [ -e "$HALT" ] && die "dispatch blocked by $HALT ($(cat "$HALT")); remove it to resume"
+
+  # Fail closed: the orchestrator's Keycard credential must exist before anything else happens.
+  [ -n "${FACTORY_SECRETS_DIR:-}" ] || die "FACTORY_SECRETS_DIR is not set"
+  for t in keycard_client_id keycard_client_secret; do
+    [ -s "$FACTORY_SECRETS_DIR/$t" ] || die "missing or empty token file: $FACTORY_SECRETS_DIR/$t"
+  done
+
+  # Validate the job: exactly these four keys, all non-empty strings. Everything else is derived here.
+  jq -e 'type=="object" and (keys|sort)==["base_branch","instructions","repo","task_id"] and all(.[]; type=="string" and length>0)' \
+    "$task" >/dev/null 2>&1 || die "invalid task file: need exactly {repo, base_branch, task_id, instructions}, all non-empty strings"
+  repo=$(jq -r .repo "$task"); base_branch=$(jq -r .base_branch "$task")
+  task_id=$(jq -r .task_id "$task"); instructions=$(jq -r .instructions "$task")
+  [[ "$task_id" =~ ^[A-Za-z0-9._-]+$ ]] || die "task_id must match [A-Za-z0-9._-]+"
+  [[ "$base_branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die "base_branch has unexpected characters"
+  case "$repo" in
+    https://*|/*) repo_url="$repo" ;;                                   # URL or local path (dry runs)
+    *) [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "repo must be owner/name, an https URL, or a local path"
+       repo_url="https://github.com/$repo.git" ;;
+  esac
+  # GitHub repos get a per-run installation token minted from the App key (fetched from Keycard Vault); anything else (dry runs) needs a github_token file.
+  case "$repo_url" in
+    https://github.com/*) ;;
+    *) [ -s "$FACTORY_SECRETS_DIR/github_token" ] || die "missing or empty token file: $FACTORY_SECRETS_DIR/github_token" ;;
+  esac
+
+  image_digest=$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null) || die "image $IMAGE not built; run: docker build -t $IMAGE ."
+  # Which factory ran: this checkout's commit. The definition changes only by reviewed PR and `git pull`; a dirty tree is not that.
+  factory_commit=$(git -C "$FACTORY_DIR" rev-parse HEAD 2>/dev/null) || factory_commit=
+  if [ -n "$factory_commit" ] && [ -n "$(git -C "$FACTORY_DIR" status --porcelain)" ]; then
+    [ "${FACTORY_ALLOW_DIRTY:-}" = 1 ] || die "factory checkout has uncommitted changes; land them by PR and git pull, or set FACTORY_ALLOW_DIRTY=1 for a development run"
+    factory_commit="$factory_commit-dirty"
+  fi
+
+  # One job at a time. mkdir is atomic. Any factory container still around is an orphan.
+  mkdir "$LOCK" 2>/dev/null || die "another run is in progress: $(cat "$LOCK/run_id" 2>/dev/null)"
+  trap cleanup EXIT; trap 'exit 130' INT TERM
+  run_id="$(date -u +%Y%m%dT%H%M%SZ)-$task_id"; echo "$run_id" > "$LOCK/run_id"
+  orphans=$(docker ps -aq --filter label=factory.run); if [ -n "$orphans" ]; then docker rm -f $orphans >/dev/null; fi
+
+  rundir="$RUNS/$run_id"; mkdir -p "$rundir"; logf="$rundir/log.jsonl"; : > "$logf"
+  echo "run $run_id"; echo "  evidence: $rundir"
+
+  # GitHub token: scoped to this repo, expires in 60 min (= job timeout). Held in memory here for the clone and for redaction.
+  case "$repo_url" in
+    https://github.com/*) app_key=$(keycard_token "$GITHUB_APP_KEY_RESOURCE" | openssl base64 -d -A 2>/dev/null) || app_key=
+                          [ -n "$app_key" ] || die "Keycard did not issue the GitHub App key (zone $KEYCARD_ZONE, resource $GITHUB_APP_KEY_RESOURCE)"
+                          gh_tok=$(mint_github_token "${repo##*/}" "$app_key") || gh_tok=; app_key=
+                          [ -n "$gh_tok" ] || die "GitHub did not issue an installation token for $repo (app $GITHUB_APP_ID, installation $GITHUB_APP_INSTALLATION)"
+                          gh_src="GitHub App installation $GITHUB_APP_INSTALLATION, repo $repo; key from Keycard $GITHUB_APP_KEY_RESOURCE" ;;
+    *) gh_tok=$(cat "$FACTORY_SECRETS_DIR/github_token"); gh_src="file" ;;
+  esac
+
+  # Clone (the container never sees the task file; only /work and /run/secrets are mounted).
+  work=$(mktemp -d "${TMPDIR:-/tmp}/factory-work.XXXXXX")
+  FACTORY_GH="$gh_tok" git -c credential.helper='!f() { echo username=x-access-token; echo "password=$FACTORY_GH"; }; f' \
+    clone -q "$repo_url" "$work" || die "clone failed: $repo_url"
+  base_sha=$(git -C "$work" rev-parse "origin/$base_branch" 2>/dev/null) || die "base branch not found: $base_branch"
+  log "cloned $repo_url at $base_sha"
+
+  jq -n --arg run_id "$run_id" --arg task_id "$task_id" --arg job "$(shasum -a 256 "$task" | cut -d' ' -f1)" \
+        --arg repo "$repo" --arg base_branch "$base_branch" --arg base_sha "$base_sha" \
+        --arg image "$image_digest" --arg fc "$factory_commit" --arg started "$(now)" --arg kz "$KEYCARD_ZONE" \
+    '{run_id:$run_id, task_id:$task_id, job_sha256:$job, repo:$repo, base_branch:$base_branch, base_sha:$base_sha,
+      image_digest:$image, factory_commit:(if $fc=="" then null else $fc end), keycard_zone:$kz,
+      started_at:$started, ended_at:null, exit_status:null, final_sha:null, pr_url:null}' \
+    > "$rundir/manifest.json"
+
+  # Secrets go to the container over stdin, one per line; the entrypoint writes them as 0400 files on the
+  # /run/secrets tmpfs. They never touch the host filesystem, argv, or docker inspect output.
+  # Claude credential, two steps, no API key anywhere:
+  # 1. Keycard signs a 1h OIDC token for this Application (policy-checked, audited). Client secret via curl config on stdin, not argv.
+  kc_tok=$(keycard_token "$ANTHROPIC_RESOURCE") || kc_tok=
+  [ -n "$kc_tok" ] || die "Keycard did not issue a token for $ANTHROPIC_RESOURCE (zone $KEYCARD_ZONE)"
+  # 2. Anthropic exchanges it for a 1h bearer token scoped to the factory workspace.
+  an_tok=$(jq -nc --arg a "$kc_tok" --arg r "$ANTHROPIC_FEDERATION_RULE" --arg o "$ANTHROPIC_ORG" --arg s "$ANTHROPIC_SERVICE_ACCOUNT" --arg w "$ANTHROPIC_WORKSPACE" \
+      '{grant_type:"urn:ietf:params:oauth:grant-type:jwt-bearer", assertion:$a, federation_rule_id:$r, organization_id:$o, service_account_id:$s, workspace_id:$w}' \
+    | curl -sS "$ANTHROPIC_RESOURCE/v1/oauth/token" -H "content-type: application/json" -d @- \
+    | jq -r '.access_token // empty') || an_tok=
+  [ -n "$an_tok" ] || die "Anthropic did not exchange the Keycard token (rule $ANTHROPIC_FEDERATION_RULE, workspace $ANTHROPIC_WORKSPACE)"
+  log "secrets issued: github_token ($gh_src), anthropic_token (Keycard $KEYCARD_ZONE -> Anthropic WIF rule $ANTHROPIC_FEDERATION_RULE, workspace $ANTHROPIC_WORKSPACE); ttl ${TIMEOUT_SEC}s"
+
+  # Run. Flags are fixed here; nothing in the task can change them. Stdout/stderr stream to log.jsonl, redacted.
+  cname="factory-$run_id"
+  ( sleep "$TIMEOUT_SEC" && docker stop -t 10 "$cname" >/dev/null 2>&1 ) & watchdog=$!
+  set +e
+  printf '%s\n%s\n' "$gh_tok" "$an_tok" \
+  | docker run -i --name "$cname" --label "factory.run=$run_id" --rm --read-only --tmpfs /tmp --tmpfs /run/secrets:size=64k \
+    --memory 4g --cpus 2 --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges \
+    -v "$work":/work \
+    -e TASK_ID="$task_id" -e BASE_BRANCH="$base_branch" "$image_digest" "$instructions" 2>&1 \
+  | while IFS= read -r line || [ -n "$line" ]; do
+      line=${line//"$gh_tok"/[REDACTED]}; line=${line//"$an_tok"/[REDACTED]}; printf '%s\n' "$line"
+    done \
+  | jq -R -c --arg r "$run_id" '{run_id:$r, ts:(now|todate), event:(. as $l | try fromjson catch {type:"text", text:$l})}' >> "$logf"
+  status=${PIPESTATUS[1]}
+  set -e
+  kill "$watchdog" 2>/dev/null || true
+  cname=   # container is gone (--rm); don't try to remove it again
+
+  final_sha=$(git -C "$work" rev-parse --verify -q "refs/heads/factory/$task_id" || echo null)
+  pr_url=$(grep -o 'https://github.com/[^"\\ ]*/pull/[0-9][0-9]*' "$logf" | tail -1 || true)
+  jq --arg ended "$(now)" --argjson status "$status" --arg final "$final_sha" --arg pr "$pr_url" \
+     '. + {ended_at:$ended, exit_status:$status, final_sha:(if $final=="null" then null else $final end), pr_url:(if $pr=="" then null else $pr end)}' \
+     "$rundir/manifest.json" > "$rundir/manifest.json.tmp" && mv "$rundir/manifest.json.tmp" "$rundir/manifest.json"
+  log "container exited with status $status"
+  echo "  exit status: $status"
+  exit "$status"
+}
+
+# ---------------------------------------------------------------- stop
+cmd_stop() {
+  run_id="${1:-}"; [ -n "$run_id" ] || usage
+  rundir="$RUNS/$run_id"; [ -d "$rundir" ] || die "no such run: $run_id"
+  cname="factory-$run_id"
+  if command -v docker >/dev/null; then
+    docker stop -t 5 "$cname" >/dev/null 2>&1 && echo "stopped container $cname" || echo "container $cname not running"
+    docker rm -f "$cname" >/dev/null 2>&1 || true
+  else
+    echo "docker not found; nothing to stop on this host"
+  fi
+  echo "stopped $run_id at $(now). Remove this file to allow new runs." > "$HALT"
+  echo "wrote $HALT (blocks new dispatch until removed)"
+  if [ -f "$rundir/manifest.json" ]; then
+    jq --arg ts "$(now)" '.incidents = ((.incidents // []) + [{ts:$ts, action:"factory stop", by:env.USER}])' \
+       "$rundir/manifest.json" > "$rundir/manifest.json.tmp" && mv "$rundir/manifest.json.tmp" "$rundir/manifest.json"
+    echo "appended incident to $rundir/manifest.json"
+  fi
+  cat <<EOF
+TODO (not wired yet; do by hand):
+  1. Revoke the Keycard grant for run $run_id in the factory zone.
+  2. Revoke the GitHub App installation token for run $run_id (DELETE /installation/token with that token).
+EOF
+}
+
+case "${1:-}" in
+  run)  shift; cmd_run "$@" ;;
+  stop) shift; cmd_stop "$@" ;;
+  *)    usage ;;
+esac
