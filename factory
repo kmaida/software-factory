@@ -30,9 +30,18 @@ now()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # ---------------------------------------------------------------- run
 run_id= work= cname= logf=
+manifest_set() {  # manifest_set <jq-filter> [jq args...]: atomic update of this run's manifest
+  f="$1"; shift
+  jq "$@" "$f" "$rundir/manifest.json" > "$rundir/manifest.json.tmp.$$" && mv "$rundir/manifest.json.tmp.$$" "$rundir/manifest.json"
+}
 cleanup() {
+  rc=$?
   [ -n "$cname" ] && docker rm -f "$cname" >/dev/null 2>&1 || true
   [ -n "$work" ] && rm -rf "$work"
+  # A run that died before finalizing still gets a terminal state, so no manifest is left open-ended.
+  if [ -n "${rundir:-}" ] && [ -f "$rundir/manifest.json" ] && [ "$(jq -r .ended_at "$rundir/manifest.json")" = null ]; then
+    manifest_set '. + {ended_at:$ended, exit_status:$rc}' --arg ended "$(now)" --argjson rc "$rc"
+  fi
   rm -rf "$LOCK"
 }
 b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
@@ -41,7 +50,7 @@ keycard_token() {  # keycard_token <resource>: client-credentials token for this
   | curl -sS -K - "$KEYCARD_ZONE/oauth/2/token" -d grant_type=client_credentials -d "resource=$1" \
   | jq -r '.access_token // empty'
 }
-mint_github_token() {  # mint_github_token <repo-name> <pem>: 1h installation token scoped to that repo, contents+pull_requests write
+mint_github_token() {  # mint_github_token <repo-name> <pem> <permissions-json>: 1h installation token scoped to that repo
   t=$(date +%s)
   hdr=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
   pld=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((t-60)) $((t+540)) "$GITHUB_APP_ID" | b64url)
@@ -49,8 +58,19 @@ mint_github_token() {  # mint_github_token <repo-name> <pem>: 1h installation to
   printf 'header = "Authorization: Bearer %s.%s.%s"\n' "$hdr" "$pld" "$sig" \
   | curl -sS -K - -X POST "https://api.github.com/app/installations/$GITHUB_APP_INSTALLATION/access_tokens" \
       -H "Accept: application/vnd.github+json" \
-      -d "{\"repositories\":[\"$1\"],\"permissions\":{\"contents\":\"write\",\"pull_requests\":\"write\"}}" \
+      -d "{\"repositories\":[\"$1\"],\"permissions\":$3}" \
   | jq -r '.token // empty'
+}
+open_pr() {  # open_pr <owner/name> <task_id> <base> <instructions>: fresh pull_requests:write token, one API call, prints the PR URL
+  key=$(keycard_token "$GITHUB_APP_KEY_RESOURCE" | openssl base64 -d -A 2>/dev/null) || return 1
+  [ -n "$key" ] || return 1
+  tok=$(mint_github_token "${1##*/}" "$key" '{"pull_requests":"write"}'); key=
+  [ -n "$tok" ] || return 1
+  printf 'header = "Authorization: Bearer %s"\n' "$tok" \
+  | curl -sS -K - -X POST "https://api.github.com/repos/$1/pulls" -H "Accept: application/vnd.github+json" \
+      -d "$(jq -nc --arg t "factory: $2" --arg h "factory/$2" --arg b "$3" --arg body "$4" \
+             '{title:$t, head:$h, base:$b, body:("Opened by the factory for task `"+$t+"`.\n\n"+$body)}')" \
+  | jq -r '.html_url // empty'
 }
 log() {  # log <text>: one factory-side line in log.jsonl
   jq -nc --arg r "$run_id" --arg t "$1" '{run_id:$r, ts:(now|todate), event:{type:"factory", text:$t}}' >> "$logf"
@@ -59,6 +79,7 @@ log() {  # log <text>: one factory-side line in log.jsonl
 cmd_run() {
   task="${1:-}"; [ -n "$task" ] || usage
   [ -f "$task" ] || die "task file not found: $task"
+  repo_url=
   command -v docker >/dev/null || die "docker not found; install Docker Desktop or OrbStack"
   docker info >/dev/null 2>&1 || die "docker daemon is not running"
   [ -e "$HALT" ] && die "dispatch blocked by $HALT ($(cat "$HALT")); remove it to resume"
@@ -77,9 +98,12 @@ cmd_run() {
   [[ "$task_id" =~ ^[A-Za-z0-9._-]+$ ]] || die "task_id must match [A-Za-z0-9._-]+"
   [[ "$base_branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die "base_branch has unexpected characters"
   case "$repo" in
-    https://*|/*) repo_url="$repo" ;;                                   # URL or local path (dry runs)
-    *) [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "repo must be owner/name, an https URL, or a local path"
-       repo_url="https://github.com/$repo.git" ;;
+    https://github.com/*) repo="${repo#https://github.com/}"; repo="${repo%/}"; repo="${repo%.git}" ;;   # normalise to owner/name
+    https://*|/*) repo_url="$repo" ;;                                   # other URL or local path (dry runs)
+  esac
+  case "$repo_url" in
+    "") [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "repo must be owner/name, a GitHub URL, another https URL, or a local path"
+        repo_url="https://github.com/$repo.git" ;;
   esac
   # GitHub repos get a per-run installation token minted from the App key (fetched from Keycard Vault); anything else (dry runs) needs a github_token file.
   case "$repo_url" in
@@ -95,20 +119,35 @@ cmd_run() {
     factory_commit="$factory_commit-dirty"
   fi
 
-  # One job at a time. mkdir is atomic. Any factory container still around is an orphan.
-  mkdir "$LOCK" 2>/dev/null || die "another run is in progress: $(cat "$LOCK/run_id" 2>/dev/null)"
+  # One job at a time. mkdir is atomic. The lock names the orchestrator pid: a lock whose pid is gone is stale
+  # (crash, SIGKILL) and is reclaimed; any factory container still around is then an orphan.
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    lpid=$(cat "$LOCK/pid" 2>/dev/null || echo 0)
+    if [ "$lpid" -gt 0 ] 2>/dev/null && kill -0 "$lpid" 2>/dev/null; then die "another run is in progress: $(cat "$LOCK/run_id" 2>/dev/null) (pid $lpid)"; fi
+    echo "reclaiming stale lock left by run $(cat "$LOCK/run_id" 2>/dev/null)" >&2
+    rm -rf "$LOCK"; mkdir "$LOCK" || die "cannot take lock $LOCK"
+  fi
   trap cleanup EXIT; trap 'exit 130' INT TERM
-  run_id="$(date -u +%Y%m%dT%H%M%SZ)-$task_id"; echo "$run_id" > "$LOCK/run_id"
+  run_id="$(date -u +%Y%m%dT%H%M%SZ)-$task_id"; echo "$run_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"
   orphans=$(docker ps -aq --filter label=factory.run); if [ -n "$orphans" ]; then docker rm -f $orphans >/dev/null; fi
 
   rundir="$RUNS/$run_id"; mkdir -p "$rundir"; logf="$rundir/log.jsonl"; : > "$logf"
   echo "run $run_id"; echo "  evidence: $rundir"
+  # Manifest exists from the first moment there is a run, before any credential is issued; later steps fill it in.
+  jq -n --arg run_id "$run_id" --arg task_id "$task_id" --arg job "$(shasum -a 256 "$task" | cut -d' ' -f1)" \
+        --arg repo "$repo" --arg base_branch "$base_branch" \
+        --arg image "$image_digest" --arg fc "$factory_commit" --arg started "$(now)" --arg kz "$KEYCARD_ZONE" \
+    '{run_id:$run_id, task_id:$task_id, job_sha256:$job, repo:$repo, base_branch:$base_branch, base_sha:null,
+      image_digest:$image, factory_commit:(if $fc=="" then null else $fc end), keycard_zone:$kz,
+      started_at:$started, ended_at:null, exit_status:null, final_sha:null, pr_url:null}' \
+    > "$rundir/manifest.json"
 
-  # GitHub token: scoped to this repo, expires in 60 min (= job timeout). Held in memory here for the clone and for redaction.
+  # GitHub token for the agent: this repo only, contents:write only (push), expires in 60 min (= job timeout). It cannot open,
+  # approve or merge pull requests; the host opens the PR afterwards with a separate token. Held in memory here for the clone and for redaction.
   case "$repo_url" in
     https://github.com/*) app_key=$(keycard_token "$GITHUB_APP_KEY_RESOURCE" | openssl base64 -d -A 2>/dev/null) || app_key=
                           [ -n "$app_key" ] || die "Keycard did not issue the GitHub App key (zone $KEYCARD_ZONE, resource $GITHUB_APP_KEY_RESOURCE)"
-                          gh_tok=$(mint_github_token "${repo##*/}" "$app_key") || gh_tok=; app_key=
+                          gh_tok=$(mint_github_token "${repo##*/}" "$app_key" '{"contents":"write"}') || gh_tok=; app_key=
                           [ -n "$gh_tok" ] || die "GitHub did not issue an installation token for $repo (app $GITHUB_APP_ID, installation $GITHUB_APP_INSTALLATION)"
                           gh_src="GitHub App installation $GITHUB_APP_INSTALLATION, repo $repo; key from Keycard $GITHUB_APP_KEY_RESOURCE" ;;
     *) gh_tok=$(cat "$FACTORY_SECRETS_DIR/github_token"); gh_src="file" ;;
@@ -116,34 +155,37 @@ cmd_run() {
 
   # Clone (the container never sees the task file; only /work and /run/secrets are mounted).
   work=$(mktemp -d "${TMPDIR:-/tmp}/factory-work.XXXXXX")
-  FACTORY_GH="$gh_tok" git -c credential.helper='!f() { echo username=x-access-token; echo "password=$FACTORY_GH"; }; f' \
-    clone -q "$repo_url" "$work" || die "clone failed: $repo_url"
+  # `credential.helper=` first clears inherited helpers (the mini's system gitconfig sets osxkeychain, which would store the
+  # token on success). Ours answers only for github.com and reads the token from fd 3, so it is in neither argv nor the environment.
+  git -c credential.helper= \
+      -c credential.helper='!f() { h=; while IFS= read -r l; do case "$l" in host=*) h=${l#host=};; esac; done; [ "$h" = github.com ] || exit 0; echo username=x-access-token; echo "password=$(cat <&3)"; }; f' \
+    clone -q "$repo_url" "$work" 3< <(printf '%s' "$gh_tok") || die "clone failed: $repo_url"
   base_sha=$(git -C "$work" rev-parse "origin/$base_branch" 2>/dev/null) || die "base branch not found: $base_branch"
   log "cloned $repo_url at $base_sha"
-
-  jq -n --arg run_id "$run_id" --arg task_id "$task_id" --arg job "$(shasum -a 256 "$task" | cut -d' ' -f1)" \
-        --arg repo "$repo" --arg base_branch "$base_branch" --arg base_sha "$base_sha" \
-        --arg image "$image_digest" --arg fc "$factory_commit" --arg started "$(now)" --arg kz "$KEYCARD_ZONE" \
-    '{run_id:$run_id, task_id:$task_id, job_sha256:$job, repo:$repo, base_branch:$base_branch, base_sha:$base_sha,
-      image_digest:$image, factory_commit:(if $fc=="" then null else $fc end), keycard_zone:$kz,
-      started_at:$started, ended_at:null, exit_status:null, final_sha:null, pr_url:null}' \
-    > "$rundir/manifest.json"
+  manifest_set '. + {base_sha:$sha}' --arg sha "$base_sha"
+  if git -C "$work" rev-parse --verify -q "origin/factory/$task_id" >/dev/null; then
+    die "branch factory/$task_id already exists on $repo; delete it or use a new task_id (a rerun would diverge from it and fail to push)"
+  fi
 
   # Secrets go to the container over stdin, one per line; the entrypoint writes them as 0400 files on the
   # /run/secrets tmpfs. They never touch the host filesystem, argv, or docker inspect output.
   # Claude credential, two steps, no API key anywhere:
   # 1. Keycard signs a 1h OIDC token for this Application (policy-checked, audited). Client secret via curl config on stdin, not argv.
+  #    The token itself goes to jq on stdin for the same reason.
   kc_tok=$(keycard_token "$ANTHROPIC_RESOURCE") || kc_tok=
   [ -n "$kc_tok" ] || die "Keycard did not issue a token for $ANTHROPIC_RESOURCE (zone $KEYCARD_ZONE)"
   # 2. Anthropic exchanges it for a 1h bearer token scoped to the factory workspace.
-  an_tok=$(jq -nc --arg a "$kc_tok" --arg r "$ANTHROPIC_FEDERATION_RULE" --arg o "$ANTHROPIC_ORG" --arg s "$ANTHROPIC_SERVICE_ACCOUNT" --arg w "$ANTHROPIC_WORKSPACE" \
-      '{grant_type:"urn:ietf:params:oauth:grant-type:jwt-bearer", assertion:$a, federation_rule_id:$r, organization_id:$o, service_account_id:$s, workspace_id:$w}' \
+  an_tok=$(printf '%s' "$kc_tok" | jq -Rsc --arg r "$ANTHROPIC_FEDERATION_RULE" --arg o "$ANTHROPIC_ORG" --arg s "$ANTHROPIC_SERVICE_ACCOUNT" --arg w "$ANTHROPIC_WORKSPACE" \
+      '{grant_type:"urn:ietf:params:oauth:grant-type:jwt-bearer", assertion:., federation_rule_id:$r, organization_id:$o, service_account_id:$s, workspace_id:$w}' \
     | curl -sS "$ANTHROPIC_RESOURCE/v1/oauth/token" -H "content-type: application/json" -d @- \
     | jq -r '.access_token // empty') || an_tok=
   [ -n "$an_tok" ] || die "Anthropic did not exchange the Keycard token (rule $ANTHROPIC_FEDERATION_RULE, workspace $ANTHROPIC_WORKSPACE)"
   log "secrets issued: github_token ($gh_src), anthropic_token (Keycard $KEYCARD_ZONE -> Anthropic WIF rule $ANTHROPIC_FEDERATION_RULE, workspace $ANTHROPIC_WORKSPACE); ttl ${TIMEOUT_SEC}s"
 
   # Run. Flags are fixed here; nothing in the task can change them. Stdout/stderr stream to log.jsonl, redacted.
+  # `factory stop` during the steps above signals this process; the HALT check here covers a stop that landed between that and now.
+  [ -e "$HALT" ] && die "dispatch blocked by $HALT ($(cat "$HALT"))"
+  gh_b64=$(printf 'x-access-token:%s' "$gh_tok" | openssl base64 -A)   # the Basic-auth form git prints in verbose traces
   cname="factory-$run_id"
   ( sleep "$TIMEOUT_SEC" && docker stop -t 10 "$cname" >/dev/null 2>&1 ) & watchdog=$!
   set +e
@@ -153,7 +195,7 @@ cmd_run() {
     -v "$work":/work \
     -e TASK_ID="$task_id" -e BASE_BRANCH="$base_branch" "$image_digest" "$instructions" 2>&1 \
   | while IFS= read -r line || [ -n "$line" ]; do
-      line=${line//"$gh_tok"/[REDACTED]}; line=${line//"$an_tok"/[REDACTED]}; printf '%s\n' "$line"
+      line=${line//"$gh_tok"/[REDACTED]}; line=${line//"$an_tok"/[REDACTED]}; line=${line//"$gh_b64"/[REDACTED]}; printf '%s\n' "$line"
     done \
   | jq -R -c --arg r "$run_id" '{run_id:$r, ts:(now|todate), event:(. as $l | try fromjson catch {type:"text", text:$l})}' >> "$logf"
   status=${PIPESTATUS[1]}
@@ -162,10 +204,14 @@ cmd_run() {
   cname=   # container is gone (--rm); don't try to remove it again
 
   final_sha=$(git -C "$work" rev-parse --verify -q "refs/heads/factory/$task_id" || echo null)
-  pr_url=$(grep -o 'https://github.com/[^"\\ ]*/pull/[0-9][0-9]*' "$logf" | tail -1 || true)
-  jq --arg ended "$(now)" --argjson status "$status" --arg final "$final_sha" --arg pr "$pr_url" \
-     '. + {ended_at:$ended, exit_status:$status, final_sha:(if $final=="null" then null else $final end), pr_url:(if $pr=="" then null else $pr end)}' \
-     "$rundir/manifest.json" > "$rundir/manifest.json.tmp" && mv "$rundir/manifest.json.tmp" "$rundir/manifest.json"
+  # The PR is opened here, not by the agent: a second, separate token with pull_requests:write that the container never held.
+  pr_url=
+  if [ "$final_sha" != null ] && [ "$status" -eq 0 ] && [ "$gh_src" != file ]; then
+    pr_url=$(open_pr "$repo" "$task_id" "$base_branch" "$instructions") || pr_url=
+    if [ -n "$pr_url" ]; then log "opened $pr_url"; else log "branch factory/$task_id pushed but opening the PR failed; open it by hand"; status=4; fi
+  fi
+  manifest_set '. + {ended_at:$ended, exit_status:$status, final_sha:(if $final=="null" then null else $final end), pr_url:(if $pr=="" then null else $pr end)}' \
+     --arg ended "$(now)" --argjson status "$status" --arg final "$final_sha" --arg pr "$pr_url"
   log "container exited with status $status"
   echo "  exit status: $status"
   exit "$status"
@@ -175,19 +221,23 @@ cmd_run() {
 cmd_stop() {
   run_id="${1:-}"; [ -n "$run_id" ] || usage
   rundir="$RUNS/$run_id"; [ -d "$rundir" ] || die "no such run: $run_id"
-  cname="factory-$run_id"
+  cname="factory-$run_id"; logf="$rundir/log.jsonl"
+  echo "stopped $run_id at $(now). Remove this file to allow new runs." > "$HALT"   # first, so nothing new starts meanwhile
+  echo "wrote $HALT (blocks new dispatch until removed)"
   if command -v docker >/dev/null; then
     docker stop -t 5 "$cname" >/dev/null 2>&1 && echo "stopped container $cname" || echo "container $cname not running"
     docker rm -f "$cname" >/dev/null 2>&1 || true
   else
     echo "docker not found; nothing to stop on this host"
   fi
-  echo "stopped $run_id at $(now). Remove this file to allow new runs." > "$HALT"
-  echo "wrote $HALT (blocks new dispatch until removed)"
-  if [ -f "$rundir/manifest.json" ]; then
-    jq --arg ts "$(now)" '.incidents = ((.incidents // []) + [{ts:$ts, action:"factory stop", by:env.USER}])' \
-       "$rundir/manifest.json" > "$rundir/manifest.json.tmp" && mv "$rundir/manifest.json.tmp" "$rundir/manifest.json"
-    echo "appended incident to $rundir/manifest.json"
+  # An orchestrator still preparing this run (tokens, clone) has not started a container yet: interrupt it so it never does.
+  opid=0; [ "$(cat "$LOCK/run_id" 2>/dev/null)" = "$run_id" ] && opid=$(cat "$LOCK/pid" 2>/dev/null || echo 0)
+  alive=; if [ "$opid" -gt 0 ] 2>/dev/null && kill -0 "$opid" 2>/dev/null; then alive=1; kill -TERM "$opid" && echo "signalled orchestrator pid $opid"; fi
+  log "factory stop by ${USER:-?}"   # append-only; safe beside the orchestrator's own writes
+  # The manifest is written here only if no live orchestrator will finalize it (its cleanup records ended_at and exit_status).
+  if [ -z "$alive" ] && [ -f "$rundir/manifest.json" ]; then
+    manifest_set '.incidents = ((.incidents // []) + [{ts:$ts, action:"factory stop", by:env.USER}]) | .ended_at //= $ts | .exit_status //= 137' --arg ts "$(now)"
+    echo "recorded incident in $rundir/manifest.json"
   fi
   cat <<EOF
 TODO (not wired yet; do by hand):

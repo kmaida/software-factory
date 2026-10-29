@@ -10,10 +10,8 @@
 
 FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da
 
+# No gh: the agent's token can only push (contents:write); the host opens the pull request with a separate token.
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl \
- && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
- && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
- && apt-get update && apt-get install -y --no-install-recommends gh \
  && rm -rf /var/lib/apt/lists/* \
  && npm install -g @anthropic-ai/claude-code \
  && userdel -r node && useradd -m -u 1000 agent
@@ -23,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 COPY --chmod=0755 <<'EOF' /usr/local/bin/entrypoint
 #!/bin/sh
 set -eu
-# Root FS is read-only; /tmp is tmpfs. Point HOME there so git, gh and claude can write their config.
+# Root FS is read-only; /tmp is tmpfs. Point HOME there so git and claude can write their config.
 export HOME=/tmp
 umask 077
 IFS= read -r GH_TOKEN; IFS= read -r ANTHROPIC_AUTH_TOKEN
@@ -32,7 +30,8 @@ printf '%s\n' "$ANTHROPIC_AUTH_TOKEN" > /run/secrets/anthropic_token
 chmod 0400 /run/secrets/github_token /run/secrets/anthropic_token
 # anthropic_token is a bearer token from Workload Identity Federation, so ANTHROPIC_AUTH_TOKEN, not ANTHROPIC_API_KEY.
 export GH_TOKEN ANTHROPIC_AUTH_TOKEN
-git config --global credential.helper '!f() { echo "username=x-access-token"; echo "password=$GH_TOKEN"; }; f'
+# The helper answers for github.com only, so a push to any other host gets no credential.
+git config --global credential.helper '!f() { h=; while IFS= read -r l; do case "$l" in host=*) h=${l#host=};; esac; done; [ "$h" = github.com ] || exit 0; echo "username=x-access-token"; echo "password=$GH_TOKEN"; }; f'
 git config --global user.name "factory[bot]"
 git config --global user.email "factory@users.noreply.github.com"
 git config --global --add safe.directory /work
@@ -47,7 +46,6 @@ git add -A && git commit -qm "factory: ${TASK_ID} (uncommitted changes)" || true
 # No commits beyond the base: the agent declined or produced nothing. Push nothing; exit 3 so the manifest says so.
 if [ "$(git rev-list --count "origin/${BASE_BRANCH}..HEAD")" -eq 0 ]; then echo "factory: no changes on factory/${TASK_ID}; not pushing" >&2; exit 3; fi
 git push -u origin "factory/${TASK_ID}"
-gh pr create --fill --base "${BASE_BRANCH}" --head "factory/${TASK_ID}"
 EOF
 
 USER agent
