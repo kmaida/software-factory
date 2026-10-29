@@ -1,4 +1,7 @@
-# Local to the host, never committed (see README "Local files"):
-docs/keycard-setup.md
-keycard.toml
-templates/ai.keycard.factory.dispatch.plist
+# Host state, never committed: run evidence, task files, the run lock and the halt switch.
+runs/*
+!runs/.gitkeep
+queue/*
+!queue/.gitkeep
+.lock/
+HALT
