@@ -5,7 +5,7 @@ A personal software factory on an isolated Mac mini. A task file names a repo, a
 ## Layout
 
 - `factory` — the orchestrator (bash 3.2, macOS). `factory run <task-file>` and `factory stop <run_id>`.
-- `Dockerfile` — the sandbox image: Node, git, gh, Claude Code, non-root user, entrypoint that takes secrets over stdin and ends by pushing a `factory/<task_id>` branch and opening the PR.
+- `Dockerfile` — the sandbox image: Node, git, Claude Code, non-root user, entrypoint that takes secrets over stdin and ends by pushing a `factory/<task_id>` branch. No `gh`: the agent's token can only push.
 - `factory.md` — spec, Agent Baseline mapping, implementation notes, TODO.
 - `queue/` — task files, one JSON object each: `repo`, `base_branch`, `task_id`, `instructions`. Host state, not committed.
 - `runs/<run_id>/` — per-run evidence: `manifest.json` and `log.jsonl`. Host state, not committed.
@@ -13,10 +13,10 @@ A personal software factory on an isolated Mac mini. A task file names a repo, a
 ## How a run works
 
 1. The orchestrator validates the task file, takes a lock, and writes a manifest naming the run, the task, the base commit, the image digest and its own commit.
-2. It gets a Keycard-signed token for the Anthropic resource and exchanges it at Anthropic Workload Identity Federation for a one-hour API token. It fetches the GitHub App private key from Keycard Vault and mints a one-hour installation token scoped to the target repo.
+2. It gets a Keycard-signed token for the Anthropic resource and exchanges it at Anthropic Workload Identity Federation for a one-hour API token. It fetches the GitHub App private key from Keycard Vault and mints a one-hour installation token scoped to the target repo with `contents:write` only.
 3. Both tokens go into the container over stdin and land as 0400 files on a tmpfs. The clone is the only bind mount. The container is read-only, non-root, capability-dropped and resource-limited.
 4. Claude Code works with a fixed tool allowlist. The orchestrator streams its output to the run log with both tokens redacted.
-5. The entrypoint commits, pushes the branch and opens the PR. If nothing changed it pushes nothing and exits 3.
+5. The entrypoint commits and pushes the branch. If nothing changed it pushes nothing and exits 3. The host then opens the PR with a separate, short-lived `pull_requests:write` token the container never had, and records the PR URL in the manifest.
 6. A ruleset on the target repo requires one human approval and green CI before merge. The App authors the PR, so it cannot approve it.
 
 ## Where things live
