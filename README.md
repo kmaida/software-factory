@@ -1,29 +1,40 @@
-# factory
+# software-factory
 
-Linear issue → worktree worker → two-model judge → merge controller in CI. Keycard brokers per-role credentials.
+A personal software factory on an isolated Mac mini. A task file names a repo, a base branch and instructions; the orchestrator runs Claude Code in a locked-down container against a fresh clone and opens a pull request that a human must approve. The spec, the design decisions and the current state are in [`factory.md`](factory.md).
 
-## Against the agentbaseline.org software-factory reference (Level 1)
+## Layout
 
-Have: versioned profile (`.factory/policy.json` + CLAUDE snippet, read from the base commit); approval policy (Kim merges; `auto_merge` opt-in); no local process holds a credential (Keycard brokers `GH_TOKEN` and `LINEAR_TOKEN` into dispatch and workers alike; `scripts/linear.sh` is the only Linear client, `scripts/pr.sh` opens the worker's PR over REST because `gh` cannot verify TLS inside the sandbox, and factory Claude processes run with no MCP servers at all); judge and merge run where no local process has their tokens, from workflow definitions a PR cannot change (`pull_request_target`), with every secret in a default-branch-only GitHub Environment so a PR-added workflow gets none of them; PR code in the judge runs only in throwaway containers, with no network during checks; judge verdicts are HMAC-signed and the merge gate verifies the signature, never the status name; the gate refuses a PR retargeted off the default branch before reading from it; policy changes force review; deterministic gate plus two models, never an LLM judge alone; run id in Linear comment, PR body, and Keycard audit; budgets per run (turns + wall clock); pause switch; worker shell egress limited to the allowlist in `worker-settings.json` under `auto` mode, with the npm registry explicitly denied (dispatch runs `npm ci --ignore-scripts` from the base lockfile before the worker starts, so the one-command path to fetching and running a registry package is closed; git and tarball URLs on allowed hosts are not).
+- `factory` — the orchestrator (bash 3.2, macOS). `factory run <task-file>` and `factory stop <run_id>`.
+- `Dockerfile` — the sandbox image: Node, git, gh, Claude Code, non-root user, entrypoint that takes secrets over stdin and ends by pushing a `factory/<task_id>` branch and opening the PR.
+- `factory.md` — spec, Agent Baseline mapping, implementation notes, TODO.
+- `queue/` — task files, one JSON object each: `repo`, `base_branch`, `task_id`, `instructions`. Host state, not committed.
+- `runs/<run_id>/` — per-run evidence: `manifest.json` and `log.jsonl`. Host state, not committed.
 
-Plan for the rest, validated against Codex: `docs/baseline-plan.md`. Not yet: a sandbox the agent can't escape (the worker is a Claude Code seatbelt sandbox on the developer's machine, not a microVM); a true default-deny egress proxy outside the agent (the Keycard egress proxy); supply-chain admission for packages (today workers cannot change lockfiles or manifests at all, which sidesteps it); tamper-evident local run logs (GitHub Actions logs and the Keycard audit log are; `~/.factory/logs` is not).
+## How a run works
 
-- `skills/factory:factory-onboard` — one-time per repo: preflight, setup PR, registry row.
-- `skills/factory:factory-dispatch` — one idempotent sweep: claim, start workers, judge green PRs, reset stale runs.
-- `skills/factory:factory-worker` — implement one issue, open PR, exit.
-- `skills/factory:factory-judge` — Claude + Codex refute the PR at its exact SHA, post commit statuses.
-- `scripts/risk-gate.sh` — deterministic low/review decision, run in CI from the base commit. `scripts/test-risk-gate.sh` is its check.
-- `templates/factory-merge.yml` — the only merge path.
-- `scripts/linear.sh` — the factory's whole Linear surface: list a project's `factory` issues, read one, set state by name, assign, comment, over Linear's GraphQL API with the brokered `LINEAR_TOKEN`.
-- `scripts/dispatch.sh` — sweep entrypoint: preflight (registry, brokered tokens, every registered project readable), then the dispatch skill. Fails loudly instead of reporting "nothing to do".
-- `keycard.toml` — the single Keycard config for local processes (one provider per issuer per zone: `urn:github:factory` → `GH_TOKEN`, `https://api.linear.app` → `LINEAR_TOKEN`). Setup in `docs/keycard-setup.md`.
+1. The orchestrator validates the task file, takes a lock, and writes a manifest naming the run, the task, the base commit, the image digest and its own commit.
+2. It gets a Keycard-signed token for the Anthropic resource and exchanges it at Anthropic Workload Identity Federation for a one-hour API token. It fetches the GitHub App private key from Keycard Vault and mints a one-hour installation token scoped to the target repo.
+3. Both tokens go into the container over stdin and land as 0400 files on a tmpfs. The clone is the only bind mount. The container is read-only, non-root, capability-dropped and resource-limited.
+4. Claude Code works with a fixed tool allowlist. The orchestrator streams its output to the run log with both tokens redacted.
+5. The entrypoint commits, pushes the branch and opens the PR. If nothing changed it pushes nothing and exits 3.
+6. A ruleset on the target repo requires one human approval and green CI before merge. The App authors the PR, so it cannot approve it.
 
-Run: `KEYCARD_ZONE=<zone> keycard agent exec --config keycard.toml --zone <zone> -- scripts/dispatch.sh` from this directory. The dispatch skill runs with `--permission-mode bypassPermissions`: under `auto`, the permission classifier refuses to spawn the worker subprocess and the sweep stops to ask. Workers themselves run under `auto`. Pause: `gh variable set FACTORY_PAUSED -b true -R owner/repo`.
+## Where things live
 
-## Local files
+- The mini holds this repo as a clone of `main` and pulls after each merge. It never pushes. The only credential on it is the Keycard client id and secret, outside the repo.
+- Changes to the factory itself land by pull request from a laptop, under the same ruleset as the target repos. `factory run` records the checkout's commit in the manifest and refuses to start on uncommitted changes.
+- Keycard, Anthropic and GitHub App identifiers are constants at the top of `factory`. None of them is a secret.
 
-Three files are gitignored and live only on the host: `keycard.toml` (org and zone ids plus the two `[[credentials.default]]` entries, `GH_TOKEN` and `LINEAR_TOKEN`), `templates/ai.keycard.factory.dispatch.plist` (the LaunchAgent that runs `scripts/dispatch.sh` under `keycard agent exec`), and `docs/keycard-setup.md` (the Keycard, GitHub App and Linear setup steps). They hold identifiers and host paths, not secrets; they stay out of the repo so the public history describes the design, not one machine. Their copies for the mini, the install commands, and the host notes that `docs/mini.md` replaces with placeholders live in the private repo [kmaida/factory-host](https://github.com/kmaida/factory-host).
+## Running
 
-## Mini
+```sh
+docker build -t factory-sandbox .
+FACTORY_SECRETS_DIR=~/factory-secrets ./factory run queue/<task>.json
+./factory stop <run_id>
+```
 
-The always-on host is a Mac mini running the dispatcher as a dedicated non-admin macOS user from a LaunchAgent every 30 minutes. Versions, logins, paths, the plist, and the FileVault tradeoff are in `docs/mini.md`; the plist is `templates/ai.keycard.factory.dispatch.plist`.
+`factory stop` kills the container, writes a `HALT` file that blocks further runs until a human removes it, and records the incident in the manifest.
+
+## History
+
+The first version of this repository was a different design: a Linear-driven worker, a two-model judge and a merge gate in GitHub Actions. It was retired in favour of this one; the code is in the history before the `retire-v1` merge.

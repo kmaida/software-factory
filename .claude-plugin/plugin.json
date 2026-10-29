@@ -1,8 +1,0 @@
-{
-  "name": "factory",
-  "version": "0.1.0",
-  "description": "Software factory: Linear issue -> worktree worker -> two-model judge -> merge controller in CI. Keycard brokers per-role credentials.",
-  "author": {
-    "name": "Kim Maida"
-  }
-}
