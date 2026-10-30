@@ -23,7 +23,7 @@ ANTHROPIC_FEDERATION_RULE="fdrl_014KGxaZmUmk5veFbJ8uibXB"
 GITHUB_APP_ID="Iv23liCLESgW74Wn2Ie2"     # GitHub App client id (accepted as JWT issuer); the private key lives in Keycard Vault
 GITHUB_APP_KEY_RESOURCE="urn:factory:github-app-key"
 GITHUB_APP_INSTALLATION="176545264"
-OPENAI_KEY_RESOURCE="urn:factory:openai-key"   # Keycard Vault API Token credential: the Codex judge's key, fetched per judge round
+OPENAI_RESOURCE="https://api.openai.com"       # Keycard Vault API Token credential on the OpenAI API resource: the Codex judge's key, fetched per judge round
 MAX_ROUNDS=3                                   # worker -> judge rounds before the verdict is final
 
 die()   { echo "factory: $*" >&2; exit 1; }
@@ -87,7 +87,7 @@ anthropic_token() {  # Claude credential, two steps, no API key anywhere. Fresh 
     | jq -r '.access_token // empty'
 }
 openai_key() {  # the judge's key: Keycard Vault for real runs, a file for dry runs (same split as the GitHub token)
-  if [ "$gh_src" = file ]; then cat "$FACTORY_SECRETS_DIR/openai_key"; else keycard_token "$OPENAI_KEY_RESOURCE"; fi
+  if [ "$gh_src" = file ]; then cat "$FACTORY_SECRETS_DIR/openai_key"; else keycard_token "$OPENAI_RESOURCE"; fi
 }
 log() {  # log <text>: one factory-side line in log.jsonl
   jq -nc --arg r "$run_id" --arg t "$1" '{run_id:$r, ts:(now|todate), event:{type:"factory", text:$t}}' >> "$logf"
@@ -227,8 +227,8 @@ cmd_run() {
     if [ "$head" = "$prev_head" ]; then log "round $round: no new commits; the round $((round-1)) verdict stands"; break; fi
     prev_head=$head
 
-    oa_key=$(openai_key) || oa_key=; [ -n "$oa_key" ] || die "no Codex key (Keycard $OPENAI_KEY_RESOURCE)"
-    log "round $round: openai_key issued (Keycard $KEYCARD_ZONE resource $OPENAI_KEY_RESOURCE)"
+    oa_key=$(openai_key) || oa_key=; [ -n "$oa_key" ] || die "no Codex key (Keycard $OPENAI_RESOURCE)"
+    log "round $round: openai_key issued (Keycard $KEYCARD_ZONE resource $OPENAI_RESOURCE)"
     jwork=$(mktemp -d "${TMPDIR:-/tmp}/factory-judge.XXXXXX"); jout=$(mktemp -d "${TMPDIR:-/tmp}/factory-judge-out.XXXXXX")
     jprompt="$(cat "$FACTORY_DIR/judge-prompt.md")"$'\n\n'"## Commits"$'\n'"Base: $base_sha"$'\n'"Head: $head"$'\n\n'"## Task given to the agent"$'\n'"$instructions"
     run_container judge "$oa_key" -v "$work":/src:ro -v "$jwork":/work -v "$jout":/out -e HEAD_SHA="$head" -- "$jprompt"
