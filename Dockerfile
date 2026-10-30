@@ -11,7 +11,8 @@
 #     --memory 4g --cpus 2 --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges \
 #     -e MODE=work -e TASK_ID -e BASE_BRANCH -v "$REPO_DIR":/work factory-sandbox@sha256:<digest> "<instructions>"
 
-FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da
+# Node 24 to match the target repos' CI (plan-my-today pins node-version: 24); the judge flagged the mismatch on the first run.
+FROM node:24-bookworm-slim@sha256:c86ecead9e55a5210ac1727de38a4ca840bf03dcaf34dc9749addbf383b1920c
 
 # No gh: the push token can only push (contents:write); the host opens the pull request with a separate token.
 # Codex is the judge; pinned, bump deliberately.
