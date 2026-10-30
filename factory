@@ -1,8 +1,9 @@
 #!/bin/bash
 # factory: orchestrator for the software factory. See factory.md.
 #   factory run <task-file>   validate job, mint run, docker run the sandbox, write manifest + log
-#   factory lint [dir]        check queue/*.json against tasks.md before a sweep
-#   factory sweep [max]       run every queue/*.json in name order; each moves to queue/done/ or queue/failed/
+#   factory lint [dir]        check queue/*.json against tasks.md before a batch
+#   factory batch [dir] [--max-tasks N] [--stop-at HH:MM] [--no-chain] [--continue]
+#                             the overnight queue: each task bases on the previous task's branch; stops on the first failure
 #   factory report [n]        one line per run from the manifests: exit, judge rounds, verdict, PR
 #   factory stop <run_id>     kill the container, block new dispatch, record the incident
 # Compatible with the macOS /bin/bash (3.2). Needs: docker, git, jq.
@@ -12,7 +13,7 @@ command -v docker >/dev/null || PATH="/Applications/Docker.app/Contents/Resource
 
 FACTORY_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUNS="$FACTORY_DIR/runs"
-QUEUE="${FACTORY_QUEUE:-$FACTORY_DIR/queue}"   # task files; lint and sweep read it (override for tests or a second queue)
+QUEUE="${FACTORY_QUEUE:-$FACTORY_DIR/queue}"   # task files; lint and batch read it by default (override for tests or a second queue)
 LOCK="$FACTORY_DIR/.lock"   # one concurrent job; held by `factory run`, removed on exit
 HALT="$FACTORY_DIR/HALT"    # written by `factory stop`; blocks dispatch until a human removes it
 IMAGE="factory-sandbox"
@@ -31,14 +32,14 @@ OPENAI_RESOURCE="https://api.openai.com"       # Keycard Vault API Token credent
 MAX_ROUNDS=3                                   # worker -> judge rounds before the verdict is final
 
 die()   { echo "factory: $*" >&2; exit 1; }
-usage() { echo "usage: factory run <task-file> | factory lint [dir] | factory sweep [max] | factory report [n] | factory stop <run_id>" >&2; exit 2; }
+usage() { echo "usage: factory run <task-file> | factory lint [dir] | factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--no-chain] [--continue] | factory report [n] | factory stop <run_id>" >&2; exit 2; }
 # Job schema: exactly these four keys, all non-empty strings. Everything else is derived by the orchestrator.
 JOB_SCHEMA='type=="object" and (keys|sort)==["base_branch","instructions","repo","task_id"] and all(.[]; type=="string" and length>0)'
 ID_RE='^[A-Za-z0-9._-]+$'; BRANCH_RE='^[A-Za-z0-9._/-]+$'
 now()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # ---------------------------------------------------------------- run
-run_id= work= jwork= jout= logf=
+run_id= work= jwork= jout= logf= borrowed=
 manifest_set() {  # manifest_set <jq-filter> [jq args...]: atomic update of this run's manifest
   f="$1"; shift
   jq "$@" "$f" "$rundir/manifest.json" > "$rundir/manifest.json.tmp.$$" && mv "$rundir/manifest.json.tmp.$$" "$rundir/manifest.json"
@@ -52,7 +53,16 @@ cleanup() {
   if [ -n "${rundir:-}" ] && [ -f "$rundir/manifest.json" ] && [ "$(jq -r .ended_at "$rundir/manifest.json")" = null ]; then
     manifest_set '. + {ended_at:$ended, exit_status:$rc}' --arg ended "$(now)" --argjson rc "$rc"
   fi
-  rm -rf "$LOCK"
+  [ -n "$borrowed" ] || rm -rf "$LOCK"   # a borrowed lock belongs to the batch loop, which resets it when this run returns
+}
+take_lock() {  # one job at a time. mkdir is atomic. The lock names the holder's pid: a lock whose pid is gone is stale
+  # (crash, SIGKILL) and is reclaimed; any factory container still around is then an orphan.
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    lpid=$(cat "$LOCK/pid" 2>/dev/null || echo 0)
+    if [ "$lpid" -gt 0 ] 2>/dev/null && kill -0 "$lpid" 2>/dev/null; then die "another run is in progress: $(cat "$LOCK/run_id" 2>/dev/null) (pid $lpid)"; fi
+    echo "reclaiming stale lock left by run $(cat "$LOCK/run_id" 2>/dev/null)" >&2
+    rm -rf "$LOCK"; mkdir "$LOCK" || die "cannot take lock $LOCK"
+  fi
 }
 b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
 keycard_token() {  # keycard_token <resource>: client-credentials token for this Application; client secret via curl config on stdin, not argv
@@ -166,14 +176,9 @@ cmd_run() {
     factory_commit="$factory_commit-dirty"
   fi
 
-  # One job at a time. mkdir is atomic. The lock names the orchestrator pid: a lock whose pid is gone is stale
-  # (crash, SIGKILL) and is reclaimed; any factory container still around is then an orphan.
-  if ! mkdir "$LOCK" 2>/dev/null; then
-    lpid=$(cat "$LOCK/pid" 2>/dev/null || echo 0)
-    if [ "$lpid" -gt 0 ] 2>/dev/null && kill -0 "$lpid" 2>/dev/null; then die "another run is in progress: $(cat "$LOCK/run_id" 2>/dev/null) (pid $lpid)"; fi
-    echo "reclaiming stale lock left by run $(cat "$LOCK/run_id" 2>/dev/null)" >&2
-    rm -rf "$LOCK"; mkdir "$LOCK" || die "cannot take lock $LOCK"
-  fi
+  # Inside `factory batch` the batch loop holds the lock for the whole queue and this run borrows it: it records its own id and
+  # pid there (so `factory stop` signals the run, not the loop) and cleanup leaves it for the loop instead of removing it.
+  if [ "${FACTORY_BATCH:-}" = "$PPID" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$PPID" ]; then borrowed=1; else take_lock; fi
   trap cleanup EXIT; trap 'exit 130' INT TERM
   run_id="$(date -u +%Y%m%dT%H%M%SZ)-$task_id"; echo "$run_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"
   orphans=$(docker ps -aq --filter label=factory.run); if [ -n "$orphans" ]; then docker rm -f $orphans >/dev/null; fi
@@ -182,9 +187,9 @@ cmd_run() {
   echo "run $run_id"; echo "  evidence: $rundir"
   # Manifest exists from the first moment there is a run, before any credential is issued; later steps fill it in.
   jq -n --arg run_id "$run_id" --arg task_id "$task_id" --arg job "$(shasum -a 256 "$task" | cut -d' ' -f1)" \
-        --arg repo "$repo" --arg base_branch "$base_branch" \
+        --arg repo "$repo" --arg base_branch "$base_branch" --arg cb "${FACTORY_CHAIN_BASE:-}" \
         --arg image "$image_digest" --arg fc "$factory_commit" --arg started "$(now)" --arg kz "$KEYCARD_ZONE" \
-    '{run_id:$run_id, task_id:$task_id, job_sha256:$job, repo:$repo, base_branch:$base_branch, base_sha:null,
+    '{run_id:$run_id, task_id:$task_id, job_sha256:$job, repo:$repo, base_branch:$base_branch, chain_base:(if $cb=="" then null else $cb end), base_sha:null,
       image_digest:$image, factory_commit:(if $fc=="" then null else $fc end), keycard_zone:$kz,
       started_at:$started, ended_at:null, exit_status:null, final_sha:null, pr_url:null}' \
     > "$rundir/manifest.json"
@@ -322,28 +327,60 @@ cmd_lint() {  # factory lint [dir]: the conventions in tasks.md that a sleeping 
   return "$bad"
 }
 
-# ---------------------------------------------------------------- sweep
-cmd_sweep() {  # factory sweep [max]: the overnight loop. Tasks run one at a time in filename order (prefix them 010-, 020-, ...).
-  # Exit 0 moves the file to queue/done/, anything else to queue/failed/; the manifest has the detail. A refuted or failed run still
-  # pushes its branch (evidence), so a dependent task would happily build on it: sweep skips, transitively, every task whose
-  # base_branch is a task that failed in this sweep, moving it to failed/ unrun. A base from an earlier night is trusted to have shipped.
-  max="${1:-50}"; n=0; failed=" "
-  cmd_lint "$QUEUE" || die "fix the queue before sweeping (see tasks.md)"
-  for task in "$QUEUE"/*.json; do
-    [ -e "$task" ] || { echo "queue is empty"; break; }
-    [ -e "$HALT" ] && { echo "halted by $HALT; $(ls "$QUEUE"/*.json 2>/dev/null | wc -l | tr -d ' ') task(s) left in queue"; break; }
-    id=$(jq -r .task_id "$task"); base=$(jq -r .base_branch "$task")
-    case "$failed" in *" ${base#factory/} "*)
-      echo "== $(basename "$task"): skipped, its base $base failed in this sweep"; dest=failed; failed="$failed$id " ;;
-    *)
-      echo "== $(basename "$task") ($(now))"
-      if "$0" run "$task"; then dest=done; else dest=failed; failed="$failed$id "; fi
-      n=$((n+1)) ;;
+# ---------------------------------------------------------------- batch
+cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--no-chain] [--continue]: the overnight loop.
+  # Tasks run in filename order under one lock. Chain mode (default): every task after a successful one bases on
+  # factory/<previous task_id>, so the night ends as a stack of judged PRs to merge bottom-up; the rewritten base_branch lives in a
+  # temp copy of the task file under $TMPDIR, the file on disk is never changed. Any exit but 0 stops the batch: that task goes to
+  # <queue-dir>/failed/, every later one stays in the queue untouched. With --continue the batch goes on instead: a failed run still
+  # pushes its branch (evidence), so every later task whose base names a task that failed tonight is moved to failed/ unrun, and the
+  # chain resumes from the next task's own base_branch. HALT between tasks stops the batch either way. Exit 0 moves a task to
+  # <queue-dir>/done/<run_id>.json (run_id is <timestamp>-<task_id>, and lint makes task_id the filename), so a rerun never repeats it.
+  dir= max= stop_at= deadline= chain=on cont=
+  while [ $# -gt 0 ]; do case "$1" in
+    --max-tasks) max="${2:-}"; shift 2 ;; --stop-at) stop_at="${2:-}"; shift 2 ;; --no-chain) chain=; shift ;; --continue) cont=1; shift ;;
+    -*) usage ;; *) [ -z "$dir" ] || usage; dir="$1"; shift ;; esac; done
+  dir="${dir:-$QUEUE}"; [ -d "$dir" ] || die "no such queue: $dir"
+  [ -z "$max" ] || [[ "$max" =~ ^[0-9]+$ ]] || die "--max-tasks needs a number"
+  [ -z "$stop_at" ] || deadline=$(date -j -f %H:%M "$stop_at" +%s 2>/dev/null) || die "--stop-at needs HH:MM (local time, today)"   # today at HH:MM, as an epoch
+  [ -e "$HALT" ] && die "dispatch blocked by $HALT ($(cat "$HALT")); remove it to resume"
+  cmd_lint "$dir" || die "fix the queue before batching (see tasks.md)"
+  [ -z "$chain" ] || [ "$(jq -r .repo "$dir"/*.json 2>/dev/null | sort -u | wc -l)" -le 1 ] || die "a chained queue targets one repo; use --no-chain"
+  batch_id="batch-$(date -u +%Y%m%dT%H%M%SZ)"; report="$RUNS/$batch_id.md"
+  take_lock; echo "$batch_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"
+  tmpjob=; trap 'rm -rf "$LOCK" ${tmpjob:+"$tmpjob"}' EXIT; trap 'exit 130' INT TERM
+  rows= prev= why= failed=" " n=0 fail=0
+  for task in "$dir"/*.json; do
+    [ -e "$task" ] || { why="queue is empty"; break; }
+    [ -e "$HALT" ] && { why="halted by $HALT ($(cat "$HALT"))"; break; }
+    [ -z "$max" ] || [ "$n" -lt "$max" ] || { why="--max-tasks $max reached"; break; }
+    [ -z "$deadline" ] || [ "$(date +%s)" -lt "$deadline" ] || { why="--stop-at $stop_at passed"; break; }
+    name=$(basename "$task" .json); id=$(jq -r .task_id "$task"); base=$(jq -r .base_branch "$task"); cb=; job="$task"
+    [ -z "$chain" ] || [ -z "$prev" ] || { cb="factory/$prev"; base="$cb"; }
+    case "$failed" in *" ${base#factory/} "*)   # --continue: its base failed tonight (branch pushed as evidence); do not build on it
+      echo "== $name: skipped, its base $base failed in this batch"; rows="$rows| - | skipped | - | - | - | $base | - |"$'\n'
+      failed="$failed$id "; mkdir -p "$dir/failed"; mv "$task" "$dir/failed/$batch_id-$name.json"; continue ;;
     esac
-    mkdir -p "$QUEUE/$dest"; mv "$task" "$QUEUE/$dest/"
-    [ "$n" -lt "$max" ] || { echo "stopping after $max task(s); $(ls "$QUEUE"/*.json 2>/dev/null | wc -l | tr -d ' ') left in queue"; break; }
+    if [ -n "$cb" ]; then tmpjob=$(mktemp "${TMPDIR:-/tmp}/factory-task.XXXXXX"); job="$tmpjob"; jq --arg b "$cb" '.base_branch=$b' "$task" > "$job"; fi
+    echo "== $name ($(now))${cb:+, base $cb}"
+    t0=$(date +%s); rc=0; FACTORY_BATCH=$$ FACTORY_CHAIN_BASE="$cb" "$0" run "$job" || rc=$?
+    [ -z "$tmpjob" ] || rm -f "$tmpjob"; tmpjob=
+    # The run left its id in the borrowed lock; take the lock back at once, so a later `factory stop <that run>` signals nothing
+    # and a run that dies before it takes the lock (docker down) cannot be mistaken for the previous one.
+    run_id=$(cat "$LOCK/run_id"); echo "$batch_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"; m="$RUNS/$run_id/manifest.json"
+    if [ "$run_id" != "$batch_id" ] && [ -f "$m" ]; then
+      cells=$(jq -r '[(.exit_status // "running" | tostring), (.judge.rounds // "-" | tostring), (.judge.verdict // "-"), (.pr_url // "-")] | join(" | ")' "$m")
+    else run_id="$batch_id-$name"; cells="$rc | - | - | -"; fi   # died before it was a run (bad task file, docker down)
+    rows="$rows| $run_id | $cells | ${cb:--} | $(( $(date +%s) - t0 ))s |"$'\n'; n=$((n+1))
+    if [ "$rc" -eq 0 ]; then dest=done; prev=$id; else dest=failed; prev=; failed="$failed$id "; fail=$rc; fi
+    mkdir -p "$dir/$dest"; mv "$task" "$dir/$dest/$run_id.json"
+    [ "$rc" -eq 0 ] || [ -n "$cont" ] || { why="$name exited $rc"; break; }   # 3 no changes, 4 PR failed, 5 REFUTED, 6 no verdict; the row has the verdict
   done
-  echo; cmd_report "$n"
+  { echo "# $batch_id"; echo; echo "queue: $dir, chain: ${chain:-off}, tasks run: $n"; echo
+    echo "| RUN | EXIT | ROUNDS | VERDICT | PR | CHAIN BASE | DURATION |"; echo "|---|---|---|---|---|---|---|"; printf '%s' "$rows"
+    echo; if [ -n "$why" ]; then echo "Stopped: $why. $(ls "$dir"/*.json 2>/dev/null | wc -l | tr -d ' ') task(s) left in queue."; else echo "All tasks ran."; fi; } > "$report"
+  cat "$report"; echo "report: $report"
+  exit "$fail"   # the last failing run's status, 0 when every run passed
 }
 
 # ---------------------------------------------------------------- report
@@ -389,7 +426,7 @@ EOF
 case "${1:-}" in
   run)    shift; cmd_run "$@" ;;
   lint)   shift; cmd_lint "$@" ;;
-  sweep)  shift; cmd_sweep "$@" ;;
+  batch)  shift; cmd_batch "$@" ;;
   report) shift; cmd_report "$@" ;;
   stop)   shift; cmd_stop "$@" ;;
   *)    usage ;;

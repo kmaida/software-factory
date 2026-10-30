@@ -1,11 +1,11 @@
 # Writing tasks
 
-A task is one JSON file in `queue/`: `{repo, base_branch, task_id, instructions}`. The orchestrator checks the schema; `factory lint` checks the conventions below; `factory sweep` runs the queue in filename order. Nobody is awake while it runs, so a task has to stand on its own: the agent never gets to ask, and the judge has to be able to tell whether it is done.
+A task is one JSON file in `queue/`: `{repo, base_branch, task_id, instructions}`. The orchestrator checks the schema; `factory lint` checks the conventions below; `factory batch` runs the queue in filename order. Nobody is awake while it runs, so a task has to stand on its own: the agent never gets to ask, and the judge has to be able to tell whether it is done.
 
 ## Files and ids
 
 - Filename is `<task_id>.json`, and `task_id` starts with a number so the night runs in order: `010-scaffold`, `020-schema`, `030-auth-api`.
-- `base_branch` is `main` for work that stands alone, or `factory/<earlier task_id>` for work that builds on an earlier task. GitHub stacks the pull requests and retargets each one to `main` as you merge in order. A refuted or failed task still pushes its branch as evidence, so `sweep` skips every task that depends on it, directly or through another skipped task, and moves them to `queue/failed/` unrun. A base that is not in tonight's queue is trusted to exist on the repo already.
+- `base_branch` is `main` for work that stands alone, or `factory/<earlier task_id>` for work that builds on an earlier task. GitHub stacks the pull requests and retargets each one to `main` as you merge in order. `factory batch` rewrites it to the previous task's branch anyway (chain mode), so write it for `--no-chain` and for reading. A refuted or failed task still pushes its branch as evidence; `batch` stops there, or with `--continue` skips every task that depends on it, directly or through another skipped task, and moves them to `queue/failed/` unrun. A base that is not in tonight's queue is trusted to exist on the repo already.
 - Independent tasks should all use `main`, so one refutation does not block them.
 
 ## Instructions
@@ -31,6 +31,7 @@ Out of scope: <what a helpful agent would be tempted to add>. Do not touch <path
 - Nothing that needs a decision. No "choose a library", no "pick a schema". Decide in the plan and state it under Context.
 - Nothing that needs a secret, an account, or a network service the repo's tests do not already have.
 - Nothing that can only be done against an unmerged branch other than its own `base_branch`.
+- Under "Out of scope" or "Done when", tell the worker: if the task cannot be completed, commit `docs/BLOCKED-<task_id>.md` with the reason. A branch with that file is refuted with the reason in the findings, so a `factory batch` chain stops with evidence instead of a silent exit 3.
 - The first task in a new repository is scaffold, test runner and CI. Nothing stacks on it the same night until you have merged it once and seen the judge run its checks.
 
 ## Against over-engineering
@@ -41,7 +42,7 @@ Every worker round starts with `worker-prompt.md`: least code that satisfies "Do
 
 ```sh
 ./factory lint          # schema, <number>-<name> ids, filename = task_id, the five headings in order, base_branch order
-./factory sweep         # runs lint first and refuses to start on any problem
+./factory batch         # runs lint first and refuses to start on any problem
 ```
 
 In the morning, `./factory report` and the stacked pull requests, oldest first. A task in `queue/failed/` has its reason in `runs/<run_id>/manifest.json` and, if the judge got that far, `judge-<round>.md`.
