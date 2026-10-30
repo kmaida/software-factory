@@ -31,6 +31,7 @@ Out of scope: <what a helpful agent would be tempted to add>. Do not touch <path
 - Nothing that needs a decision. No "choose a library", no "pick a schema". Decide in the plan and state it under Context.
 - Nothing that needs a secret, an account, or a network service the repo's tests do not already have.
 - Nothing that can only be done against an unmerged branch other than its own `base_branch`.
+- Under "Out of scope" or "Done when", tell the worker: if the task cannot be completed, commit `docs/BLOCKED-<task_id>.md` with the reason. A branch with that file is refuted with the reason in the findings, so a `factory batch` chain stops with evidence instead of a silent exit 3.
 - The first task in a new repository is scaffold, test runner and CI. Nothing stacks on it the same night until you have merged it once and seen the judge run its checks.
 
 ## Against over-engineering
