@@ -5,7 +5,7 @@ A task is one JSON file in `queue/`: `{repo, base_branch, task_id, instructions}
 ## Files and ids
 
 - Filename is `<task_id>.json`, and `task_id` starts with a number so the night runs in order: `010-scaffold`, `020-schema`, `030-auth-api`.
-- `base_branch` is `main` for work that stands alone, or `factory/<earlier task_id>` for work that builds on an earlier task. GitHub stacks the pull requests and retargets each one to `main` as you merge in order. If the earlier task fails or is refuted, its branch never appears and the dependent task fails at the clone, so a chain stops at the first broken link.
+- `base_branch` is `main` for work that stands alone, or `factory/<earlier task_id>` for work that builds on an earlier task. GitHub stacks the pull requests and retargets each one to `main` as you merge in order. A refuted or failed task still pushes its branch as evidence, so `sweep` skips every task that depends on it, directly or through another skipped task, and moves them to `queue/failed/` unrun. A base that is not in tonight's queue is trusted to exist on the repo already.
 - Independent tasks should all use `main`, so one refutation does not block them.
 
 ## Instructions
@@ -40,8 +40,8 @@ Every worker round starts with `worker-prompt.md`: least code that satisfies "Do
 ## Before bed
 
 ```sh
-./factory lint          # schema, filename = task_id, base_branch order, "Done when" present
-./factory sweep         # refuses to start if lint fails
+./factory lint          # schema, <number>-<name> ids, filename = task_id, the five headings in order, base_branch order
+./factory sweep         # runs lint first and refuses to start on any problem
 ```
 
 In the morning, `./factory report` and the stacked pull requests, oldest first. A task in `queue/failed/` has its reason in `runs/<run_id>/manifest.json` and, if the judge got that far, `judge-<round>.md`.

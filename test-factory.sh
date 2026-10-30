@@ -62,27 +62,33 @@ grep -q 'REDACTED' "$m/log.jsonl" || { echo "FAIL: secret not redacted"; exit 1;
 ! grep -q 'stub-token\|dummy-openai_key\|dummy-github_token' "$m/log.jsonl" || { echo "FAIL: secret leaked into log"; exit 1; }
 rc=$(STUB_WORK_FAIL_ROUND=2 run t5 "REFUTED,VERIFIED"); m=$(ls -d "$runs"/*-t5 | tail -1)
 check "$rc" 7 "t5 exit is the failed worker's"; check "$(jq -r .final_sha "$m/manifest.json" | wc -c | tr -d ' ')" 41 "t5 branch still recorded (pushed)"; check "$(jq -r .pr_url "$m/manifest.json")" null "t5 no PR"
-# lint: a good stacked pair passes; a bad trio fails with one line per file (id != filename, no "Done when", base is a later task).
+# lint: a good stacked pair passes; a bad trio fails with one line per broken file (id != filename and base is a later task; missing headings).
+body='Goal: g.\nContext: c.\nScope: s.\nDone when: tests pass.\nOut of scope: o.'
+task() { printf '{"repo":"%s","base_branch":"%s","task_id":"%s","instructions":"%s"}\n' "$1" "$2" "$3" "$4" > "$5/$3.json"; }
 mkdir -p "$t/lint-ok" "$t/lint-bad"
-echo '{"repo":"o/r","base_branch":"main","task_id":"010-a","instructions":"Goal: x. Done when: tests pass."}' > "$t/lint-ok/010-a.json"
-echo '{"repo":"o/r","base_branch":"factory/010-a","task_id":"020-b","instructions":"Done when: y."}' > "$t/lint-ok/020-b.json"
-echo '{"repo":"o/r","base_branch":"factory/030-c","task_id":"010-x","instructions":"Done when: z."}' > "$t/lint-bad/010-a.json"
-echo '{"repo":"o/r","base_branch":"main","task_id":"020-b","instructions":"no acceptance line"}' > "$t/lint-bad/020-b.json"
-echo '{"repo":"o/r","base_branch":"main","task_id":"030-c","instructions":"Done when: ok."}' > "$t/lint-bad/030-c.json"
+task o/r main 010-a "$body" "$t/lint-ok"; task o/r factory/010-a 020-b "$body" "$t/lint-ok"
+printf '{"repo":"o/r","base_branch":"factory/030-c","task_id":"010-x","instructions":"%s"}\n' "$body" > "$t/lint-bad/010-a.json"
+task o/r main 020-b 'Goal: g.\nDone when: y.' "$t/lint-bad"; task o/r main 030-c "$body" "$t/lint-bad"
 check "$("$here/factory" lint "$t/lint-ok")" "lint ok: 2 task(s)" "lint ok"
 set +e; out=$("$here/factory" lint "$t/lint-bad"); rc=$?; set -e
 check "$rc" 1 "lint bad exit"; check "$(printf '%s\n' "$out" | grep -c '^0[12]0-[ab]:')" 2 "lint bad reports the two broken files"
 printf '%s\n' "$out" | grep -q "010-a: task_id '010-x' is not the filename; base_branch factory/030-c is a later task in the queue" || { echo "FAIL: lint messages: $out"; exit 1; }
-# sweep: two queued tasks in name order; the first verifies (-> done/), the second is refuted three times (-> failed/).
-q="$here/queue"; rm -rf "$q"/done "$q"/failed
-for id in 010-sw-a 020-sw-b; do echo "{\"repo\":\"$t/remote.git\",\"base_branch\":\"main\",\"task_id\":\"$id\",\"instructions\":\"Done when: done.\"}" > "$q/$id.json"; done
+printf '%s\n' "$out" | grep -q "020-b: instructions need the headings" || { echo "FAIL: lint headings message: $out"; exit 1; }
+# sweep on its own queue: 010 verifies (-> done/), 020 is refuted three times (-> failed/), 030 depends on 020 and is skipped unrun (-> failed/).
+q="$t/queue"; mkdir -p "$q"
+task "$t/remote.git" main 010-sw-a "$body" "$q"; task "$t/remote.git" main 020-sw-b "$body" "$q"; task "$t/remote.git" factory/020-sw-b 030-sw-c "$body" "$q"
 rm -f "$t/state"; set +e
-PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_VERDICTS="VERIFIED,REFUTED,REFUTED,REFUTED" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 \
-  FACTORY_LINT_SKIP=1 "$here/factory" sweep 2 > "$t/sweep.out" 2>&1; rc=$?; set -e   # max 2: never touch real task files that may sit in queue/
+PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_VERDICTS="VERIFIED,REFUTED,REFUTED,REFUTED" FACTORY_QUEUE="$q" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 \
+  "$here/factory" sweep > "$t/sweep.out" 2>&1; rc=$?; set -e
 m=$(ls -d "$runs"/*-020-sw-b | tail -1)
-check "$rc" 0 "sweep exit"; check "$(ls "$q"/done)" "010-sw-a.json" "sweep done/"; check "$(ls "$q"/failed)" "020-sw-b.json" "sweep failed/"
-check "$(grep -c 'sw-[ab] ' "$t/sweep.out")" 2 "sweep report lists both runs"; grep -q 'stopping after 2' "$t/sweep.out" || { echo "FAIL: sweep max"; exit 1; }
-rm -rf "$q"/done "$q"/failed "$runs"/*-0[12]0-sw-[ab]
+check "$rc" 0 "sweep exit"; check "$(ls "$q"/done)" "010-sw-a.json" "sweep done/"; check "$(ls "$q"/failed | tr '\n' ' ')" "020-sw-b.json 030-sw-c.json " "sweep failed/"
+check "$(ls -d "$runs"/*-030-sw-c 2>/dev/null | wc -l | tr -d ' ')" 0 "sweep never ran the dependent of a failed task"
+grep -q '030-sw-c.json: skipped, its base factory/020-sw-b failed in this sweep' "$t/sweep.out" || { echo "FAIL: sweep skip message"; cat "$t/sweep.out"; exit 1; }
+check "$(grep -cE '^[0-9]{8}T[0-9]{6}Z-0[12]0-sw-[ab] ' "$t/sweep.out")" 2 "sweep report lists the two runs"
+# sweep refuses a queue that fails lint, without running anything
+set +e; FACTORY_QUEUE="$t/lint-bad" "$here/factory" sweep > "$t/sweep2.out" 2>&1; rc=$?; set -e
+check "$rc" 1 "sweep refuses bad queue"; grep -q 'fix the queue before sweeping' "$t/sweep2.out" || { echo "FAIL: sweep refusal message"; exit 1; }
+rm -rf "$runs"/*-0[12]0-sw-[ab]
 rc=$(STUB_WORK_IDLE_ROUND=2 run t6 "CAVEATS"); m=$(ls -d "$runs"/*-t6 | tail -1)
 check "$rc" 0 "t6 exit (caveats, idle revision ships)"; check "$(jq -r .judge.rounds "$m/manifest.json")" 1 "t6 rounds counts judged rounds only"
 rm -rf "$runs"/*-t[1-8]

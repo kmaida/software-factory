@@ -12,6 +12,7 @@ command -v docker >/dev/null || PATH="/Applications/Docker.app/Contents/Resource
 
 FACTORY_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUNS="$FACTORY_DIR/runs"
+QUEUE="${FACTORY_QUEUE:-$FACTORY_DIR/queue}"   # task files; lint and sweep read it (override for tests or a second queue)
 LOCK="$FACTORY_DIR/.lock"   # one concurrent job; held by `factory run`, removed on exit
 HALT="$FACTORY_DIR/HALT"    # written by `factory stop`; blocks dispatch until a human removes it
 IMAGE="factory-sandbox"
@@ -33,6 +34,7 @@ die()   { echo "factory: $*" >&2; exit 1; }
 usage() { echo "usage: factory run <task-file> | factory lint [dir] | factory sweep [max] | factory report [n] | factory stop <run_id>" >&2; exit 2; }
 # Job schema: exactly these four keys, all non-empty strings. Everything else is derived by the orchestrator.
 JOB_SCHEMA='type=="object" and (keys|sort)==["base_branch","instructions","repo","task_id"] and all(.[]; type=="string" and length>0)'
+ID_RE='^[A-Za-z0-9._-]+$'; BRANCH_RE='^[A-Za-z0-9._/-]+$'
 now()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # ---------------------------------------------------------------- run
@@ -139,8 +141,8 @@ cmd_run() {
   jq -e "$JOB_SCHEMA" "$task" >/dev/null 2>&1 || die "invalid task file: need exactly {repo, base_branch, task_id, instructions}, all non-empty strings"
   repo=$(jq -r .repo "$task"); base_branch=$(jq -r .base_branch "$task")
   task_id=$(jq -r .task_id "$task"); instructions=$(jq -r .instructions "$task")
-  [[ "$task_id" =~ ^[A-Za-z0-9._-]+$ ]] || die "task_id must match [A-Za-z0-9._-]+"
-  [[ "$base_branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die "base_branch has unexpected characters"
+  [[ "$task_id" =~ $ID_RE ]] || die "task_id must match $ID_RE"
+  [[ "$base_branch" =~ $BRANCH_RE ]] || die "base_branch has unexpected characters"
   case "$repo" in
     https://github.com/*) repo="${repo#https://github.com/}"; repo="${repo%/}"; repo="${repo%.git}" ;;   # normalise to owner/name
     https://*|/*) repo_url="$repo" ;;                                   # other URL or local path (dry runs)
@@ -292,7 +294,7 @@ cmd_run() {
 
 # ---------------------------------------------------------------- lint
 cmd_lint() {  # factory lint [dir]: the conventions in tasks.md that a sleeping operator cannot enforce. Exit 1 on any problem.
-  dir="${1:-$FACTORY_DIR/queue}"; bad=0; seen=
+  dir="${1:-$QUEUE}"; bad=0; n=0; seen=" "
   for f in "$dir"/*.json; do
     [ -e "$f" ] || { echo "no task files in $dir"; return 0; }
     name=$(basename "$f" .json); p=
@@ -300,35 +302,46 @@ cmd_lint() {  # factory lint [dir]: the conventions in tasks.md that a sleeping 
     else
       id=$(jq -r .task_id "$f"); base=$(jq -r .base_branch "$f")
       [ "$id" = "$name" ] || p="$p; task_id '$id' is not the filename"
-      jq -e '.instructions | test("Done when")' "$f" >/dev/null || p="$p; instructions have no \"Done when\""
+      [[ "$id" =~ $ID_RE && "$id" =~ ^[0-9]+- ]] || p="$p; task_id must be <number>-<name> matching $ID_RE"
+      [[ "$base" =~ $BRANCH_RE ]] || p="$p; base_branch has unexpected characters"
+      # The five headings of tasks.md, each at the start of a line, in order, and something after "Done when:".
+      jq -e '.instructions | test("(^|\n)Goal:[\\s\\S]*\nContext:[\\s\\S]*\nScope:[\\s\\S]*\nDone when:[ \t]*\\S[\\s\\S]*\nOut of scope:")' "$f" >/dev/null \
+        || p="$p; instructions need the headings Goal, Context, Scope, Done when, Out of scope, in that order, each on its own line"
       case "$base" in
         factory/*) dep=${base#factory/}
                    case " $seen " in *" $dep "*) ;;   # an earlier task in this queue
                      *) if [ -e "$dir/$dep.json" ]; then p="$p; base_branch $base is a later task in the queue"; else echo "$name: base_branch $base is not in the queue; it must already exist on the repo"; fi ;;
                    esac ;;
       esac
-      seen="$seen $id"
+      seen="$seen$id "
     fi
+    n=$((n+1))
     [ -z "$p" ] || { echo "$name:${p#;}"; bad=1; }
   done
-  [ "$bad" -eq 0 ] && echo "lint ok: $(echo $seen | wc -w | tr -d ' ') task(s)"
+  [ "$bad" -eq 0 ] && echo "lint ok: $n task(s)"
   return "$bad"
 }
 
 # ---------------------------------------------------------------- sweep
 cmd_sweep() {  # factory sweep [max]: the overnight loop. Tasks run one at a time in filename order (prefix them 010-, 020-, ...).
-  # Exit 0 moves the file to queue/done/, anything else to queue/failed/; the manifest has the detail. A task whose base branch is a
-  # factory/<task> branch that was refuted or failed will itself fail at the clone ("base branch not found"), so a chain stops cleanly.
-  max="${1:-50}"; n=0
-  [ "${FACTORY_LINT_SKIP:-}" = 1 ] || cmd_lint "$FACTORY_DIR/queue" || die "fix the queue before sweeping (see tasks.md), or FACTORY_LINT_SKIP=1 to run anyway"
-  for task in "$FACTORY_DIR"/queue/*.json; do
+  # Exit 0 moves the file to queue/done/, anything else to queue/failed/; the manifest has the detail. A refuted or failed run still
+  # pushes its branch (evidence), so a dependent task would happily build on it: sweep skips, transitively, every task whose
+  # base_branch is a task that failed in this sweep, moving it to failed/ unrun. A base from an earlier night is trusted to have shipped.
+  max="${1:-50}"; n=0; failed=" "
+  cmd_lint "$QUEUE" || die "fix the queue before sweeping (see tasks.md)"
+  for task in "$QUEUE"/*.json; do
     [ -e "$task" ] || { echo "queue is empty"; break; }
-    [ -e "$HALT" ] && { echo "halted by $HALT; $(ls "$FACTORY_DIR"/queue/*.json 2>/dev/null | wc -l | tr -d ' ') task(s) left in queue"; break; }
-    echo "== $(basename "$task") ($(now))"
-    if "$0" run "$task"; then dest=done; else dest=failed; fi
-    mkdir -p "$FACTORY_DIR/queue/$dest"; mv "$task" "$FACTORY_DIR/queue/$dest/"
-    n=$((n+1))
-    [ "$n" -lt "$max" ] || { echo "stopping after $max task(s); $(ls "$FACTORY_DIR"/queue/*.json 2>/dev/null | wc -l | tr -d ' ') left in queue"; break; }
+    [ -e "$HALT" ] && { echo "halted by $HALT; $(ls "$QUEUE"/*.json 2>/dev/null | wc -l | tr -d ' ') task(s) left in queue"; break; }
+    id=$(jq -r .task_id "$task"); base=$(jq -r .base_branch "$task")
+    case "$failed" in *" ${base#factory/} "*)
+      echo "== $(basename "$task"): skipped, its base $base failed in this sweep"; dest=failed; failed="$failed$id " ;;
+    *)
+      echo "== $(basename "$task") ($(now))"
+      if "$0" run "$task"; then dest=done; else dest=failed; failed="$failed$id "; fi
+      n=$((n+1)) ;;
+    esac
+    mkdir -p "$QUEUE/$dest"; mv "$task" "$QUEUE/$dest/"
+    [ "$n" -lt "$max" ] || { echo "stopping after $max task(s); $(ls "$QUEUE"/*.json 2>/dev/null | wc -l | tr -d ' ') left in queue"; break; }
   done
   echo; cmd_report "$n"
 }

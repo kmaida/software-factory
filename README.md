@@ -34,7 +34,7 @@ A personal software factory on an isolated Mac mini. A task file names a repo, a
 ```sh
 docker build -t factory-sandbox .
 FACTORY_SECRETS_DIR=~/factory-secrets ./factory run queue/<task>.json
-./factory lint                                                # the queue against tasks.md; sweep runs this first and refuses on problems
+./factory lint                                                # the queue against tasks.md; sweep runs this first and refuses on problems (FACTORY_QUEUE=<dir> for another queue)
 FACTORY_SECRETS_DIR=~/factory-secrets ./factory sweep        # every queued task, one at a time, then a report
 ./factory report                                              # last 20 runs: exit, judge rounds, verdict, PR
 ./factory stop <run_id>
@@ -42,7 +42,7 @@ FACTORY_SECRETS_DIR=~/factory-secrets ./factory sweep        # every queued task
 
 ## Overnight
 
-Write the night's tasks as numbered files (`010-…json`, `020-…json`) so they run in order. A task that builds on an earlier one names that task's branch as its `base_branch` (`factory/010-…`); GitHub stacks the PRs and you merge them in order in the morning. If the earlier task fails or is refuted, its branch never appears and the dependent task fails at the clone, so the chain stops there. For a new project make the first task the test harness and CI, so the judge has checks to run. Start the sweep under `nohup` or in tmux, keep the mini awake, and read `factory report` with coffee. The factory never merges: one approval per PR is the gate.
+Write the night's tasks as numbered files (`010-…json`, `020-…json`) so they run in order. A task that builds on an earlier one names that task's branch as its `base_branch` (`factory/010-…`); GitHub stacks the PRs and you merge them in order in the morning. If the earlier task fails or is refuted, its branch is still pushed as evidence, so the sweep skips everything that depends on it and moves those tasks to `queue/failed/` unrun. For a new project make the first task the test harness and CI, so the judge has checks to run. Start the sweep under `nohup` or in tmux, keep the mini awake, and read `factory report` with coffee. The factory never merges: one approval per PR is the gate.
 
 `factory stop` kills the run's container, writes a `HALT` file that blocks further runs until a human removes it, and records the incident in the run log (and in the manifest when no live orchestrator will finalize it).
 
