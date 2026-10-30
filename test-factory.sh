@@ -111,14 +111,14 @@ m=$(ls -d "$runs"/*-020-ch-b | tail -1); check "$(jq -r '"\(.base_branch) \(.cha
 m=$(ls -d "$runs"/*-030-ch-c | tail -1); check "$(jq -r .chain_base "$m/manifest.json")" "factory/020-ch-b" "chain 030 rebased"
 check "$(jq -r .base_branch "$t/ch/done/"*-020-ch-b.json)" main "chain 020 file on disk unchanged"
 rep=$(ls "$runs"/batch-*.md | tail -1); check "$(grep -c '^| [0-9]' "$rep")" 3 "batch report rows"; grep -q 'factory/020-ch-b | ' "$rep" || { echo "FAIL: report chain base"; cat "$rep"; exit 1; }
-grep -q '^All tasks ran\.' "$rep" || { echo "FAIL: report end"; cat "$rep"; exit 1; }; grep -q "^report: $rep" "$t/batch.out" || { echo "FAIL: report path not printed"; exit 1; }
+grep -q '^All tasks ran\.' "$rep" && grep -q 'chain: on,' "$rep" || { echo "FAIL: report end"; cat "$rep"; exit 1; }; grep -q "^report: $rep" "$t/batch.out" || { echo "FAIL: report path not printed"; exit 1; }
 [ -d "$here/.lock" ] && { echo "FAIL: batch left the lock"; exit 1; }
 # chain where task two is REFUTED: 020 -> failed/, 030 never runs and stays in the queue, exit is the failing run's.
 queue rf 010-rf-a 020-rf-b 030-rf-c
 rc=$(batch "$t/rf" "VERIFIED,REFUTED,REFUTED,REFUTED")
 check "$rc" 5 "refuted chain exit"; check "$(moved rf/done)" "010-rf-a.json " "refuted chain done/"; check "$(moved rf/failed)" "020-rf-b.json " "refuted chain failed/"
 check "$(moved rf)" "030-rf-c.json done failed " "refuted chain leaves 030 queued"; check "$(ls -d "$runs"/*-030-rf-c 2>/dev/null | wc -l | tr -d ' ')" 0 "refuted chain never ran 030"
-grep -q '^Stopped: 020-rf-b: REFUTED\. 1 task(s) left in queue\.' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: refuted report"; cat "$t/batch.out"; exit 1; }
+grep -q '^Stopped: 020-rf-b exited 5\. 1 task(s) left in queue\.' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: refuted report"; cat "$t/batch.out"; exit 1; }
 # --max-tasks 1, --stop-at in the past (nothing runs, nothing moves), HALT written during 010's push (020 stays), --no-chain.
 queue mx 010-mx-a 020-mx-b; rc=$(batch "$t/mx" "VERIFIED" --max-tasks 1)
 check "$rc" 0 "max-tasks exit"; check "$(moved mx/done)" "010-mx-a.json " "max-tasks done/"; check "$(moved mx)" "020-mx-b.json done " "max-tasks leaves 020"
@@ -129,7 +129,7 @@ check "$rc" 0 "halt exit"; check "$(moved ha/done)" "010-ha-a.json " "halt done/
 grep -q 'Stopped: halted by' "$t/batch.out" || { echo "FAIL: halt message"; cat "$t/batch.out"; exit 1; }; rm -f "$here/HALT"
 queue nc 010-nc-a 020-nc-b; rc=$(batch "$t/nc" "VERIFIED,VERIFIED" --no-chain)
 check "$rc" 0 "no-chain exit"; m=$(ls -d "$runs"/*-020-nc-b | tail -1); check "$(jq -r '"\(.base_branch) \(.chain_base)"' "$m/manifest.json")" "main null" "no-chain 020 on its own base"
-rm -rf "$runs"/*-0[123]0-[a-z][a-z]-[a-c] "$runs"/batch-*.md
+find "$runs" -maxdepth 1 -newer "$t/secrets" \( -name 'batch-*.md' -o -name '*-0[0-9]0-[a-z][a-z]-[a-c]' \) -exec rm -rf {} +   # only what this test made
 rc=$(STUB_WORK_IDLE_ROUND=2 run t6 "CAVEATS"); m=$(ls -d "$runs"/*-t6 | tail -1)
 check "$rc" 0 "t6 exit (caveats, idle revision ships)"; check "$(jq -r .judge.rounds "$m/manifest.json")" 1 "t6 rounds counts judged rounds only"
 rm -rf "$runs"/*-t[1-8]

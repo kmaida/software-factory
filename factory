@@ -54,7 +54,7 @@ cleanup() {
   if [ -n "${rundir:-}" ] && [ -f "$rundir/manifest.json" ] && [ "$(jq -r .ended_at "$rundir/manifest.json")" = null ]; then
     manifest_set '. + {ended_at:$ended, exit_status:$rc}' --arg ended "$(now)" --argjson rc "$rc"
   fi
-  if [ -n "$borrowed" ]; then echo $PPID > "$LOCK/pid"; else rm -rf "$LOCK"; fi   # a borrowed lock goes back to the batch loop
+  [ -n "$borrowed" ] || rm -rf "$LOCK"   # a borrowed lock belongs to the batch loop, which resets it when this run returns
 }
 take_lock() {  # one job at a time. mkdir is atomic. The lock names the holder's pid: a lock whose pid is gone is stale
   # (crash, SIGKILL) and is reclaimed; any factory container still around is then an orphan.
@@ -178,7 +178,7 @@ cmd_run() {
   fi
 
   # Inside `factory batch` the batch loop holds the lock for the whole queue and this run borrows it: it records its own id and
-  # pid there (so `factory stop` signals the run, not the loop) and cleanup hands the lock back instead of removing it.
+  # pid there (so `factory stop` signals the run, not the loop) and cleanup leaves it for the loop instead of removing it.
   if [ "${FACTORY_BATCH:-}" = "$PPID" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$PPID" ]; then borrowed=1; else take_lock; fi
   trap cleanup EXIT; trap 'exit 130' INT TERM
   run_id="$(date -u +%Y%m%dT%H%M%SZ)-$task_id"; echo "$run_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"
@@ -359,15 +359,16 @@ cmd_batch() {  # factory batch <queue-dir> [--max-tasks N] [--stop-at HH:MM] [--
   # temp copy of the task file under $TMPDIR, the file on disk is never changed. Any exit but 0 stops the batch: that task goes to
   # <queue-dir>/failed/, every later one stays in the queue untouched. HALT between tasks stops it the same way. Exit 0 moves a task
   # to <queue-dir>/done/<run_id>.json (run_id is <timestamp>-<task_id>, and lint makes task_id the filename), so a rerun never repeats it.
-  dir= max= stop_at= chain=1
+  dir= max= stop_at= deadline= chain=on
   while [ $# -gt 0 ]; do case "$1" in
     --max-tasks) max="${2:-}"; shift 2 ;; --stop-at) stop_at="${2:-}"; shift 2 ;; --no-chain) chain=; shift ;;
     -*) usage ;; *) [ -z "$dir" ] || usage; dir="$1"; shift ;; esac; done
   [ -n "$dir" ] && [ -d "$dir" ] || usage
   [ -z "$max" ] || [[ "$max" =~ ^[0-9]+$ ]] || die "--max-tasks needs a number"
-  [ -z "$stop_at" ] || [[ "$stop_at" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || die "--stop-at needs HH:MM (local time, today)"
+  [ -z "$stop_at" ] || deadline=$(date -j -f %H:%M "$stop_at" +%s 2>/dev/null) || die "--stop-at needs HH:MM (local time, today)"   # today at HH:MM, as an epoch
   [ -e "$HALT" ] && die "dispatch blocked by $HALT ($(cat "$HALT")); remove it to resume"
   cmd_lint "$dir" || die "fix the queue before batching (see tasks.md)"
+  [ -z "$chain" ] || [ "$(jq -r .repo "$dir"/*.json 2>/dev/null | sort -u | wc -l)" -le 1 ] || die "a chained queue targets one repo; use --no-chain"
   batch_id="batch-$(date -u +%Y%m%dT%H%M%SZ)"; report="$RUNS/$batch_id.md"
   take_lock; echo "$batch_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"
   tmpjob=; trap 'rm -rf "$LOCK" ${tmpjob:+"$tmpjob"}' EXIT; trap 'exit 130' INT TERM
@@ -376,26 +377,27 @@ cmd_batch() {  # factory batch <queue-dir> [--max-tasks N] [--stop-at HH:MM] [--
     [ -e "$task" ] || { why="queue is empty"; break; }
     [ -e "$HALT" ] && { why="halted by $HALT ($(cat "$HALT"))"; break; }
     [ -z "$max" ] || [ "$n" -lt "$max" ] || { why="--max-tasks $max reached"; break; }
-    [ -z "$stop_at" ] || [[ "$(date +%H:%M)" < "$stop_at" ]] || { why="--stop-at $stop_at passed"; break; }
+    [ -z "$deadline" ] || [ "$(date +%s)" -lt "$deadline" ] || { why="--stop-at $stop_at passed"; break; }
     name=$(basename "$task" .json); cb=; job="$task"
     if [ -n "$chain" ] && [ -n "$prev" ]; then
       cb="factory/$prev"; tmpjob=$(mktemp "${TMPDIR:-/tmp}/factory-task.XXXXXX"); job="$tmpjob"
       jq --arg b "$cb" '.base_branch=$b' "$task" > "$job"
     fi
     echo "== $name ($(now))${cb:+, base $cb}"
-    t0=$(date +%s); set +e; FACTORY_BATCH=$$ FACTORY_CHAIN_BASE="$cb" "$0" run "$job"; rc=$?; set -e
+    t0=$(date +%s); rc=0; FACTORY_BATCH=$$ FACTORY_CHAIN_BASE="$cb" "$0" run "$job" || rc=$?
     [ -z "$tmpjob" ] || rm -f "$tmpjob"; tmpjob=
-    run_id=$(cat "$LOCK/run_id"); m="$RUNS/$run_id/manifest.json"   # the run left its id in the lock it borrowed
+    # The run left its id in the borrowed lock; take the lock back at once, so a later `factory stop <that run>` signals nothing
+    # and a run that dies before it takes the lock (docker down) cannot be mistaken for the previous one.
+    run_id=$(cat "$LOCK/run_id"); echo "$batch_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"; m="$RUNS/$run_id/manifest.json"
     if [ "$run_id" != "$batch_id" ] && [ -f "$m" ]; then
       cells=$(jq -r '[(.exit_status // "running" | tostring), (.judge.rounds // "-" | tostring), (.judge.verdict // "-"), (.pr_url // "-")] | join(" | ")' "$m")
     else run_id="$batch_id-$name"; cells="$rc | - | - | -"; fi   # died before it was a run (bad task file, docker down)
     rows="$rows| $run_id | $cells | ${cb:--} | $(( $(date +%s) - t0 ))s |"$'\n'; n=$((n+1))
     if [ "$rc" -eq 0 ]; then dest=done; prev=$(jq -r .task_id "$task"); else dest=failed; fi
     mkdir -p "$dir/$dest"; mv "$task" "$dir/$dest/$run_id.json"
-    case "$rc" in 0) ;; 3) why="$name: no changes";; 4) why="$name: pushed, PR failed";; 5) why="$name: REFUTED";; 6) why="$name: no verdict";; *) why="$name: exit $rc";; esac
-    [ "$rc" -eq 0 ] || break
+    [ "$rc" -eq 0 ] || { why="$name exited $rc"; break; }   # 3 no changes, 4 PR failed, 5 REFUTED, 6 no verdict; the row has the verdict
   done
-  { echo "# $batch_id"; echo; echo "queue: $dir, chain: ${chain:+on}${chain:-off}, tasks run: $n"; echo
+  { echo "# $batch_id"; echo; echo "queue: $dir, chain: ${chain:-off}, tasks run: $n"; echo
     echo "| RUN | EXIT | ROUNDS | VERDICT | PR | CHAIN BASE | DURATION |"; echo "|---|---|---|---|---|---|---|"; printf '%s' "$rows"
     echo; if [ -n "$why" ]; then echo "Stopped: $why. $(ls "$dir"/*.json 2>/dev/null | wc -l | tr -d ' ') task(s) left in queue."; else echo "All tasks ran."; fi; } > "$report"
   cat "$report"; echo "report: $report"
