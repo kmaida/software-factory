@@ -1,6 +1,8 @@
 #!/bin/bash
 # factory: orchestrator for the software factory. See factory.md.
 #   factory run <task-file>   validate job, mint run, docker run the sandbox, write manifest + log
+#   factory sweep [max]       run every queue/*.json in name order; each moves to queue/done/ or queue/failed/
+#   factory report [n]        one line per run from the manifests: exit, judge rounds, verdict, PR
 #   factory stop <run_id>     kill the container, block new dispatch, record the incident
 # Compatible with the macOS /bin/bash (3.2). Needs: docker, git, jq.
 set -euo pipefail
@@ -27,7 +29,7 @@ OPENAI_RESOURCE="https://api.openai.com"       # Keycard Vault API Token credent
 MAX_ROUNDS=3                                   # worker -> judge rounds before the verdict is final
 
 die()   { echo "factory: $*" >&2; exit 1; }
-usage() { echo "usage: factory run <task-file> | factory stop <run_id>" >&2; exit 2; }
+usage() { echo "usage: factory run <task-file> | factory sweep [max] | factory report [n] | factory stop <run_id>" >&2; exit 2; }
 now()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # ---------------------------------------------------------------- run
@@ -224,7 +226,7 @@ cmd_run() {
     run_container work "$an_tok" -v "$work":/work -- "$prompt"; an_tok=
     [ "$status" -eq 0 ] || break
     head=$(git -C "$work" rev-parse --verify -q "refs/heads/factory/$task_id") || die "worker exited 0 but factory/$task_id does not exist"
-    if [ "$head" = "$prev_head" ]; then log "round $round: no new commits; the round $((round-1)) verdict stands"; break; fi
+    if [ "$head" = "$prev_head" ]; then log "round $round: no new commits; the round $((round-1)) verdict stands"; round=$((round-1)); break; fi   # rounds = judged rounds
     prev_head=$head
 
     oa_key=$(openai_key) || oa_key=; [ -n "$oa_key" ] || die "no Codex key (Keycard $OPENAI_RESOURCE)"
@@ -286,6 +288,32 @@ cmd_run() {
   exit "$status"
 }
 
+# ---------------------------------------------------------------- sweep
+cmd_sweep() {  # factory sweep [max]: the overnight loop. Tasks run one at a time in filename order (prefix them 010-, 020-, ...).
+  # Exit 0 moves the file to queue/done/, anything else to queue/failed/; the manifest has the detail. A task whose base branch is a
+  # factory/<task> branch that was refuted or failed will itself fail at the clone ("base branch not found"), so a chain stops cleanly.
+  max="${1:-50}"; n=0
+  for task in "$FACTORY_DIR"/queue/*.json; do
+    [ -e "$task" ] || { echo "queue is empty"; break; }
+    [ -e "$HALT" ] && { echo "halted by $HALT; $(ls "$FACTORY_DIR"/queue/*.json 2>/dev/null | wc -l | tr -d ' ') task(s) left in queue"; break; }
+    echo "== $(basename "$task") ($(now))"
+    if "$0" run "$task"; then dest=done; else dest=failed; fi
+    mkdir -p "$FACTORY_DIR/queue/$dest"; mv "$task" "$FACTORY_DIR/queue/$dest/"
+    n=$((n+1))
+    [ "$n" -lt "$max" ] || { echo "stopping after $max task(s); $(ls "$FACTORY_DIR"/queue/*.json 2>/dev/null | wc -l | tr -d ' ') left in queue"; break; }
+  done
+  echo; cmd_report "$n"
+}
+
+# ---------------------------------------------------------------- report
+cmd_report() {  # factory report [n]: the last n runs (default 20), oldest first
+  { printf 'RUN\tEXIT\tROUNDS\tVERDICT\tPR\n'
+    for m in "$RUNS"/*/manifest.json; do
+      [ -e "$m" ] || break
+      jq -r '[.run_id, (.exit_status // "running" | tostring), (.judge.rounds // "-" | tostring), (.judge.verdict // "-"), (.pr_url // "-")] | @tsv' "$m"
+    done | tail -n "${1:-20}"; } | column -t -s "$(printf '\t')"
+}
+
 # ---------------------------------------------------------------- stop
 cmd_stop() {
   run_id="${1:-}"; [ -n "$run_id" ] || usage
@@ -318,7 +346,9 @@ EOF
 }
 
 case "${1:-}" in
-  run)  shift; cmd_run "$@" ;;
-  stop) shift; cmd_stop "$@" ;;
+  run)    shift; cmd_run "$@" ;;
+  sweep)  shift; cmd_sweep "$@" ;;
+  report) shift; cmd_report "$@" ;;
+  stop)   shift; cmd_stop "$@" ;;
   *)    usage ;;
 esac
