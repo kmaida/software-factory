@@ -23,10 +23,11 @@ The **orchestrator** on the mini is the trust boundary, not the container. It re
 
 ### 2. No static secrets in the sandbox
 
-- Two secrets exist per run, both short-lived and both delivered as 0400 files on a tmpfs mount, never as `docker run` arguments: (review)
-  - `github_token`: a GitHub App installation token scoped to the one target repo with `contents:write` only, so the agent can push and nothing else: it cannot open, approve or merge a pull request. The orchestrator mints it per run: it fetches the App's private key from Keycard Vault (resource `urn:factory:github-app-key`, a dependency of the orchestrator Application, policy-checked and audited like the Anthropic resource), signs a 10-minute app JWT in memory, and calls `POST /app/installations/<id>/access_tokens` with the repo and that one permission. After the container exits, the host mints a second token with `pull_requests:write` only and makes the one API call that opens the PR; the container never holds it. The key is not stored on the mini. Keycard has no GitHub App connector, so repo scoping happens in the orchestrator's minting call, not in Keycard.
-  - `anthropic_token`: the Claude Code credential, issued per run with no API key anywhere. The orchestrator authenticates to the software factory zone as its own Application (`urn:factory:mini`) and gets a one-hour Keycard-signed OIDC token for the `https://api.anthropic.com` resource, policy-checked and audited. It exchanges that at Anthropic's Workload Identity Federation endpoint for a one-hour bearer token bound to the `factory` workspace and the `factory-mini` service account. The container uses it as `ANTHROPIC_AUTH_TOKEN`.
-- No PAT, no `gh auth` cache, no `.claude` auth in the image. TTL equals the job timeout.
+- Each container gets exactly one secret, delivered over stdin as a 0400 file on a tmpfs mount, never as a `docker run` argument: the worker gets the Claude credential, the judge gets the Codex key, the push step gets the GitHub token. The worker and the judge never hold a GitHub token. (review)
+  - `github_token`: a GitHub App installation token scoped to the one target repo with `contents:write` only, so the push step can push and nothing else: it cannot open, approve or merge a pull request. The orchestrator mints it for the clone and again for the push: it fetches the App's private key from Keycard Vault (resource `urn:factory:github-app-key`, a dependency of the orchestrator Application, policy-checked and audited like the Anthropic resource), signs a 10-minute app JWT in memory, and calls `POST /app/installations/<id>/access_tokens` with the repo and that one permission. After the container exits, the host mints a second token with `pull_requests:write` only and makes the one API call that opens the PR; the container never holds it. The key is not stored on the mini. Keycard has no GitHub App connector, so repo scoping happens in the orchestrator's minting call, not in Keycard.
+  - `openai_key`: the Codex judge's API key, a Keycard Vault API Token credential (resource `urn:factory:openai-key`), fetched per judge round, policy-checked and audited like the App key. It is a static key, not a short-lived token: fetching it per round gives an audit trail, not an expiry. Rotate it in Keycard if a run looks compromised.
+  - `anthropic_token`: the Claude Code credential, issued per worker round with no API key anywhere. The orchestrator authenticates to the software factory zone as its own Application (`urn:factory:mini`) and gets a one-hour Keycard-signed OIDC token for the `https://api.anthropic.com` resource, policy-checked and audited. It exchanges that at Anthropic's Workload Identity Federation endpoint for a one-hour bearer token bound to the `factory` workspace and the `factory-mini` service account. The container uses it as `ANTHROPIC_AUTH_TOKEN`.
+- No PAT, no `gh auth` cache, no `.claude` auth in the image. The Anthropic and GitHub tokens live one hour, the per-container timeout.
 - Known limit: a token copied out during the run stays valid until it expires or is revoked. The run log redacts both tokens (literal and the Basic-auth base64 form); that is a mitigation against accidental leaks in output, not a guarantee, since an encoded or split token survives it.
 - GitHub cannot scope an installation token to a branch, so the agent's token can also push to any other branch of the target repo that no rule protects, and to other open PR branches. The ruleset protects `main`, and "dismiss stale approvals" means a push onto someone else's approved PR removes the approval rather than riding it.
 
@@ -42,15 +43,22 @@ The **orchestrator** on the mini is the trust boundary, not the container. It re
 - `runs/<run_id>/log.jsonl`: one line per tool call and per token issue, with run id, timestamp, tool, redacted arguments, exit status. Written by the orchestrator from the agent's stream, so the agent cannot rewrite it.
 - Keycard zone audit covers the authorization side.
 
-### 5. Human gate on merge
+### 5. Judge before the human gate
 
-- Agent pushes `factory/<task_id>`; the host opens the PR. CI runs. I merge.
+- No human sees the code before an independent model has tried to refute it. After each worker round the orchestrator runs Codex in its own container against a fresh clone of the worker's checkout (read-only mount of the worker's tree, agent config files stripped, instructions from `judge-prompt.md` in the factory checkout, never from the target repo). The judge reads the diff, runs the repo's checks, hunts for wrong or out-of-scope changes and weakened tests, and ends with `VERDICT: VERIFIED | CAVEATS | REFUTED` plus findings.
+- Anything but VERIFIED sends the findings back to the worker as a revision round on the same branch, up to `MAX_ROUNDS` (3). A revision round that produces no new commit ends the loop.
+- The branch is pushed after the loop whatever the verdict (evidence). The PR opens only on VERIFIED or CAVEATS, with the verdict and findings in the body. REFUTED exits 5 and a missing verdict exits 6, both without a PR. Each round's full review is kept as `runs/<run_id>/judge-<round>.md`.
+- The judge is a model and can be wrong both ways; it narrows what reaches the human, it does not replace them.
+
+### 6. Human gate on merge
+
+- The host opens the PR after a passing verdict. CI runs. I merge.
 - Enforced in GitHub, not by instruction: a ruleset on `main` (PR required, one approval, stale approvals dismissed, required check), the agent's token cannot review or merge, and the App is not in the bypass list. (review)
 - Target-repo requirement: workflows that run on `pull_request` must not use repository secrets. A `factory/*` branch is a same-repo branch, so GitHub gives its workflow runs the repo's secrets, and the agent can change any script those workflows execute. The App has no `workflows` permission, so it cannot edit the workflow files themselves. `plan-my-today`'s CI uses dummy values and no secrets.
 
-### 6. Kill switch
+### 7. Kill switch
 
-- One script, `factory stop <run_id>`: stops the container, blocks new dispatch, revokes the Keycard grant and the GitHub token, and appends an incident line to the manifest. (review)
+- One script, `factory stop <run_id>`: stops the run's container, blocks new dispatch, and records the incident (in the log always; in the manifest when no live orchestrator will finalize it). Revocation is not wired: the orchestrator keeps no token to revoke, and both expire within the hour. (review)
 - Known limit: revocation does not undo work already pushed. The PR gate catches that.
 
 ## Flow
@@ -59,11 +67,13 @@ The **orchestrator** on the mini is the trust boundary, not the container. It re
 task file in queue/
   -> orchestrator validates job, creates run_id, writes manifest
   -> orchestrator mints repo-scoped GitHub token from the App, fetches Claude credential from Keycard
-  -> both piped into the container, land as 0400 files on tmpfs
+  -> each container gets its one secret over stdin, landing as a 0400 file on tmpfs
   -> docker run (pinned image, repo mount, secrets mount, limits)
-  -> agent works; orchestrator streams tool calls to log.jsonl
-  -> agent pushes branch, opens PR
-  -> container removed, manifest finalized
+  -> worker container: agent works and commits; orchestrator streams tool calls to log.jsonl
+  -> judge container: Codex reviews a fresh clone, writes findings + VERDICT
+  -> not VERIFIED and rounds left: worker container again with the findings; else continue
+  -> push container pushes the branch; host opens the PR only on VERIFIED or CAVEATS
+  -> containers removed, manifest finalized (judge rounds and verdict recorded)
   -> human reviews and merges
 ```
 
@@ -81,21 +91,23 @@ Status is Implemented, Partial, or Planned. Each has a check that proves it. (re
 | AUT-05 Independent approval | Implemented | Ruleset on `main` in each target repo: PR required, 1 approval, stale approvals dismissed, `test` check required, no App in the bypass list. The agent's token has no pull-request permission at all, so it cannot approve anything. |
 | AUT-06 Fail-closed | Implemented | Orchestrator refuses to start a run on any token or schema failure. |
 | OBS-01 / OBS-02 Telemetry and correlation | Partial | Log and manifest keyed by run_id. No integrity protection on the files. |
-| VAL-03 Artifact testing | Implemented | Required CI checks on the PR. |
+| VAL-03 Artifact testing | Implemented | Codex judge runs the repo's checks and tries to refute the change before the PR exists; required CI checks on the PR. |
 | RES-01 Stop and revoke | Partial | `factory stop` exists. Token-copy limit documented. |
 | RES-03 Evidence preservation | Partial | Manifest and log kept per run. No retention policy. |
 | Discover, Validate (other), RES-02, RES-05 | Planned | Not in v1. |
 
 ## Accepted risks for v1
 
-- Open egress from the container. The agent can exfiltrate the repo and the two tokens over HTTPS (it owns the 0400 files and both are in its environment). The git helper inside only answers for github.com, so a push to another host carries no credential, but `curl` would. Revisit with the Keycard egress proxy when agents run in a cluster or when this matters.
+- Open egress from the containers. The worker can exfiltrate the repo and its Anthropic token over HTTPS. In the judge container, the repo's own checks run as the same user as Codex with no inner sandbox, so a test the worker wrote can read Codex's login under `/tmp/codex` and send the judge's key out (v1's CI judge had the same exposure). The git helper only answers for github.com, so a push to another host carries no credential, but `curl` would. Mitigations in place: the judge's key is judge-only and rotatable, the verdict is collected from a mount the repo cannot reach, and anything the judge writes is redacted for its key before it is reused. Revisit with the Keycard egress proxy, or a credential-free check container feeding the judge, when this matters.
 - Single machine, single user, no evidence integrity.
 
 ## Files
 
 - `factory.md`: this spec.
-- `Dockerfile`: the sandbox image.
-- `factory`: orchestrator script (`run`, `stop`). `run` exits with the container's status, or 3 when the agent produced no commits (nothing pushed), or 4 when the branch was pushed but opening the PR failed.
+- `Dockerfile`: the sandbox image; one entrypoint with three modes (`work`, `judge`, `push`), one container per step.
+- `judge-prompt.md`: the judge's instructions, read from this checkout, never from the target repo.
+- `factory`: orchestrator script (`run`, `stop`). `run` exits with the worker's status, or 3 when the agent produced no commits (nothing pushed), 4 when the branch was pushed but opening the PR failed, 5 when the judge refuted the final round (pushed, no PR), 6 when the judge gave no verdict (pushed, no PR).
+- `test-factory.sh`: runs the orchestrator against stubbed `docker` and `curl` and checks the revise / refuted / no-verdict / caveats paths and log redaction.
 - `queue/`, `runs/`: task intake and per-run evidence. Not in the image.
 
 ## Implementation notes (mini, 2026-10-29)
@@ -118,8 +130,11 @@ Status is Implemented, Partial, or Planned. Each has a check that proves it. (re
 - **Verified end to end on 2026-10-29 with a Keycard-brokered Claude credential:** the agent ran a real session in the sandbox, edited and committed on `factory/<task_id>`, and the log redacted both tokens. Push and PR still fail in the dry run because the throwaway remote is a host path the container cannot reach; those need the GitHub App.
 - **Verified in a real container on 2026-10-29:** `docker inspect` shows user `agent` (uid 1000), read-only root FS, `CapDrop=[ALL]`, `no-new-privileges`, 4 GiB memory, 2 CPUs, 512 pids, and only the `/work` bind mount plus the `/tmp` and `/run/secrets` tmpfs; no Docker socket; writes to `/` and `/usr` fail. The dry run clones, creates `factory/<task_id>` from `origin/<base>`, writes git config under `/tmp`, reaches `claude`, and exits 1 with "Invalid API key" on a dummy token; the log has zero token hits; lock, clone dir, and container are gone afterwards. `factory stop` writes `HALT` and the incident, and `factory run` refuses while `HALT` exists. Still untested: push, PR creation, the 60-minute watchdog, and a real Claude session (needs real credentials).
 - **Known:** Docker's default `/tmp` tmpfs is `noexec`. Revisit if Claude Code needs to execute something from `/tmp`.
+- **Judge added 2026-10-30, not yet run for real:** the entrypoint gained `MODE=work|judge|push`, the image gained `@openai/codex@0.164.0` (pinned), and the orchestrator runs the worker → judge loop above. Codex runs with its own sandbox off (`--dangerously-bypass-approvals-and-sandbox`): it cannot start inside the capability-dropped container, and the container is the sandbox, as in v1's CI judge. The judge clones `/src` (the worker's tree, mounted read-only) inside the container so no hook or index state the worker left behind is reused and nothing the judge runs can modify the worker's checkout; the host only ever reads one text file (`.factory-verdict.md`) out of the judge's directory. The push step likewise never runs git inside the worker's checkout: it clones the branch from the read-only mount into a fresh bare repo and pushes to the URL the orchestrator passes, with hooks disabled, so a hook or config the worker planted cannot run with the GitHub token (the worker no longer holds that token, and this keeps it that way). The orchestrator logic is covered by `test-factory.sh`; the image, Codex login with a Vault-fetched key, and a full round in a real container still need the rebuild and one real run.
 
 ## TODO (Kim)
+
+- Judge: create the Keycard Vault API Token credential for the OpenAI key as resource `urn:factory:openai-key`, add a `factory-orchestrator-*` permit for `urn:factory:mini` on it (same shape as the App key permit), rebuild the image (`docker build -t factory-sandbox .`; update the image id above), and run one real task to see a verdict land.
 
 - Put the plan-my-today ruleset on `kmaida/software-factory` too (PR required, 1 approval, admin bypass for PRs only; no required check until the repo has CI). Decide what to do with the old design's `scripts/`, `skills/`, `templates/` and README there.
 - Install the App on each further target repo (same installation; Settings → Applications → Configure → add repos).

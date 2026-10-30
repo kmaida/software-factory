@@ -23,21 +23,24 @@ ANTHROPIC_FEDERATION_RULE="fdrl_014KGxaZmUmk5veFbJ8uibXB"
 GITHUB_APP_ID="Iv23liCLESgW74Wn2Ie2"     # GitHub App client id (accepted as JWT issuer); the private key lives in Keycard Vault
 GITHUB_APP_KEY_RESOURCE="urn:factory:github-app-key"
 GITHUB_APP_INSTALLATION="176545264"
+OPENAI_KEY_RESOURCE="urn:factory:openai-key"   # Keycard Vault API Token credential: the Codex judge's key, fetched per judge round
+MAX_ROUNDS=3                                   # worker -> judge rounds before the verdict is final
 
 die()   { echo "factory: $*" >&2; exit 1; }
 usage() { echo "usage: factory run <task-file> | factory stop <run_id>" >&2; exit 2; }
 now()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # ---------------------------------------------------------------- run
-run_id= work= cname= logf=
+run_id= work= jwork= jout= logf=
 manifest_set() {  # manifest_set <jq-filter> [jq args...]: atomic update of this run's manifest
   f="$1"; shift
   jq "$@" "$f" "$rundir/manifest.json" > "$rundir/manifest.json.tmp.$$" && mv "$rundir/manifest.json.tmp.$$" "$rundir/manifest.json"
 }
 cleanup() {
   rc=$?
-  [ -n "$cname" ] && docker rm -f "$cname" >/dev/null 2>&1 || true
-  [ -n "$work" ] && rm -rf "$work"
+  # Best effort, every step: a docker outage here must not stop the manifest from being finalized or the lock from being released.
+  if [ -n "$run_id" ]; then c=$(docker ps -aq --filter "label=factory.run=$run_id" 2>/dev/null) || c=; [ -n "$c" ] && docker rm -f $c >/dev/null 2>&1 || true; fi
+  [ -n "$work" ] && rm -rf "$work"; [ -n "$jwork" ] && rm -rf "$jwork"; [ -n "$jout" ] && rm -rf "$jout"
   # A run that died before finalizing still gets a terminal state, so no manifest is left open-ended.
   if [ -n "${rundir:-}" ] && [ -f "$rundir/manifest.json" ] && [ "$(jq -r .ended_at "$rundir/manifest.json")" = null ]; then
     manifest_set '. + {ended_at:$ended, exit_status:$rc}' --arg ended "$(now)" --argjson rc "$rc"
@@ -72,8 +75,46 @@ open_pr() {  # open_pr <owner/name> <task_id> <base> <instructions>: fresh pull_
              '{title:$t, head:$h, base:$b, body:("Opened by the factory for task `"+$t+"`.\n\n"+$body)}')" \
   | jq -r '.html_url // empty'
 }
+anthropic_token() {  # Claude credential, two steps, no API key anywhere. Fresh per worker round: the token lives 1h, a run may not.
+  # 1. Keycard signs a 1h OIDC token for this Application (policy-checked, audited). Client secret via curl config on stdin, not argv.
+  #    The token itself goes to jq on stdin for the same reason.
+  kc=$(keycard_token "$ANTHROPIC_RESOURCE") || kc=
+  [ -n "$kc" ] || { echo "factory: Keycard did not issue a token for $ANTHROPIC_RESOURCE (zone $KEYCARD_ZONE)" >&2; return 1; }
+  # 2. Anthropic exchanges it for a 1h bearer token scoped to the factory workspace.
+  printf '%s' "$kc" | jq -Rsc --arg r "$ANTHROPIC_FEDERATION_RULE" --arg o "$ANTHROPIC_ORG" --arg s "$ANTHROPIC_SERVICE_ACCOUNT" --arg w "$ANTHROPIC_WORKSPACE" \
+      '{grant_type:"urn:ietf:params:oauth:grant-type:jwt-bearer", assertion:., federation_rule_id:$r, organization_id:$o, service_account_id:$s, workspace_id:$w}' \
+    | curl -sS "$ANTHROPIC_RESOURCE/v1/oauth/token" -H "content-type: application/json" -d @- \
+    | jq -r '.access_token // empty'
+}
+openai_key() {  # the judge's key: Keycard Vault for real runs, a file for dry runs (same split as the GitHub token)
+  if [ "$gh_src" = file ]; then cat "$FACTORY_SECRETS_DIR/openai_key"; else keycard_token "$OPENAI_KEY_RESOURCE"; fi
+}
 log() {  # log <text>: one factory-side line in log.jsonl
   jq -nc --arg r "$run_id" --arg t "$1" '{run_id:$r, ts:(now|todate), event:{type:"factory", text:$t}}' >> "$logf"
+}
+run_container() {  # run_container <mode> <secret> [docker args...] -- [entrypoint args...]: one sandbox step; sets $status
+  mode=$1; secret=$2; shift 2
+  dargs=(); while [ $# -gt 0 ] && [ "$1" != -- ]; do dargs+=("$1"); shift; done; shift
+  # Flags are fixed here; nothing in the task can change them. The secret goes over stdin; the entrypoint writes it to the tmpfs.
+  # `factory stop` during preparation signals this process; the HALT check covers a stop that landed between that and now.
+  [ -e "$HALT" ] && die "dispatch blocked by $HALT ($(cat "$HALT"))"
+  b64=$(printf 'x-access-token:%s' "$secret" | openssl base64 -A)   # the Basic-auth form git prints in verbose traces
+  cname="factory-$run_id-$mode-$round"
+  log "container $cname starting"
+  ( sleep "$TIMEOUT_SEC" && docker stop -t 10 "$cname" >/dev/null 2>&1 ) & watchdog=$!
+  set +e
+  printf '%s\n' "$secret" \
+  | docker run -i --name "$cname" --label "factory.run=$run_id" --rm --read-only --tmpfs /tmp --tmpfs /run/secrets:size=64k \
+    --memory 4g --cpus 2 --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges \
+    -e MODE="$mode" -e TASK_ID="$task_id" -e BASE_BRANCH="$base_branch" "${dargs[@]}" "$image_digest" "$@" 2>&1 \
+  | while IFS= read -r line || [ -n "$line" ]; do
+      line=${line//"$secret"/[REDACTED]}; line=${line//"$b64"/[REDACTED]}; printf '%s\n' "$line"
+    done \
+  | jq -R -c --arg r "$run_id" '{run_id:$r, ts:(now|todate), event:(. as $l | try fromjson catch {type:"text", text:$l})}' >> "$logf"
+  status=${PIPESTATUS[1]}
+  set -e
+  kill "$watchdog" 2>/dev/null || true
+  log "container $cname exited with status $status"
 }
 
 cmd_run() {
@@ -108,8 +149,9 @@ cmd_run() {
   # GitHub repos get a per-run installation token minted from the App key (fetched from Keycard Vault); anything else (dry runs) needs a github_token file.
   case "$repo_url" in
     https://github.com/*) ;;
-    *) [ -s "$FACTORY_SECRETS_DIR/github_token" ] || die "missing or empty token file: $FACTORY_SECRETS_DIR/github_token" ;;
+    *) for t in github_token openai_key; do [ -s "$FACTORY_SECRETS_DIR/$t" ] || die "missing or empty token file: $FACTORY_SECRETS_DIR/$t"; done ;;
   esac
+  [ -s "$FACTORY_DIR/judge-prompt.md" ] || die "missing $FACTORY_DIR/judge-prompt.md"
 
   image_digest=$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null) || die "image $IMAGE not built; run: docker build -t $IMAGE ."
   # Which factory ran: this checkout's commit. The definition changes only by reviewed PR and `git pull`; a dirty tree is not that.
@@ -142,8 +184,8 @@ cmd_run() {
       started_at:$started, ended_at:null, exit_status:null, final_sha:null, pr_url:null}' \
     > "$rundir/manifest.json"
 
-  # GitHub token for the agent: this repo only, contents:write only (push), expires in 60 min (= job timeout). It cannot open,
-  # approve or merge pull requests; the host opens the PR afterwards with a separate token. Held in memory here for the clone and for redaction.
+  # GitHub token for the clone and the push: this repo only, contents:write only, expires in 60 min. It cannot open, approve or
+  # merge pull requests; the host opens the PR afterwards with a separate token. The worker and the judge never hold it.
   case "$repo_url" in
     https://github.com/*) app_key=$(keycard_token "$GITHUB_APP_KEY_RESOURCE" | openssl base64 -d -A 2>/dev/null) || app_key=
                           [ -n "$app_key" ] || die "Keycard did not issue the GitHub App key (zone $KEYCARD_ZONE, resource $GITHUB_APP_KEY_RESOURCE)"
@@ -167,52 +209,79 @@ cmd_run() {
     die "branch factory/$task_id already exists on $repo; delete it or use a new task_id (a rerun would diverge from it and fail to push)"
   fi
 
-  # Secrets go to the container over stdin, one per line; the entrypoint writes them as 0400 files on the
-  # /run/secrets tmpfs. They never touch the host filesystem, argv, or docker inspect output.
-  # Claude credential, two steps, no API key anywhere:
-  # 1. Keycard signs a 1h OIDC token for this Application (policy-checked, audited). Client secret via curl config on stdin, not argv.
-  #    The token itself goes to jq on stdin for the same reason.
-  kc_tok=$(keycard_token "$ANTHROPIC_RESOURCE") || kc_tok=
-  [ -n "$kc_tok" ] || die "Keycard did not issue a token for $ANTHROPIC_RESOURCE (zone $KEYCARD_ZONE)"
-  # 2. Anthropic exchanges it for a 1h bearer token scoped to the factory workspace.
-  an_tok=$(printf '%s' "$kc_tok" | jq -Rsc --arg r "$ANTHROPIC_FEDERATION_RULE" --arg o "$ANTHROPIC_ORG" --arg s "$ANTHROPIC_SERVICE_ACCOUNT" --arg w "$ANTHROPIC_WORKSPACE" \
-      '{grant_type:"urn:ietf:params:oauth:grant-type:jwt-bearer", assertion:., federation_rule_id:$r, organization_id:$o, service_account_id:$s, workspace_id:$w}' \
-    | curl -sS "$ANTHROPIC_RESOURCE/v1/oauth/token" -H "content-type: application/json" -d @- \
-    | jq -r '.access_token // empty') || an_tok=
-  [ -n "$an_tok" ] || die "Anthropic did not exchange the Keycard token (rule $ANTHROPIC_FEDERATION_RULE, workspace $ANTHROPIC_WORKSPACE)"
-  log "secrets issued: github_token ($gh_src), anthropic_token (Keycard $KEYCARD_ZONE -> Anthropic WIF rule $ANTHROPIC_FEDERATION_RULE, workspace $ANTHROPIC_WORKSPACE); ttl ${TIMEOUT_SEC}s"
+  gh_tok=   # the clone is done; the push mints its own token later, so none is held while the agents run
 
-  # Run. Flags are fixed here; nothing in the task can change them. Stdout/stderr stream to log.jsonl, redacted.
-  # `factory stop` during the steps above signals this process; the HALT check here covers a stop that landed between that and now.
-  [ -e "$HALT" ] && die "dispatch blocked by $HALT ($(cat "$HALT"))"
-  gh_b64=$(printf 'x-access-token:%s' "$gh_tok" | openssl base64 -A)   # the Basic-auth form git prints in verbose traces
-  cname="factory-$run_id"
-  ( sleep "$TIMEOUT_SEC" && docker stop -t 10 "$cname" >/dev/null 2>&1 ) & watchdog=$!
-  set +e
-  printf '%s\n%s\n' "$gh_tok" "$an_tok" \
-  | docker run -i --name "$cname" --label "factory.run=$run_id" --rm --read-only --tmpfs /tmp --tmpfs /run/secrets:size=64k \
-    --memory 4g --cpus 2 --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges \
-    -v "$work":/work \
-    -e TASK_ID="$task_id" -e BASE_BRANCH="$base_branch" "$image_digest" "$instructions" 2>&1 \
-  | while IFS= read -r line || [ -n "$line" ]; do
-      line=${line//"$gh_tok"/[REDACTED]}; line=${line//"$an_tok"/[REDACTED]}; line=${line//"$gh_b64"/[REDACTED]}; printf '%s\n' "$line"
-    done \
-  | jq -R -c --arg r "$run_id" '{run_id:$r, ts:(now|todate), event:(. as $l | try fromjson catch {type:"text", text:$l})}' >> "$logf"
-  status=${PIPESTATUS[1]}
-  set -e
-  kill "$watchdog" 2>/dev/null || true
-  cname=   # container is gone (--rm); don't try to remove it again
+  # Worker -> judge rounds. Each step is its own container with exactly one secret: the worker has the Claude credential,
+  # the judge has the Codex key, the push has the GitHub token. The judge reviews a fresh clone of the worker's checkout and
+  # ends with a VERDICT line; anything but VERIFIED sends its findings back to the worker for a revision round, up to MAX_ROUNDS.
+  # Nothing is pushed until the rounds are over, so no human sees the code before the judge has.
+  round=1 verdict= findings= head= prev_head= status=0
+  while :; do
+    prompt="$instructions"
+    [ -n "$findings" ] && prompt="$instructions"$'\n\n'"## Review of your previous attempt (round $((round-1)) verdict: $verdict)"$'\n'"The reviewer refused the branch as it stands. Fix every finding below on the current branch, keep the task's scope, and commit. Findings:"$'\n'"$findings"
+    an_tok=$(anthropic_token) || an_tok=; [ -n "$an_tok" ] || die "Anthropic did not exchange the Keycard token (rule $ANTHROPIC_FEDERATION_RULE, workspace $ANTHROPIC_WORKSPACE)"
+    log "round $round: anthropic_token issued (Keycard $KEYCARD_ZONE -> Anthropic WIF rule $ANTHROPIC_FEDERATION_RULE, workspace $ANTHROPIC_WORKSPACE); ttl ${TIMEOUT_SEC}s"
+    run_container work "$an_tok" -v "$work":/work -- "$prompt"; an_tok=
+    [ "$status" -eq 0 ] || break
+    head=$(git -C "$work" rev-parse --verify -q "refs/heads/factory/$task_id") || die "worker exited 0 but factory/$task_id does not exist"
+    if [ "$head" = "$prev_head" ]; then log "round $round: no new commits; the round $((round-1)) verdict stands"; break; fi
+    prev_head=$head
 
-  final_sha=$(git -C "$work" rev-parse --verify -q "refs/heads/factory/$task_id" || echo null)
-  # The PR is opened here, not by the agent: a second, separate token with pull_requests:write that the container never held.
-  pr_url=
-  if [ "$final_sha" != null ] && [ "$status" -eq 0 ] && [ "$gh_src" != file ]; then
-    pr_url=$(open_pr "$repo" "$task_id" "$base_branch" "$instructions") || pr_url=
-    if [ -n "$pr_url" ]; then log "opened $pr_url"; else log "branch factory/$task_id pushed but opening the PR failed; open it by hand"; status=4; fi
+    oa_key=$(openai_key) || oa_key=; [ -n "$oa_key" ] || die "no Codex key (Keycard $OPENAI_KEY_RESOURCE)"
+    log "round $round: openai_key issued (Keycard $KEYCARD_ZONE resource $OPENAI_KEY_RESOURCE)"
+    jwork=$(mktemp -d "${TMPDIR:-/tmp}/factory-judge.XXXXXX"); jout=$(mktemp -d "${TMPDIR:-/tmp}/factory-judge-out.XXXXXX")
+    jprompt="$(cat "$FACTORY_DIR/judge-prompt.md")"$'\n\n'"## Commits"$'\n'"Base: $base_sha"$'\n'"Head: $head"$'\n\n'"## Task given to the agent"$'\n'"$instructions"
+    run_container judge "$oa_key" -v "$work":/src:ro -v "$jwork":/work -v "$jout":/out -e HEAD_SHA="$head" -- "$jprompt"
+    jstatus=$status; status=0   # the worker succeeded; a failed judge is a missing verdict (exit 6 below), not a failed run
+    # The verdict counts only if the judge exited 0 and left a regular file in /out, a mount the repository cannot reach.
+    # Bounded read; then redact the judge's key before the text goes anywhere (the next prompt, the PR body, evidence).
+    findings=
+    if [ "$jstatus" -eq 0 ] && [ -f "$jout/verdict.md" ] && [ ! -L "$jout/verdict.md" ]; then findings=$(head -c 200000 "$jout/verdict.md"); fi
+    findings=${findings//"$oa_key"/[REDACTED]}; oa_key=
+    rm -rf "$jwork" "$jout"; jwork= jout=
+    printf '%s\n' "$findings" > "$rundir/judge-$round.md"   # evidence: the full review, one file per round
+    # The last non-blank line must be the verdict line, whole; anything else is no verdict.
+    verdict=$(printf '%s\n' "$findings" | sed -e '/^[[:space:]]*$/d' | tail -1 | grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)[[:space:]]*$' | awk '{print $2}' || true)
+    log "round $round: judge verdict ${verdict:-NONE} (container status $jstatus, $(printf '%s' "$findings" | wc -c | tr -d ' ') bytes)"
+    echo "  round $round: judge verdict ${verdict:-NONE}"
+    [ -n "$verdict" ] || break                 # judge error: nothing to revise against; fail closed below
+    [ "$verdict" = VERIFIED ] && break
+    [ "$round" -ge "$MAX_ROUNDS" ] && break
+    round=$((round+1))
+  done
+  wstatus=$status
+
+  # Push the last judged commit whenever there is one (evidence, and the human's starting point if they want it), even when a
+  # later revision round failed, with a fresh token the agents never held. A round-1 worker that fails leaves nothing to push. Then the PR: only when every worker round succeeded and
+  # the verdict is VERIFIED or CAVEATS. REFUTED exits 5 and NONE exits 6, both without a PR.
+  final_sha=${head:-null}; pr_url=
+  if [ "$final_sha" != null ]; then
+    case "$gh_src" in
+      file) gh_tok=$(cat "$FACTORY_SECRETS_DIR/github_token") ;;
+      *) app_key=$(keycard_token "$GITHUB_APP_KEY_RESOURCE" | openssl base64 -d -A 2>/dev/null) || app_key=
+         gh_tok=$(mint_github_token "${repo##*/}" "$app_key" '{"contents":"write"}') || gh_tok=; app_key= ;;
+    esac
+    [ -n "$gh_tok" ] || die "GitHub did not issue a push token for $repo"
+    run_container push "$gh_tok" -v "$work":/src:ro -e REPO_URL="$repo_url" -e HEAD_SHA="$head" --; gh_tok=   # read-only mount; pushes the judged commit by SHA
+    if [ "$status" -ne 0 ]; then log "push of factory/$task_id failed"; [ "$wstatus" -eq 0 ] || status=$wstatus
+    elif [ "$wstatus" -ne 0 ]; then log "worker failed in round $round (status $wstatus); branch pushed, no PR"; status=$wstatus
+    else
+      case "$verdict" in
+        VERIFIED|CAVEATS)
+          if [ "$gh_src" != file ]; then
+            # The PR is opened here, not by an agent: a separate token with pull_requests:write that no container ever held.
+            body="$instructions"$'\n\n'"## Judge (Codex), $round round(s), verdict $verdict"$'\n\n'"$findings"
+            pr_url=$(open_pr "$repo" "$task_id" "$base_branch" "$body") || pr_url=
+            if [ -n "$pr_url" ]; then log "opened $pr_url"; else log "branch factory/$task_id pushed but opening the PR failed; open it by hand"; status=4; fi
+          fi ;;
+        REFUTED) log "refuted after $round round(s); branch pushed, no PR"; status=5 ;;
+        *)       log "judge gave no verdict; branch pushed, no PR"; status=6 ;;
+      esac
+    fi
   fi
-  manifest_set '. + {ended_at:$ended, exit_status:$status, final_sha:(if $final=="null" then null else $final end), pr_url:(if $pr=="" then null else $pr end)}' \
-     --arg ended "$(now)" --argjson status "$status" --arg final "$final_sha" --arg pr "$pr_url"
-  log "container exited with status $status"
+  manifest_set '. + {ended_at:$ended, exit_status:$status, final_sha:(if $final=="null" then null else $final end), pr_url:(if $pr=="" then null else $pr end),
+                     judge:{rounds:$rounds, verdict:(if $v=="" then null else $v end)}}' \
+     --arg ended "$(now)" --argjson status "$status" --arg final "$final_sha" --arg pr "$pr_url" --argjson rounds "$round" --arg v "$verdict"
   echo "  exit status: $status"
   exit "$status"
 }
@@ -221,12 +290,14 @@ cmd_run() {
 cmd_stop() {
   run_id="${1:-}"; [ -n "$run_id" ] || usage
   rundir="$RUNS/$run_id"; [ -d "$rundir" ] || die "no such run: $run_id"
-  cname="factory-$run_id"; logf="$rundir/log.jsonl"
+  logf="$rundir/log.jsonl"
   echo "stopped $run_id at $(now). Remove this file to allow new runs." > "$HALT"   # first, so nothing new starts meanwhile
   echo "wrote $HALT (blocks new dispatch until removed)"
   if command -v docker >/dev/null; then
-    docker stop -t 5 "$cname" >/dev/null 2>&1 && echo "stopped container $cname" || echo "container $cname not running"
-    docker rm -f "$cname" >/dev/null 2>&1 || true
+    # A run has one container at a time (worker, judge or push), all labelled with the run id.
+    c=$(docker ps -q --filter "label=factory.run=$run_id")
+    if [ -n "$c" ]; then docker stop -t 5 $c >/dev/null 2>&1 && echo "stopped container(s) $c"; else echo "no container running for $run_id"; fi
+    c=$(docker ps -aq --filter "label=factory.run=$run_id"); [ -n "$c" ] && docker rm -f $c >/dev/null 2>&1 || true
   else
     echo "docker not found; nothing to stop on this host"
   fi
