@@ -77,21 +77,6 @@ set +e; out=$("$here/factory" lint "$t/lint-bad"); rc=$?; set -e
 check "$rc" 1 "lint bad exit"; check "$(printf '%s\n' "$out" | grep -c '^0[12]0-[ab]:')" 2 "lint bad reports the two broken files"
 printf '%s\n' "$out" | grep -q "010-a: task_id '010-x' is not the filename; base_branch factory/030-c is a later task in the queue" || { echo "FAIL: lint messages: $out"; exit 1; }
 printf '%s\n' "$out" | grep -q "020-b: instructions need the headings" || { echo "FAIL: lint headings message: $out"; exit 1; }
-# sweep on its own queue: 010 verifies (-> done/), 020 is refuted three times (-> failed/), 030 depends on 020 and is skipped unrun (-> failed/).
-q="$t/queue"; mkdir -p "$q"
-task "$t/remote.git" main 010-sw-a "$body" "$q"; task "$t/remote.git" main 020-sw-b "$body" "$q"; task "$t/remote.git" factory/020-sw-b 030-sw-c "$body" "$q"
-rm -f "$t/state"; set +e
-PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_VERDICTS="VERIFIED,REFUTED,REFUTED,REFUTED" FACTORY_QUEUE="$q" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 \
-  "$here/factory" sweep > "$t/sweep.out" 2>&1; rc=$?; set -e
-m=$(ls -d "$runs"/*-020-sw-b | tail -1)
-check "$rc" 0 "sweep exit"; check "$(ls "$q"/done)" "010-sw-a.json" "sweep done/"; check "$(ls "$q"/failed | tr '\n' ' ')" "020-sw-b.json 030-sw-c.json " "sweep failed/"
-check "$(ls -d "$runs"/*-030-sw-c 2>/dev/null | wc -l | tr -d ' ')" 0 "sweep never ran the dependent of a failed task"
-grep -q '030-sw-c.json: skipped, its base factory/020-sw-b failed in this sweep' "$t/sweep.out" || { echo "FAIL: sweep skip message"; cat "$t/sweep.out"; exit 1; }
-check "$(grep -cE '^[0-9]{8}T[0-9]{6}Z-0[12]0-sw-[ab] ' "$t/sweep.out")" 2 "sweep report lists the two runs"
-# sweep refuses a queue that fails lint, without running anything
-set +e; FACTORY_QUEUE="$t/lint-bad" "$here/factory" sweep > "$t/sweep2.out" 2>&1; rc=$?; set -e
-check "$rc" 1 "sweep refuses bad queue"; grep -q 'fix the queue before sweeping' "$t/sweep2.out" || { echo "FAIL: sweep refusal message"; exit 1; }
-rm -rf "$runs"/*-0[12]0-sw-[ab]
 # batch: a three-task chain. 020 and 030 run with base_branch rewritten to the previous task's branch (the files on disk are not
 # touched: same bytes after the move to done/), chain_base is in the manifest, and the batch report has one row per task.
 batch() {  # batch <queue-dir> <verdicts> [flags...] -> exit status; output in $t/batch.out
@@ -101,7 +86,7 @@ batch() {  # batch <queue-dir> <verdicts> [flags...] -> exit status; output in $
   echo "$rc"
 }
 queue() { mkdir -p "$t/$1"; for id in "${@:2}"; do task "$t/remote.git" main "$id" "$body" "$t/$1"; done; }
-moved() { ls "$t/$1" 2>/dev/null | sed 's/^[0-9]*T[0-9]*Z-//' | tr '\n' ' '; }   # filenames without the run timestamp
+moved() { ls "$t/$1" 2>/dev/null | sed -E 's/^(batch-)?[0-9]+T[0-9]+Z-//' | tr '\n' ' '; }   # filenames without the run or batch id
 queue ch 010-ch-a 020-ch-b 030-ch-c; sums=$(shasum "$t/ch"/*.json | cut -d' ' -f1)
 rc=$(batch "$t/ch" "VERIFIED,VERIFIED,VERIFIED")
 check "$rc" 0 "chain exit"; check "$(moved ch/done)" "010-ch-a.json 020-ch-b.json 030-ch-c.json " "chain done/"; check "$(moved ch)" "done " "chain queue empty"
@@ -129,8 +114,17 @@ check "$rc" 0 "halt exit"; check "$(moved ha/done)" "010-ha-a.json " "halt done/
 grep -q 'Stopped: halted by' "$t/batch.out" || { echo "FAIL: halt message"; cat "$t/batch.out"; exit 1; }; rm -f "$here/HALT"
 queue nc 010-nc-a 020-nc-b; rc=$(batch "$t/nc" "VERIFIED,VERIFIED" --no-chain)
 check "$rc" 0 "no-chain exit"; m=$(ls -d "$runs"/*-020-nc-b | tail -1); check "$(jq -r '"\(.base_branch) \(.chain_base)"' "$m/manifest.json")" "main null" "no-chain 020 on its own base"
-find "$runs" -maxdepth 1 -newer "$t/secrets" \( -name 'batch-*.md' -o -name '*-0[0-9]0-[a-z][a-z]-[a-c]' \) -exec rm -rf {} +   # only what this test made
+# --continue: 020 (chained on 010) is refuted -> failed/; 030 names factory/020-sw-b as its base -> failed/ unrun; 040 bases on main
+# again (after a break the chain resumes from the task's own base_branch). Exit is the last failure's. A queue that fails lint is refused.
+queue sw 010-sw-a 020-sw-b 040-sw-d; task "$t/remote.git" factory/020-sw-b 030-sw-c "$body" "$t/sw"
+rc=$(batch "$t/sw" "VERIFIED,REFUTED,REFUTED,REFUTED,VERIFIED" --continue)
+check "$rc" 5 "continue exit"; check "$(moved sw/done)" "010-sw-a.json 040-sw-d.json " "continue done/"; check "$(moved sw/failed)" "020-sw-b.json 030-sw-c.json " "continue failed/"
+check "$(ls -d "$runs"/*-030-sw-c 2>/dev/null | wc -l | tr -d ' ')" 0 "continue never ran the dependent of a failed task"
+m=$(ls -d "$runs"/*-040-sw-d | tail -1); check "$(jq -r '"\(.base_branch) \(.chain_base)"' "$m/manifest.json")" "main null" "continue resumes from the task's own base"
+grep -q '030-sw-c: skipped, its base factory/020-sw-b failed in this batch' "$t/batch.out" || { echo "FAIL: skip message"; cat "$t/batch.out"; exit 1; }
+rc=$(batch "$t/lint-bad" VERIFIED); check "$rc" 1 "batch refuses bad queue"; grep -q 'fix the queue before batching' "$t/batch.out" || { echo "FAIL: refusal message"; exit 1; }
+find "$runs" -maxdepth 1 -newer "$t/secrets" \( -name 'batch-*.md' -o -name '*-0[0-9]0-[a-z][a-z]-[a-d]' \) -exec rm -rf {} +   # only what this test made
 rc=$(STUB_WORK_IDLE_ROUND=2 run t6 "CAVEATS"); m=$(ls -d "$runs"/*-t6 | tail -1)
 check "$rc" 0 "t6 exit (caveats, idle revision ships)"; check "$(jq -r .judge.rounds "$m/manifest.json")" 1 "t6 rounds counts judged rounds only"
 rm -rf "$runs"/*-t[1-8]
-echo "ok: judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction), lint, sweep and batch (chain, refuted chain, max-tasks, stop-at, halt, no-chain)"
+echo "ok: judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction), lint and batch (chain, refuted chain, max-tasks, stop-at, halt, no-chain, continue)"
