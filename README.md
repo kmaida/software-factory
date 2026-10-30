@@ -4,9 +4,11 @@ A personal software factory on an isolated Mac mini. A task file names a repo, a
 
 ## Layout
 
-- `factory` — the orchestrator (bash 3.2, macOS). `factory run <task-file>`, `factory sweep [max]`, `factory report [n]`, `factory stop <run_id>`.
+- `factory` — the orchestrator (bash 3.2, macOS). `factory run <task-file>`, `factory lint [dir]`, `factory sweep [max]`, `factory report [n]`, `factory stop <run_id>`.
 - `Dockerfile` — the sandbox image: Node, git, Claude Code, Codex (pinned), non-root user. One entrypoint, three modes (`work`, `judge`, `push`), each run as its own container with exactly one secret over stdin. No `gh`: the push token can only push.
-- `judge-prompt.md` — what the Codex judge is told. Lives here, not in the target repo, so the worker cannot rewrite it.
+- `worker-prompt.md` — the house rules every worker round opens with: least code that satisfies "Done when", no speculative abstraction, one test per behaviour.
+- `judge-prompt.md` — what the Codex judge is told, including over-engineering as a finding. Both prompts live here, not in the target repo, so the worker cannot rewrite them.
+- `tasks.md` — how to write a task file: naming, stacking, the five-heading instructions body, sizing. `factory lint` checks the queue against it.
 - `test-factory.sh` — stubbed `docker`/`curl` check of the worker → judge → push loop.
 - `factory.md` — spec, Agent Baseline mapping, implementation notes, TODO.
 - `queue/` — task files, one JSON object each: `repo`, `base_branch`, `task_id`, `instructions`. `sweep` runs them in filename order and moves each to `queue/done/` or `queue/failed/`. Host state, not committed.
@@ -32,6 +34,7 @@ A personal software factory on an isolated Mac mini. A task file names a repo, a
 ```sh
 docker build -t factory-sandbox .
 FACTORY_SECRETS_DIR=~/factory-secrets ./factory run queue/<task>.json
+./factory lint                                                # the queue against tasks.md; sweep runs this first and refuses on problems (FACTORY_QUEUE=<dir> for another queue)
 FACTORY_SECRETS_DIR=~/factory-secrets ./factory sweep        # every queued task, one at a time, then a report
 ./factory report                                              # last 20 runs: exit, judge rounds, verdict, PR
 ./factory stop <run_id>
@@ -39,7 +42,7 @@ FACTORY_SECRETS_DIR=~/factory-secrets ./factory sweep        # every queued task
 
 ## Overnight
 
-Write the night's tasks as numbered files (`010-…json`, `020-…json`) so they run in order. A task that builds on an earlier one names that task's branch as its `base_branch` (`factory/010-…`); GitHub stacks the PRs and you merge them in order in the morning. If the earlier task fails or is refuted, its branch never appears and the dependent task fails at the clone, so the chain stops there. For a new project make the first task the test harness and CI, so the judge has checks to run. Start the sweep under `nohup` or in tmux, keep the mini awake, and read `factory report` with coffee. The factory never merges: one approval per PR is the gate.
+Write the night's tasks as numbered files (`010-…json`, `020-…json`) so they run in order. A task that builds on an earlier one names that task's branch as its `base_branch` (`factory/010-…`); GitHub stacks the PRs and you merge them in order in the morning. If the earlier task fails or is refuted, its branch is still pushed as evidence, so the sweep skips everything that depends on it and moves those tasks to `queue/failed/` unrun. For a new project make the first task the test harness and CI, so the judge has checks to run. Start the sweep under `nohup` or in tmux, keep the mini awake, and read `factory report` with coffee. The factory never merges: one approval per PR is the gate.
 
 `factory stop` kills the run's container, writes a `HALT` file that blocks further runs until a human removes it, and records the incident in the run log (and in the manifest when no live orchestrator will finalize it).
 
