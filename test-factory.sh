@@ -26,6 +26,7 @@ while [ $# -gt 0 ]; do case "$1" in
 IFS= read -r secret; echo "stub $mode secret=$secret"
 case "$mode" in
   work) cd "$work"; git checkout -q "factory/$TASK_ID" 2>/dev/null || git checkout -qb "factory/$TASK_ID" "origin/$BASE_BRANCH"
+        [ "${STUB_WORK_IDLE_ROUND:-0}" = "$(git rev-list --count "origin/$BASE_BRANCH..HEAD" | xargs -I{} expr {} + 1)" ] && exit 0
         [ "${STUB_WORK_FAIL_ROUND:-0}" = "$(git rev-list --count "origin/$BASE_BRANCH..HEAD" | xargs -I{} expr {} + 1)" ] && exit 7
         echo "${args[0]}" >> work.log; git add -A; git -c commit.gpgsign=false -c user.name=w -c user.email=w@w commit -qm "round";;
   judge) n=$(cat "$STUB_STATE" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_STATE"
@@ -61,5 +62,17 @@ grep -q 'REDACTED' "$m/log.jsonl" || { echo "FAIL: secret not redacted"; exit 1;
 ! grep -q 'stub-token\|dummy-openai_key\|dummy-github_token' "$m/log.jsonl" || { echo "FAIL: secret leaked into log"; exit 1; }
 rc=$(STUB_WORK_FAIL_ROUND=2 run t5 "REFUTED,VERIFIED"); m=$(ls -d "$runs"/*-t5 | tail -1)
 check "$rc" 7 "t5 exit is the failed worker's"; check "$(jq -r .final_sha "$m/manifest.json" | wc -c | tr -d ' ')" 41 "t5 branch still recorded (pushed)"; check "$(jq -r .pr_url "$m/manifest.json")" null "t5 no PR"
-rm -rf "$runs"/*-t[1-5]
-echo "ok: judge loop (revise, refuted, no verdict, caveats, failed revision, redaction)"
+# sweep: two queued tasks in name order; the first verifies (-> done/), the second is refuted three times (-> failed/).
+q="$here/queue"; rm -rf "$q"/done "$q"/failed
+for id in 010-sw-a 020-sw-b; do echo "{\"repo\":\"$t/remote.git\",\"base_branch\":\"main\",\"task_id\":\"$id\",\"instructions\":\"do\"}" > "$q/$id.json"; done
+rm -f "$t/state"; set +e
+PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_VERDICTS="VERIFIED,REFUTED,REFUTED,REFUTED" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 \
+  "$here/factory" sweep 2 > "$t/sweep.out" 2>&1; rc=$?; set -e   # max 2: never touch real task files that may sit in queue/
+m=$(ls -d "$runs"/*-020-sw-b | tail -1)
+check "$rc" 0 "sweep exit"; check "$(ls "$q"/done)" "010-sw-a.json" "sweep done/"; check "$(ls "$q"/failed)" "020-sw-b.json" "sweep failed/"
+check "$(grep -c 'sw-[ab] ' "$t/sweep.out")" 2 "sweep report lists both runs"; grep -q 'stopping after 2' "$t/sweep.out" || { echo "FAIL: sweep max"; exit 1; }
+rm -rf "$q"/done "$q"/failed "$runs"/*-0[12]0-sw-[ab]
+rc=$(STUB_WORK_IDLE_ROUND=2 run t6 "CAVEATS"); m=$(ls -d "$runs"/*-t6 | tail -1)
+check "$rc" 0 "t6 exit (caveats, idle revision ships)"; check "$(jq -r .judge.rounds "$m/manifest.json")" 1 "t6 rounds counts judged rounds only"
+rm -rf "$runs"/*-t[1-8]
+echo "ok: judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction) and sweep"

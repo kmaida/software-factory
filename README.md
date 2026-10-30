@@ -4,12 +4,12 @@ A personal software factory on an isolated Mac mini. A task file names a repo, a
 
 ## Layout
 
-- `factory` — the orchestrator (bash 3.2, macOS). `factory run <task-file>` and `factory stop <run_id>`.
+- `factory` — the orchestrator (bash 3.2, macOS). `factory run <task-file>`, `factory sweep [max]`, `factory report [n]`, `factory stop <run_id>`.
 - `Dockerfile` — the sandbox image: Node, git, Claude Code, Codex (pinned), non-root user. One entrypoint, three modes (`work`, `judge`, `push`), each run as its own container with exactly one secret over stdin. No `gh`: the push token can only push.
 - `judge-prompt.md` — what the Codex judge is told. Lives here, not in the target repo, so the worker cannot rewrite it.
 - `test-factory.sh` — stubbed `docker`/`curl` check of the worker → judge → push loop.
 - `factory.md` — spec, Agent Baseline mapping, implementation notes, TODO.
-- `queue/` — task files, one JSON object each: `repo`, `base_branch`, `task_id`, `instructions`. Host state, not committed.
+- `queue/` — task files, one JSON object each: `repo`, `base_branch`, `task_id`, `instructions`. `sweep` runs them in filename order and moves each to `queue/done/` or `queue/failed/`. Host state, not committed.
 - `runs/<run_id>/` — per-run evidence: `manifest.json`, `log.jsonl` and one `judge-<round>.md` per review. Host state, not committed.
 
 ## How a run works
@@ -32,8 +32,14 @@ A personal software factory on an isolated Mac mini. A task file names a repo, a
 ```sh
 docker build -t factory-sandbox .
 FACTORY_SECRETS_DIR=~/factory-secrets ./factory run queue/<task>.json
+FACTORY_SECRETS_DIR=~/factory-secrets ./factory sweep        # every queued task, one at a time, then a report
+./factory report                                              # last 20 runs: exit, judge rounds, verdict, PR
 ./factory stop <run_id>
 ```
+
+## Overnight
+
+Write the night's tasks as numbered files (`010-…json`, `020-…json`) so they run in order. A task that builds on an earlier one names that task's branch as its `base_branch` (`factory/010-…`); GitHub stacks the PRs and you merge them in order in the morning. If the earlier task fails or is refuted, its branch never appears and the dependent task fails at the clone, so the chain stops there. For a new project make the first task the test harness and CI, so the judge has checks to run. Start the sweep under `nohup` or in tmux, keep the mini awake, and read `factory report` with coffee. The factory never merges: one approval per PR is the gate.
 
 `factory stop` kills the run's container, writes a `HALT` file that blocks further runs until a human removes it, and records the incident in the run log (and in the manifest when no live orchestrator will finalize it).
 
