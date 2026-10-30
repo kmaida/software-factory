@@ -4,9 +4,11 @@ A personal software factory on an isolated Mac mini. A task file names a repo, a
 
 ## Layout
 
-- `factory` — the orchestrator (bash 3.2, macOS). `factory run <task-file>`, `factory sweep [max]`, `factory report [n]`, `factory stop <run_id>`.
+- `factory` — the orchestrator (bash 3.2, macOS). `factory run <task-file>`, `factory lint [dir]`, `factory sweep [max]`, `factory report [n]`, `factory stop <run_id>`.
 - `Dockerfile` — the sandbox image: Node, git, Claude Code, Codex (pinned), non-root user. One entrypoint, three modes (`work`, `judge`, `push`), each run as its own container with exactly one secret over stdin. No `gh`: the push token can only push.
-- `judge-prompt.md` — what the Codex judge is told. Lives here, not in the target repo, so the worker cannot rewrite it.
+- `worker-prompt.md` — the house rules every worker round opens with: least code that satisfies "Done when", no speculative abstraction, one test per behaviour.
+- `judge-prompt.md` — what the Codex judge is told, including over-engineering as a finding. Both prompts live here, not in the target repo, so the worker cannot rewrite them.
+- `tasks.md` — how to write a task file: naming, stacking, the five-heading instructions body, sizing. `factory lint` checks the queue against it.
 - `test-factory.sh` — stubbed `docker`/`curl` check of the worker → judge → push loop.
 - `factory.md` — spec, Agent Baseline mapping, implementation notes, TODO.
 - `queue/` — task files, one JSON object each: `repo`, `base_branch`, `task_id`, `instructions`. `sweep` runs them in filename order and moves each to `queue/done/` or `queue/failed/`. Host state, not committed.
@@ -32,6 +34,7 @@ A personal software factory on an isolated Mac mini. A task file names a repo, a
 ```sh
 docker build -t factory-sandbox .
 FACTORY_SECRETS_DIR=~/factory-secrets ./factory run queue/<task>.json
+./factory lint                                                # the queue against tasks.md; sweep runs this first and refuses on problems
 FACTORY_SECRETS_DIR=~/factory-secrets ./factory sweep        # every queued task, one at a time, then a report
 ./factory report                                              # last 20 runs: exit, judge rounds, verdict, PR
 ./factory stop <run_id>

@@ -105,7 +105,9 @@ Status is Implemented, Partial, or Planned. Each has a check that proves it. (re
 
 - `factory.md`: this spec.
 - `Dockerfile`: the sandbox image; one entrypoint with three modes (`work`, `judge`, `push`), one container per step.
-- `judge-prompt.md`: the judge's instructions, read from this checkout, never from the target repo.
+- `worker-prompt.md`: the house rules prepended to every worker round (least code that satisfies "Done when"; no speculative abstraction; one test per behaviour; no new dependencies), read from this checkout.
+- `judge-prompt.md`: the judge's instructions, read from this checkout, never from the target repo. Over-engineering is a finding with the weight of a bug and earns CAVEATS, so bloat costs the worker a revision round.
+- `tasks.md`: task-writing conventions for unattended runs; `factory lint` checks a queue against them and `sweep` refuses to start on problems.
 - `factory`: orchestrator script (`run`, `sweep`, `report`, `stop`). `sweep` runs every `queue/*.json` in filename order through `run`, moving each to `queue/done/` (exit 0) or `queue/failed/` (anything else), stops on `HALT` or after `max` tasks, and ends with `report`. `run` exits with the worker's status, or 3 when the agent produced no commits (nothing pushed), 4 when the branch was pushed but opening the PR failed, 5 when the judge refuted the final round (pushed, no PR), 6 when the judge gave no verdict (pushed, no PR).
 - `test-factory.sh`: runs the orchestrator against stubbed `docker` and `curl` and checks the revise / refuted / no-verdict / caveats paths and log redaction.
 - `queue/`, `runs/`: task intake and per-run evidence. Not in the image.

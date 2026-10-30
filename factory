@@ -1,6 +1,7 @@
 #!/bin/bash
 # factory: orchestrator for the software factory. See factory.md.
 #   factory run <task-file>   validate job, mint run, docker run the sandbox, write manifest + log
+#   factory lint [dir]        check queue/*.json against tasks.md before a sweep
 #   factory sweep [max]       run every queue/*.json in name order; each moves to queue/done/ or queue/failed/
 #   factory report [n]        one line per run from the manifests: exit, judge rounds, verdict, PR
 #   factory stop <run_id>     kill the container, block new dispatch, record the incident
@@ -29,7 +30,9 @@ OPENAI_RESOURCE="https://api.openai.com"       # Keycard Vault API Token credent
 MAX_ROUNDS=3                                   # worker -> judge rounds before the verdict is final
 
 die()   { echo "factory: $*" >&2; exit 1; }
-usage() { echo "usage: factory run <task-file> | factory sweep [max] | factory report [n] | factory stop <run_id>" >&2; exit 2; }
+usage() { echo "usage: factory run <task-file> | factory lint [dir] | factory sweep [max] | factory report [n] | factory stop <run_id>" >&2; exit 2; }
+# Job schema: exactly these four keys, all non-empty strings. Everything else is derived by the orchestrator.
+JOB_SCHEMA='type=="object" and (keys|sort)==["base_branch","instructions","repo","task_id"] and all(.[]; type=="string" and length>0)'
 now()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # ---------------------------------------------------------------- run
@@ -133,9 +136,7 @@ cmd_run() {
     [ -s "$FACTORY_SECRETS_DIR/$t" ] || die "missing or empty token file: $FACTORY_SECRETS_DIR/$t"
   done
 
-  # Validate the job: exactly these four keys, all non-empty strings. Everything else is derived here.
-  jq -e 'type=="object" and (keys|sort)==["base_branch","instructions","repo","task_id"] and all(.[]; type=="string" and length>0)' \
-    "$task" >/dev/null 2>&1 || die "invalid task file: need exactly {repo, base_branch, task_id, instructions}, all non-empty strings"
+  jq -e "$JOB_SCHEMA" "$task" >/dev/null 2>&1 || die "invalid task file: need exactly {repo, base_branch, task_id, instructions}, all non-empty strings"
   repo=$(jq -r .repo "$task"); base_branch=$(jq -r .base_branch "$task")
   task_id=$(jq -r .task_id "$task"); instructions=$(jq -r .instructions "$task")
   [[ "$task_id" =~ ^[A-Za-z0-9._-]+$ ]] || die "task_id must match [A-Za-z0-9._-]+"
@@ -153,7 +154,7 @@ cmd_run() {
     https://github.com/*) ;;
     *) for t in github_token openai_key; do [ -s "$FACTORY_SECRETS_DIR/$t" ] || die "missing or empty token file: $FACTORY_SECRETS_DIR/$t"; done ;;
   esac
-  [ -s "$FACTORY_DIR/judge-prompt.md" ] || die "missing $FACTORY_DIR/judge-prompt.md"
+  for f in worker-prompt.md judge-prompt.md; do [ -s "$FACTORY_DIR/$f" ] || die "missing $FACTORY_DIR/$f"; done
 
   image_digest=$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null) || die "image $IMAGE not built; run: docker build -t $IMAGE ."
   # Which factory ran: this checkout's commit. The definition changes only by reviewed PR and `git pull`; a dirty tree is not that.
@@ -219,8 +220,9 @@ cmd_run() {
   # Nothing is pushed until the rounds are over, so no human sees the code before the judge has.
   round=1 verdict= findings= head= prev_head= status=0
   while :; do
-    prompt="$instructions"
-    [ -n "$findings" ] && prompt="$instructions"$'\n\n'"## Review of your previous attempt (round $((round-1)) verdict: $verdict)"$'\n'"The reviewer refused the branch as it stands. Fix every finding below on the current branch, keep the task's scope, and commit. Findings:"$'\n'"$findings"
+    # Every worker round opens with the house rules (least code that satisfies "Done when"), read from this checkout like the judge prompt.
+    prompt="$(cat "$FACTORY_DIR/worker-prompt.md")"$'\n\n'"## Task"$'\n'"$instructions"
+    [ -n "$findings" ] && prompt="$prompt"$'\n\n'"## Review of your previous attempt (round $((round-1)) verdict: $verdict)"$'\n'"The reviewer refused the branch as it stands. Fix every finding below on the current branch, keep the task's scope, and commit. Findings:"$'\n'"$findings"
     an_tok=$(anthropic_token) || an_tok=; [ -n "$an_tok" ] || die "Anthropic did not exchange the Keycard token (rule $ANTHROPIC_FEDERATION_RULE, workspace $ANTHROPIC_WORKSPACE)"
     log "round $round: anthropic_token issued (Keycard $KEYCARD_ZONE -> Anthropic WIF rule $ANTHROPIC_FEDERATION_RULE, workspace $ANTHROPIC_WORKSPACE); ttl ${TIMEOUT_SEC}s"
     run_container work "$an_tok" -v "$work":/work -- "$prompt"; an_tok=
@@ -288,11 +290,37 @@ cmd_run() {
   exit "$status"
 }
 
+# ---------------------------------------------------------------- lint
+cmd_lint() {  # factory lint [dir]: the conventions in tasks.md that a sleeping operator cannot enforce. Exit 1 on any problem.
+  dir="${1:-$FACTORY_DIR/queue}"; bad=0; seen=
+  for f in "$dir"/*.json; do
+    [ -e "$f" ] || { echo "no task files in $dir"; return 0; }
+    name=$(basename "$f" .json); p=
+    if ! jq -e "$JOB_SCHEMA" "$f" >/dev/null 2>&1; then p="$p; not {repo, base_branch, task_id, instructions}, all non-empty strings"
+    else
+      id=$(jq -r .task_id "$f"); base=$(jq -r .base_branch "$f")
+      [ "$id" = "$name" ] || p="$p; task_id '$id' is not the filename"
+      jq -e '.instructions | test("Done when")' "$f" >/dev/null || p="$p; instructions have no \"Done when\""
+      case "$base" in
+        factory/*) dep=${base#factory/}
+                   case " $seen " in *" $dep "*) ;;   # an earlier task in this queue
+                     *) if [ -e "$dir/$dep.json" ]; then p="$p; base_branch $base is a later task in the queue"; else echo "$name: base_branch $base is not in the queue; it must already exist on the repo"; fi ;;
+                   esac ;;
+      esac
+      seen="$seen $id"
+    fi
+    [ -z "$p" ] || { echo "$name:${p#;}"; bad=1; }
+  done
+  [ "$bad" -eq 0 ] && echo "lint ok: $(echo $seen | wc -w | tr -d ' ') task(s)"
+  return "$bad"
+}
+
 # ---------------------------------------------------------------- sweep
 cmd_sweep() {  # factory sweep [max]: the overnight loop. Tasks run one at a time in filename order (prefix them 010-, 020-, ...).
   # Exit 0 moves the file to queue/done/, anything else to queue/failed/; the manifest has the detail. A task whose base branch is a
   # factory/<task> branch that was refuted or failed will itself fail at the clone ("base branch not found"), so a chain stops cleanly.
   max="${1:-50}"; n=0
+  [ "${FACTORY_LINT_SKIP:-}" = 1 ] || cmd_lint "$FACTORY_DIR/queue" || die "fix the queue before sweeping (see tasks.md), or FACTORY_LINT_SKIP=1 to run anyway"
   for task in "$FACTORY_DIR"/queue/*.json; do
     [ -e "$task" ] || { echo "queue is empty"; break; }
     [ -e "$HALT" ] && { echo "halted by $HALT; $(ls "$FACTORY_DIR"/queue/*.json 2>/dev/null | wc -l | tr -d ' ') task(s) left in queue"; break; }
@@ -347,6 +375,7 @@ EOF
 
 case "${1:-}" in
   run)    shift; cmd_run "$@" ;;
+  lint)   shift; cmd_lint "$@" ;;
   sweep)  shift; cmd_sweep "$@" ;;
   report) shift; cmd_report "$@" ;;
   stop)   shift; cmd_stop "$@" ;;
