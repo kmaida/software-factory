@@ -4,7 +4,7 @@ A task is one JSON file in `queue/`: `{repo, base_branch, task_id, instructions}
 
 ## Files and ids
 
-- Filename is `<task_id>.json`, and `task_id` starts with a number so the night runs in order: `010-scaffold`, `020-schema`, `030-auth-api`.
+- Filename is `<task_id>.json`, and `task_id` starts with a number so the night runs in order: `010-scaffold`, `020-schema`, `030-auth-api`. A task split after numbering takes a letter after the number, `019a-proxy`, `019b-accounting`, and still sorts into place.
 - `base_branch` is `main` for work that stands alone, or `factory/<earlier task_id>` for work that builds on an earlier task. GitHub stacks the pull requests and retargets each one to `main` as you merge in order. In chain mode `factory batch` cuts each task's branch from the previous task's branch regardless, but opens the PR against the `base_branch` written here, so a stacked PR shows the earlier task's commits until that task merges (a PR opened against `factory/<prev>` would fail with 422 once that branch is merged and auto-deleted). Write `main` unless the PR itself must target an unmerged branch. A refuted or failed task still pushes its branch as evidence; `batch` stops there, or with `--continue` skips every task that depends on it, directly or through another skipped task, and moves them to `queue/failed/` unrun. A base that is not in tonight's queue is trusted to exist on the repo already.
 - Independent tasks should all use `main`, so one refutation does not block them.
 
@@ -41,7 +41,7 @@ Every worker round starts with `worker-prompt.md`: least code that satisfies "Do
 ## Before bed
 
 ```sh
-./factory lint          # schema, <number>-<name> ids, filename = task_id, the five headings in order, base_branch order
+./factory lint          # schema, <number>-<name> ids (a letter after the number for a split task), filename = task_id, the five headings in order, base_branch order
 ./factory batch         # runs lint first and refuses to start on any problem
 ```
 

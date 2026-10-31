@@ -369,7 +369,7 @@ cmd_lint() {  # factory lint [dir]: the conventions in tasks.md that a sleeping 
     else
       id=$(jq -r .task_id "$f"); base=$(jq -r .base_branch "$f")
       [ "$id" = "$name" ] || p="$p; task_id '$id' is not the filename"
-      [[ "$id" =~ $ID_RE && "$id" =~ ^[0-9]+- ]] || p="$p; task_id must be <number>-<name> matching $ID_RE"
+      [[ "$id" =~ $ID_RE && "$id" =~ ^[0-9]+[a-z]?- ]] || p="$p; task_id must be <number>-<name> (or <number><letter>-<name> for a split task: 019a-x, 019b-y) matching $ID_RE"
       [[ "$base" =~ $BRANCH_RE ]] || p="$p; base_branch has unexpected characters"
       # The five headings of tasks.md, each at the start of a line, in order, and something after "Done when:".
       jq -e '.instructions | test("(^|\n)Goal:[\\s\\S]*\nContext:[\\s\\S]*\nScope:[\\s\\S]*\nDone when:[ \t]*\\S[\\s\\S]*\nOut of scope:")' "$f" >/dev/null \
