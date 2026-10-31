@@ -139,7 +139,7 @@ run_container() {  # run_container <mode> <secret> [docker args...] -- [entrypoi
   printf '%s\n' "$secret" \
   | docker run -i --name "$cname" --label "factory.run=$run_id" --rm --read-only --tmpfs /tmp --tmpfs /run/secrets:size=64k \
     --memory 4g --cpus 2 --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges \
-    -e MODE="$mode" -e TASK_ID="$task_id" -e BASE_BRANCH="$base_branch" "${dargs[@]}" "$image_digest" "$@" 2>&1 \
+    -e MODE="$mode" -e TASK_ID="$task_id" -e BASE_BRANCH="$from_branch" "${dargs[@]}" "$image_digest" "$@" 2>&1 \
   | while IFS= read -r line || [ -n "$line" ]; do
       line=${line//"$secret"/[REDACTED]}; line=${line//"$b64"/[REDACTED]}; printf '%s\n' "$line"
     done \
@@ -169,6 +169,10 @@ cmd_run() {
   task_id=$(jq -r .task_id "$task"); instructions=$(jq -r .instructions "$task")
   [[ "$task_id" =~ $ID_RE ]] || die "task_id must match $ID_RE"
   [[ "$base_branch" =~ $BRANCH_RE ]] || die "base_branch has unexpected characters"
+  # Chain mode (set by batch): the branch is cut from the previous task's branch, but the PR still targets the task's own
+  # base_branch. A PR whose base is factory/<prev> dies with 422 "base ref not found" once that branch is merged and auto-deleted.
+  chain_base="${FACTORY_CHAIN_BASE:-}"; [ -z "$chain_base" ] || [[ "$chain_base" =~ $BRANCH_RE ]] || die "FACTORY_CHAIN_BASE has unexpected characters"
+  from_branch="${chain_base:-$base_branch}"
   case "$repo" in
     https://github.com/*) repo="${repo#https://github.com/}"; repo="${repo%/}"; repo="${repo%.git}" ;;   # normalise to owner/name
     https://*|/*) repo_url="$repo" ;;                                   # other URL or local path (dry runs)
@@ -203,7 +207,7 @@ cmd_run() {
   echo "run $run_id"; echo "  evidence: $rundir"
   # Manifest exists from the first moment there is a run, before any credential is issued; later steps fill it in.
   jq -n --arg run_id "$run_id" --arg task_id "$task_id" --arg job "$(shasum -a 256 "$task" | cut -d' ' -f1)" \
-        --arg repo "$repo" --arg base_branch "$base_branch" --arg cb "${FACTORY_CHAIN_BASE:-}" \
+        --arg repo "$repo" --arg base_branch "$base_branch" --arg cb "$chain_base" \
         --arg image "$image_digest" --arg fc "$factory_commit" --arg started "$(now)" --arg kz "$KEYCARD_ZONE" \
     '{run_id:$run_id, task_id:$task_id, job_sha256:$job, repo:$repo, base_branch:$base_branch, chain_base:(if $cb=="" then null else $cb end), base_sha:null,
       image_digest:$image, factory_commit:(if $fc=="" then null else $fc end), keycard_zone:$kz,
@@ -228,7 +232,7 @@ cmd_run() {
   git -c credential.helper= \
       -c credential.helper='!f() { h=; while IFS= read -r l; do case "$l" in host=*) h=${l#host=};; esac; done; [ "$h" = github.com ] || exit 0; echo username=x-access-token; echo "password=$(cat <&3)"; }; f' \
     clone -q "$repo_url" "$work" 3< <(printf '%s' "$gh_tok") || die "clone failed: $repo_url"
-  base_sha=$(git -C "$work" rev-parse "origin/$base_branch" 2>/dev/null) || die "base branch not found: $base_branch"
+  base_sha=$(git -C "$work" rev-parse "origin/$from_branch" 2>/dev/null) || die "base branch not found: $from_branch"
   log "cloned $repo_url at $base_sha"
   manifest_set '. + {base_sha:$sha}' --arg sha "$base_sha"
   if git -C "$work" rev-parse --verify -q "origin/factory/$task_id" >/dev/null; then
@@ -345,9 +349,9 @@ cmd_lint() {  # factory lint [dir]: the conventions in tasks.md that a sleeping 
 
 # ---------------------------------------------------------------- batch
 cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--no-chain] [--continue]: the overnight loop.
-  # Tasks run in filename order under one lock. Chain mode (default): every task after a successful one bases on
-  # factory/<previous task_id>, so the night ends as a stack of judged PRs to merge bottom-up; the rewritten base_branch lives in a
-  # temp copy of the task file under $TMPDIR, the file on disk is never changed. Any exit but 0 stops the batch: that task goes to
+  # Tasks run in filename order under one lock. Chain mode (default): every task after a successful one cuts its branch from
+  # factory/<previous task_id> (passed to run as FACTORY_CHAIN_BASE; the task file is never changed), while its PR still targets the
+  # task's own base_branch, so a merged-and-deleted chain head cannot break a later PR. Any exit but 0 stops the batch: that task goes to
   # <queue-dir>/failed/, every later one stays in the queue untouched. With --continue the batch goes on instead: a failed run still
   # pushes its branch (evidence), so every later task whose base names a task that failed tonight is moved to failed/ unrun, and the
   # chain resumes from the next task's own base_branch. HALT between tasks stops the batch either way. Exit 0 moves a task to
@@ -364,23 +368,21 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
   [ -z "$chain" ] || [ "$(jq -r .repo "$dir"/*.json 2>/dev/null | sort -u | wc -l)" -le 1 ] || die "a chained queue targets one repo; use --no-chain"
   batch_id="batch-$(date -u +%Y%m%dT%H%M%SZ)"; report="$RUNS/$batch_id.md"
   take_lock; echo "$batch_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"
-  tmpjob=; trap 'rm -rf "$LOCK" ${tmpjob:+"$tmpjob"}' EXIT; trap 'exit 130' INT TERM
+  trap 'rm -rf "$LOCK"' EXIT; trap 'exit 130' INT TERM
   rows= prev= why= failed=" " n=0 fail=0
   for task in "$dir"/*.json; do
     [ -e "$task" ] || { why="queue is empty"; break; }
     [ -e "$HALT" ] && { why="halted by $HALT ($(cat "$HALT"))"; break; }
     [ -z "$max" ] || [ "$n" -lt "$max" ] || { why="--max-tasks $max reached"; break; }
     [ -z "$deadline" ] || [ "$(date +%s)" -lt "$deadline" ] || { why="--stop-at $stop_at passed"; break; }
-    name=$(basename "$task" .json); id=$(jq -r .task_id "$task"); base=$(jq -r .base_branch "$task"); cb=; job="$task"
+    name=$(basename "$task" .json); id=$(jq -r .task_id "$task"); base=$(jq -r .base_branch "$task"); cb=
     [ -z "$chain" ] || [ -z "$prev" ] || { cb="factory/$prev"; base="$cb"; }
     case "$failed" in *" ${base#factory/} "*)   # --continue: its base failed tonight (branch pushed as evidence); do not build on it
       echo "== $name: skipped, its base $base failed in this batch"; rows="$rows| - | skipped | - | - | - | $base | - |"$'\n'
       failed="$failed$id "; mkdir -p "$dir/failed"; mv "$task" "$dir/failed/$batch_id-$name.json"; continue ;;
     esac
-    if [ -n "$cb" ]; then tmpjob=$(mktemp "${TMPDIR:-/tmp}/factory-task.XXXXXX"); job="$tmpjob"; jq --arg b "$cb" '.base_branch=$b' "$task" > "$job"; fi
     echo "== $name ($(now))${cb:+, base $cb}"
-    t0=$(date +%s); rc=0; FACTORY_BATCH=$$ FACTORY_CHAIN_BASE="$cb" "$0" run "$job" || rc=$?
-    [ -z "$tmpjob" ] || rm -f "$tmpjob"; tmpjob=
+    t0=$(date +%s); rc=0; FACTORY_BATCH=$$ FACTORY_CHAIN_BASE="$cb" "$0" run "$task" || rc=$?
     # The run left its id in the borrowed lock; take the lock back at once, so a later `factory stop <that run>` signals nothing
     # and a run that dies before it takes the lock (docker down) cannot be mistaken for the previous one.
     run_id=$(cat "$LOCK/run_id"); echo "$batch_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"; m="$RUNS/$run_id/manifest.json"

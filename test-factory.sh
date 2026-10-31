@@ -20,7 +20,7 @@ for a in "$@"; do case "$a" in
   resource=urn:factory:github-app-key) echo "{\"access_token\":\"$(cat "$STUB_APP_KEY")\"}"; exit 0;;
   */installation) if [ "${STUB_INSTALL_404:-}" = 1 ]; then printf '{"message":"Not Found"}'; code 404; else printf '{"id":424242}'; code 200; fi;;
   */access_tokens) [ -z "${STUB_MINTS:-}" ] || printf '%s\n' "$d" >> "$STUB_MINTS"; echo '{"token":"stub-installation-token"}'; exit 0;;
-  */pulls) if [ "${STUB_PR_FAIL:-}" = 1 ]; then printf '{"message":"Validation Failed","errors":[{"message":"A pull request already exists for o:factory/gh3."}]}'; code 422; else printf '{"html_url":"https://github.com/o/r/pull/1"}'; code 201; fi;;
+  */pulls) [ -z "${STUB_PRS:-}" ] || printf '%s\n' "$d" >> "$STUB_PRS"; if [ "${STUB_PR_FAIL:-}" = 1 ]; then printf '{"message":"Validation Failed","errors":[{"message":"A pull request already exists for o:factory/gh3."}]}'; code 422; else printf '{"html_url":"https://github.com/o/r/pull/1"}'; code 201; fi;;
 esac; done
 echo '{"access_token":"stub-token"}'
 C
@@ -87,8 +87,8 @@ set +e; out=$("$here/factory" lint "$t/lint-bad"); rc=$?; set -e
 check "$rc" 1 "lint bad exit"; check "$(printf '%s\n' "$out" | grep -c '^0[12]0-[ab]:')" 2 "lint bad reports the two broken files"
 printf '%s\n' "$out" | grep -q "010-a: task_id '010-x' is not the filename; base_branch factory/030-c is a later task in the queue" || { echo "FAIL: lint messages: $out"; exit 1; }
 printf '%s\n' "$out" | grep -q "020-b: instructions need the headings" || { echo "FAIL: lint headings message: $out"; exit 1; }
-# batch: a three-task chain. 020 and 030 run with base_branch rewritten to the previous task's branch (the files on disk are not
-# touched: same bytes after the move to done/), chain_base is in the manifest, and the batch report has one row per task.
+# batch: a three-task chain. 020 and 030 cut their branch from the previous task's branch (the files on disk are not touched: same
+# bytes after the move to done/), base_branch stays the task's own and chain_base is in the manifest, and the report has one row per task.
 batch() {  # batch <queue-dir> <verdicts> [flags...] -> exit status; output in $t/batch.out
   rm -f "$t/state"; set +e
   PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 \
@@ -102,8 +102,9 @@ rc=$(batch "$t/ch" "VERIFIED,VERIFIED,VERIFIED")
 check "$rc" 0 "chain exit"; check "$(moved ch/done)" "010-ch-a.json 020-ch-b.json 030-ch-c.json " "chain done/"; check "$(moved ch)" "done " "chain queue empty"
 check "$(shasum "$t/ch"/done/*.json | cut -d' ' -f1)" "$sums" "chain task files byte-identical"
 m=$(ls -d "$runs"/*-010-ch-a | tail -1); check "$(jq -r '"\(.base_branch) \(.chain_base)"' "$m/manifest.json")" "main null" "chain 010 on its own base"
-m=$(ls -d "$runs"/*-020-ch-b | tail -1); check "$(jq -r '"\(.base_branch) \(.chain_base)"' "$m/manifest.json")" "factory/010-ch-a factory/010-ch-a" "chain 020 rebased"
+m=$(ls -d "$runs"/*-020-ch-b | tail -1); check "$(jq -r '"\(.base_branch) \(.chain_base)"' "$m/manifest.json")" "main factory/010-ch-a" "chain 020 cut from the chain head, PR base its own"
 m=$(ls -d "$runs"/*-030-ch-c | tail -1); check "$(jq -r .chain_base "$m/manifest.json")" "factory/020-ch-b" "chain 030 rebased"
+git -C "$t/remote.git" merge-base --is-ancestor refs/heads/factory/010-ch-a refs/heads/factory/020-ch-b || { echo "FAIL: chain 020 branch not cut from 010"; exit 1; }
 check "$(jq -r .base_branch "$t/ch/done/"*-020-ch-b.json)" main "chain 020 file on disk unchanged"
 rep=$(ls "$runs"/batch-*.md | tail -1); check "$(grep -c '^| [0-9]' "$rep")" 3 "batch report rows"; grep -q 'factory/020-ch-b | ' "$rep" || { echo "FAIL: report chain base"; cat "$rep"; exit 1; }
 grep -q '^All tasks ran\.' "$rep" && grep -q 'chain: on,' "$rep" || { echo "FAIL: report end"; cat "$rep"; exit 1; }; grep -q "^report: $rep" "$t/batch.out" || { echo "FAIL: report path not printed"; exit 1; }
@@ -156,6 +157,14 @@ check "$(jq -r .pr_error.status "$m/manifest.json")" 422 "gh3 pr_error.status in
 check "$(jq -r .pr_error.body "$m/manifest.json" | jq -r '.errors[0].message')" "A pull request already exists for o:factory/gh3." "gh3 pr_error.body in manifest"
 jq -r 'select(.event.type=="factory") | .event.text' "$m/log.jsonl" | grep -q 'POST /repos/o/r/pulls failed: HTTP 422 .*already exists' || { echo "FAIL: gh3 status/body not in log"; cat "$m/log.jsonl"; exit 1; }
 ! grep -q 'stub-installation-token' "$m/log.jsonl" "$m/manifest.json" || { echo "FAIL: gh3 token leaked"; exit 1; }
+# Chain against GitHub: 020 cuts its branch from factory/010-gc-a but both PRs are opened with base main (the task's own base_branch),
+# so a chain head merged and auto-deleted while the next task runs cannot make POST /pulls 422 "base ref not found".
+mkdir -p "$t/gc"; task o/r main 010-gc-a "$body" "$t/gc"; task o/r main 020-gc-b "$body" "$t/gc"
+rc=$(STUB_APP_KEY="$t/app-key.b64" STUB_PRS="$t/prs" batch "$t/gc" "VERIFIED,VERIFIED")
+check "$rc" 0 "gh chain exit"; check "$(jq -r .base "$t/prs" | tr '\n' ' ')" "main main " "gh chain PRs both target main"
+check "$(jq -r .head "$t/prs" | tr '\n' ' ')" "factory/010-gc-a factory/020-gc-b " "gh chain PR heads"
+m=$(ls -d "$runs"/*-020-gc-b | tail -1); check "$(jq -r '"\(.base_branch) \(.chain_base)"' "$m/manifest.json")" "main factory/010-gc-a" "gh chain 020 manifest"
+git -C "$t/remote.git" merge-base --is-ancestor refs/heads/factory/010-gc-a refs/heads/factory/020-gc-b || { echo "FAIL: gh chain 020 not cut from 010"; exit 1; }
 unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
 
-echo "ok: judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction), lint and batch (chain, refuted chain, max-tasks, stop-at, halt, no-chain, continue), GitHub App (installation lookup, 404, failed PR open)"
+echo "ok: judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction), lint and batch (chain, refuted chain, max-tasks, stop-at, halt, no-chain, continue), GitHub App (installation lookup, 404, failed PR open, chained PRs target base_branch)"
