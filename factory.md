@@ -39,7 +39,7 @@ The **orchestrator** on the mini is the trust boundary, not the container. It re
 
 ### 4. Run manifest and log (review)
 
-- `runs/<run_id>/manifest.json`: job hash, repo, base commit SHA, image digest, model and Claude Code version, Keycard grant id, start/end time, final commit SHA, PR URL, exit status.
+- `runs/<run_id>/manifest.json`: job hash, repo, base commit SHA, image digest, model and Claude Code version, Keycard grant id, start/end time, final commit SHA, PR URL (or `pr_error` with the HTTP status and body when opening it failed), exit status.
 - `runs/<run_id>/log.jsonl`: one line per tool call and per token issue, with run id, timestamp, tool, redacted arguments, exit status. Written by the orchestrator from the agent's stream, so the agent cannot rewrite it.
 - Keycard zone audit covers the authorization side.
 

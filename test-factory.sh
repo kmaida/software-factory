@@ -20,7 +20,7 @@ for a in "$@"; do case "$a" in
   resource=urn:factory:github-app-key) echo "{\"access_token\":\"$(cat "$STUB_APP_KEY")\"}"; exit 0;;
   */installation) if [ "${STUB_INSTALL_404:-}" = 1 ]; then printf '{"message":"Not Found"}'; code 404; else printf '{"id":424242}'; code 200; fi;;
   */access_tokens) echo '{"token":"stub-installation-token"}'; exit 0;;
-  */pulls) echo '{"html_url":"https://github.com/o/r/pull/1"}'; exit 0;;
+  */pulls) if [ "${STUB_PR_FAIL:-}" = 1 ]; then printf '{"message":"Validation Failed","errors":[{"message":"A pull request already exists for o:factory/gh3."}]}'; code 422; else printf '{"html_url":"https://github.com/o/r/pull/1"}'; code 201; fi;;
 esac; done
 echo '{"access_token":"stub-token"}'
 C
@@ -146,6 +146,13 @@ check "$(jq -r .pr_url "$m/manifest.json")" https://github.com/o/r/pull/1 "gh1 P
 rc=$(RUN_REPO=o/r STUB_INSTALL_404=1 run gh2 VERIFIED); m=$(ls -d "$runs"/*-gh2 | tail -1)
 check "$rc" 1 "gh2 exit (404 fails closed)"; grep -q 'not installed on o/r' "$t/gh2.out" || { echo "FAIL: gh2 404 message"; cat "$t/gh2.out"; exit 1; }
 check "$(jq -r .installation_id "$m/manifest.json")" null "gh2 no installation recorded"; check "$(jq -r .base_sha "$m/manifest.json")" null "gh2 never cloned"
+# A failed PR open exits 4 and leaves the HTTP status and body in the log and the manifest, so the operator can tell why.
+rc=$(RUN_REPO=o/r STUB_PR_FAIL=1 run gh3 VERIFIED); m=$(ls -d "$runs"/*-gh3 | tail -1)
+check "$rc" 4 "gh3 exit (PR open failed)"; check "$(jq -r .pr_url "$m/manifest.json")" null "gh3 no PR"
+check "$(jq -r .pr_error.status "$m/manifest.json")" 422 "gh3 pr_error.status in manifest"
+check "$(jq -r .pr_error.body "$m/manifest.json" | jq -r '.errors[0].message')" "A pull request already exists for o:factory/gh3." "gh3 pr_error.body in manifest"
+jq -r 'select(.event.type=="factory") | .event.text' "$m/log.jsonl" | grep -q 'POST /repos/o/r/pulls failed: HTTP 422 .*already exists' || { echo "FAIL: gh3 status/body not in log"; cat "$m/log.jsonl"; exit 1; }
+! grep -q 'stub-installation-token' "$m/log.jsonl" "$m/manifest.json" || { echo "FAIL: gh3 token leaked"; exit 1; }
 unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
 
-echo "ok: judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction), lint and batch (chain, refuted chain, max-tasks, stop-at, halt, no-chain, continue), GitHub App (installation lookup, 404)"
+echo "ok: judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction), lint and batch (chain, refuted chain, max-tasks, stop-at, halt, no-chain, continue), GitHub App (installation lookup, 404, failed PR open)"
