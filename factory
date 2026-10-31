@@ -37,6 +37,10 @@ usage() { echo "usage: factory run <task-file> | factory lint [dir] | factory ba
 JOB_SCHEMA='type=="object" and (keys|sort)==["base_branch","instructions","repo","task_id"] and all(.[]; type=="string" and length>0)'
 ID_RE='^[A-Za-z0-9._-]+$'; BRANCH_RE='^[A-Za-z0-9._/-]+$'
 now()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
+notify() {  # notify <line>: POST "<batch_id>: <line>" to FACTORY_NOTIFY_URL when set. URL and body via curl config on stdin, not argv (the URL may carry a token).
+  [ -n "${FACTORY_NOTIFY_URL:-}" ] || return 0
+  printf 'url = "%s"\ndata = "%s"\n' "$FACTORY_NOTIFY_URL" "$batch_id: $1" | curl -s -m 10 -o /dev/null -K - || true   # best effort: a dead webhook never stops the batch
+}
 
 # ---------------------------------------------------------------- run
 run_id= work= jwork= jout= logf= borrowed=
@@ -408,7 +412,7 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
   batch_id="batch-$(date -u +%Y%m%dT%H%M%SZ)"; report="$RUNS/$batch_id.md"; mkdir -p "$RUNS"
   take_lock; echo "$batch_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"
   trap 'rm -rf "$LOCK"' EXIT; trap 'exit 130' INT TERM
-  rows= prev= why= failed=" " n=0 fail=0
+  rows= prev= why= failed=" " n=0 fail=0 prs=0 nfail=0
   for task in "$dir"/*.json; do
     [ -e "$task" ] || { why="queue is empty"; break; }
     [ -e "$HALT" ] && { why="halted by $HALT ($(cat "$HALT"))"; break; }
@@ -433,18 +437,18 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
       cells=$(jq -r '[(.exit_status // "running" | tostring), (.judge.rounds // "-" | tostring), (.judge.verdict // "-"), (.pr_url // "-")] | join(" | ")' "$m")
     else run_id="$batch_id-$name"; cells="$rc | - | - | -"; fi   # died before it was a run (bad task file, docker down)
     rows="$rows| $run_id | $cells | ${cb:--} | $(( $(date +%s) - t0 ))s |"$'\n'; n=$((n+1))
-    if [ "$rc" -ne 0 ] && [ -n "${FACTORY_NOTIFY_URL:-}" ]; then   # one line to a webhook; URL and body via curl config on stdin, not argv (the URL may carry a token)
-      printf 'url = "%s"\ndata = "%s"\n' "$FACTORY_NOTIFY_URL" "$batch_id: $name exited $rc ($(awk -F' [|] ' '{print $3}' <<< "$cells"), $([ -n "$cont" ] && echo continuing || echo stopped))" \
-        | curl -s -m 10 -o /dev/null -K - || true   # best effort: a dead webhook never stops the batch
-    fi
-    if [ "$rc" -eq 0 ]; then dest=done; prev=$id; else dest=failed; prev=; failed="$failed$id "; fail=$rc; fi
+    [ "$rc" -eq 0 ] || notify "$name exited $rc ($(awk -F' [|] ' '{print $3}' <<< "$cells"), $([ -n "$cont" ] && echo continuing || echo stopped))"
+    [ "${cells##* | }" = - ] || prs=$((prs+1))   # the row's last cell is the PR URL or -
+    if [ "$rc" -eq 0 ]; then dest=done; prev=$id; else dest=failed; prev=; failed="$failed$id "; fail=$rc; nfail=$((nfail+1)); fi
     mkdir -p "$dir/$dest"; mv "$task" "$dir/$dest/$run_id.json"
     [ "$rc" -eq 0 ] || [ -n "$cont" ] || { why="$name exited $rc"; break; }   # 3 no changes, 4 PR failed, 5 REFUTED, 6 no verdict; the row has the verdict
   done
+  end="All tasks ran."; [ -z "$why" ] || end="Stopped: $why. $(ls "$dir"/*.json 2>/dev/null | wc -l | tr -d ' ' || true) task(s) left in queue."   # || true: an empty queue makes ls fail, and a failed substitution in an assignment is fatal under set -e
   { echo "# $batch_id"; echo; echo "queue: $dir, chain: ${chain:-off}, tasks run: $n"; echo
     echo "| RUN | EXIT | ROUNDS | VERDICT | PR | CHAIN BASE | DURATION |"; echo "|---|---|---|---|---|---|---|"; printf '%s' "$rows"
-    echo; if [ -n "$why" ]; then echo "Stopped: $why. $(ls "$dir"/*.json 2>/dev/null | wc -l | tr -d ' ') task(s) left in queue."; else echo "All tasks ran."; fi; } > "$report"
+    echo; echo "$end"; } > "$report"
   cat "$report"; echo "report: $report"
+  notify "done: $n run, $prs PR(s), $nfail failed. $end"   # always, once the loop is over: a night with no message means the batch never reached its end
   exit "$fail"   # the last failing run's status, 0 when every run passed
 }
 
