@@ -288,6 +288,8 @@ cmd_run() {
     log "round $round: openai_key issued (Keycard $KEYCARD_ZONE resource $OPENAI_RESOURCE)"
     jwork=$(mktemp -d "${TMPDIR:-/tmp}/factory-judge.XXXXXX"); jout=$(mktemp -d "${TMPDIR:-/tmp}/factory-judge-out.XXXXXX")
     jprompt="$(cat "$FACTORY_DIR/judge-prompt.md")"$'\n\n'"## Commits"$'\n'"Base: $base_sha"$'\n'"Head: $head"$'\n\n'"## Task given to the agent"$'\n'"$instructions"
+    # The judge sees its own previous findings, so it can mark each finding NEW or REPEAT; the worker's fix is judged against them.
+    [ -z "$findings" ] || jprompt="$jprompt"$'\n\n'"## Your findings on the previous round (round $((round-1)), verdict $verdict)"$'\n'"$findings"
     run_container judge "$oa_key" -v "$work":/src:ro -v "$jwork":/work -v "$jout":/out -e HEAD_SHA="$head" -- "$jprompt"
     jstatus=$status; status=0   # the worker succeeded; a failed judge is a missing verdict (exit 6 below), not a failed run
     # The verdict counts only if the judge exited 0 and left a regular file in /out, a mount the repository cannot reach.

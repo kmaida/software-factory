@@ -48,6 +48,7 @@ case "$mode" in
   judge) n=$(cat "$STUB_STATE" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_STATE"
          v=$(echo "$STUB_VERDICTS" | cut -d, -f$n)
          [ "$HEAD_SHA" = "$(git -C "$src" rev-parse "refs/heads/factory/$TASK_ID")" ] || { echo "stub: HEAD_SHA mismatch" >&2; exit 9; }
+         case "${args[$((${#args[@]}-1))]}" in *"## Your findings on the previous round (round $((n-1)), verdict REFUTED)"*"finding 1: fix it"*) echo "stub judge: saw previous findings";; esac
          # NONE: a judge that fails after something (the worker, say) preseeded a passing verdict; it must not count.
          [ "$v" = NONE ] && { echo 'VERDICT: VERIFIED' > "$out/verdict.md"; exit 1; }
          case "$v" in
@@ -73,6 +74,7 @@ check() { [ "$1" = "$2" ] || { echo "FAIL: $3: got '$1' want '$2'"; cat "$t/"*.o
 runs="$here/runs"
 rc=$(run t1 "REFUTED,VERIFIED"); m=$(ls -d "$runs"/*-t1 | tail -1)
 check "$rc" 0 "t1 exit"; check "$(jq -r .judge.verdict "$m/manifest.json")" VERIFIED "t1 verdict"; check "$(jq -r .judge.rounds "$m/manifest.json")" 2 "t1 rounds"
+check "$(grep -c 'stub judge: saw previous findings' "$m/log.jsonl")" 1 "t1 round 2 judge got round 1's findings, round 1 got none"
 check "$(ls "$m" | grep -c judge-)" 2 "t1 judge files"; check "$(git -C "$t/remote.git" rev-parse refs/heads/factory/t1)" "$(jq -r .final_sha "$m/manifest.json")" "t1 pushed the judged commit"
 # The App bot identity reached `docker run` as git env: the stub commits with -c user.name=w, and env wins, so the pushed commit carries it.
 bot='kmaida-software-factory[bot] <424243+kmaida-software-factory[bot]@users.noreply.github.com>'
