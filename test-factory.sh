@@ -13,7 +13,8 @@ openssl genrsa 2048 2>/dev/null | openssl base64 -A > "$t/app-key.b64"   # a rea
 cat > "$t/bin/curl" <<'C'
 #!/bin/bash
 # Stub: answers by URL. GitHub App calls (installation lookup, token, PR) are real-shaped; STUB_INSTALL_404=1 makes the lookup 404.
-[ -t 0 ] || cat >/dev/null
+[ -t 0 ] || in=$(cat)
+case "${in:-}" in 'url = "'*) printf '%s\n' "$in" | sed -n 's/^data = "\(.*\)"$/\1/p' >> "$STUB_NOTIFY"; exit 0;; esac   # FACTORY_NOTIFY_URL: record the one-line body
 w= d= prev=; for a in "$@"; do case "$prev" in -d) d=$a;; esac; case "$a" in -w) w=1;; esac; prev=$a; done
 code() { [ -n "$w" ] && printf '\n%s' "$1"; exit 0; }
 for a in "$@"; do case "$a" in
@@ -128,10 +129,12 @@ grep -q '^All tasks ran\.' "$rep" && grep -q 'chain: on,' "$rep" || { echo "FAIL
 [ -d "$here/.lock" ] && { echo "FAIL: batch left the lock"; exit 1; }
 # chain where task two is REFUTED: 020 -> failed/, 030 never runs and stays in the queue, exit is the failing run's.
 queue rf 010-rf-a 020-rf-b 030-rf-c
-rc=$(batch "$t/rf" "VERIFIED,REFUTED,REFUTED,REFUTED")
+rc=$(FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/rf" "VERIFIED,REFUTED,REFUTED,REFUTED")
 check "$rc" 5 "refuted chain exit"; check "$(moved rf/done)" "010-rf-a.json " "refuted chain done/"; check "$(moved rf/failed)" "020-rf-b.json " "refuted chain failed/"
 check "$(moved rf)" "030-rf-c.json done failed " "refuted chain leaves 030 queued"; check "$(ls -d "$runs"/*-030-rf-c 2>/dev/null | wc -l | tr -d ' ')" 0 "refuted chain never ran 030"
 grep -q '^Stopped: 020-rf-b exited 5\. 1 task(s) left in queue\.' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: refuted report"; cat "$t/batch.out"; exit 1; }
+# FACTORY_NOTIFY_URL: one line per non-zero exit (010 passed: no line), with the verdict and whether the batch went on.
+check "$(cat "$t/notify")" "$(basename "$(ls "$runs"/batch-*.md | tail -1)" .md): 020-rf-b exited 5 (REFUTED, stopped)" "notify line on stop"; rm -f "$t/notify"
 # --max-tasks 1, --stop-at in the past (nothing runs, nothing moves), HALT written during 010's push (020 stays), --no-chain.
 queue mx 010-mx-a 020-mx-b; rc=$(batch "$t/mx" "VERIFIED" --max-tasks 1)
 check "$rc" 0 "max-tasks exit"; check "$(moved mx/done)" "010-mx-a.json " "max-tasks done/"; check "$(moved mx)" "020-mx-b.json done " "max-tasks leaves 020"
@@ -145,11 +148,14 @@ check "$rc" 0 "no-chain exit"; m=$(ls -d "$runs"/*-020-nc-b | tail -1); check "$
 # --continue: 020 (chained on 010) is refuted -> failed/; 030 names factory/020-sw-b as its base -> failed/ unrun; 040 bases on main
 # again (after a break the chain resumes from the task's own base_branch). Exit is the last failure's. A queue that fails lint is refused.
 queue sw 010-sw-a 020-sw-b 040-sw-d; task "$t/remote.git" factory/020-sw-b 030-sw-c "$body" "$t/sw"
-rc=$(batch "$t/sw" "VERIFIED,REFUTED,REFUTED,REFUTED,VERIFIED" --continue)
+rc=$(FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/sw" "VERIFIED,REFUTED,REFUTED,REFUTED,VERIFIED" --continue)
 check "$rc" 5 "continue exit"; check "$(moved sw/done)" "010-sw-a.json 040-sw-d.json " "continue done/"; check "$(moved sw/failed)" "020-sw-b.json 030-sw-c.json " "continue failed/"
 check "$(ls -d "$runs"/*-030-sw-c 2>/dev/null | wc -l | tr -d ' ')" 0 "continue never ran the dependent of a failed task"
 m=$(ls -d "$runs"/*-040-sw-d | tail -1); check "$(jq -r '"\(.base_branch) \(.chain_base)"' "$m/manifest.json")" "main null" "continue resumes from the task's own base"
 grep -q '030-sw-c: skipped, its base factory/020-sw-b failed in this batch' "$t/batch.out" || { echo "FAIL: skip message"; cat "$t/batch.out"; exit 1; }
+check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" "020-sw-b exited 5 (REFUTED, continuing)" "notify line with --continue; a skipped task sends none"; rm -f "$t/notify"
+queue nn 010-nn-a; rc=$(STUB_NOTIFY="$t/notify" batch "$t/nn" "REFUTED,REFUTED,REFUTED"); check "$rc" 5 "no-notify exit"; [ ! -e "$t/notify" ] || { echo "FAIL: POST without FACTORY_NOTIFY_URL"; exit 1; }
+queue nu 010-nu-a; rc=$(FACTORY_NOTIFY_URL=$'http://x"\nwrite-out=INJECTED' batch "$t/nu" VERIFIED); check "$rc" 1 "a URL that could break the curl config is refused"; check "$(moved nu)" "010-nu-a.json " "refused URL: nothing ran"
 # --continue, chain on: 010 fails, 020 (on main) passes, 030 declares base factory/010 -> skipped although the chain would have put it on 020.
 mkdir -p "$t/dd"; task "$t/remote.git" main 010-dd-a "$body" "$t/dd"; task "$t/remote.git" main 020-dd-b "$body" "$t/dd"; task "$t/remote.git" factory/010-dd-a 030-dd-c "$body" "$t/dd"
 rc=$(batch "$t/dd" "REFUTED,REFUTED,REFUTED,VERIFIED" --continue)
