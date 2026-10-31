@@ -95,11 +95,16 @@ open_pr() {  # open_pr <owner/name> <task_id> <base> <instructions>: fresh pull_
   [ -n "$key" ] || return 1
   tok=$(mint_github_token "$1" "$key" '{"pull_requests":"write"}'); key=
   [ -n "$tok" ] || return 1
-  printf 'header = "Authorization: Bearer %s"\n' "$tok" \
-  | curl -sS -K - -X POST "https://api.github.com/repos/$1/pulls" -H "Accept: application/vnd.github+json" \
+  resp=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" \
+  | curl -sS -K - -w '\n%{http_code}' -X POST "https://api.github.com/repos/$1/pulls" -H "Accept: application/vnd.github+json" \
       -d "$(jq -nc --arg t "factory: $2" --arg h "factory/$2" --arg b "$3" --arg body "$4" \
-             '{title:$t, head:$h, base:$b, body:("Opened by the factory for task `"+$t+"`.\n\n"+$body)}')" \
-  | jq -r '.html_url // empty'
+             '{title:$t, head:$h, base:$b, body:("Opened by the factory for task `"+$t+"`.\n\n"+$body)}')")
+  code=${resp##*$'\n'}; body=${resp%$'\n'*}; body=${body//"$tok"/[REDACTED]}; body=${body:0:2000}; tok=
+  if [ "$code" = 201 ]; then printf '%s' "$body" | jq -r '.html_url // empty'; return; fi
+  # Exit 4 must be diagnosable from the run dir alone: status and (redacted, bounded) body go to the log and the manifest.
+  log "POST /repos/$1/pulls failed: HTTP ${code:-none} $body"
+  manifest_set '.pr_error = {status:(if $c=="" then null else ($c|tonumber) end), body:$b}' --arg c "$code" --arg b "$body"
+  return 1
 }
 anthropic_token() {  # Claude credential, two steps, no API key anywhere. Fresh per worker round: the token lives 1h, a run may not.
   # 1. Keycard signs a 1h OIDC token for this Application (policy-checked, audited). Client secret via curl config on stdin, not argv.
