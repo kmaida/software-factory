@@ -206,4 +206,5 @@ unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; rm -rf "$runs"/*-gh[
 mkdir -p "$runs/stoptest"; echo '{"ended_at":null,"exit_status":null}' > "$runs/stoptest/manifest.json"; : > "$runs/stoptest/log.jsonl"
 PATH="$t/bin:$PATH" STUB_DOCKER_PS_FAIL=1 "$here/factory" stop stoptest > "$t/stop.out" 2>&1 || { echo "FAIL: stop with docker down exited $?"; cat "$t/stop.out"; exit 1; }
 check "$(jq -r .exit_status "$runs/stoptest/manifest.json")" 137 "stop with docker down records the incident"; rm -f "$here/HALT"; rm -rf "$runs/stoptest"
+find "$runs" -maxdepth 1 -newer "$t/secrets" \( -name 'batch-*.md' -o -name '*-0[0-9]0-[a-z][a-z]-[a-d]' \) -exec rm -rf {} +   # the GitHub-path batch cases ran after the first sweep
 echo "ok: judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count), lint and batch (chain, refuted chain, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), stop with docker down"
