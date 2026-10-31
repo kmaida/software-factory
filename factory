@@ -1,7 +1,7 @@
 #!/bin/bash
 # factory: orchestrator for the software factory. See factory.md.
 #   factory run <task-file>   validate job, mint run, docker run the sandbox, write manifest + log
-#   factory lint [dir]        check queue/*.json against tasks.md before a batch
+#   factory lint [dir]        check queue/*.json against the task rules in README.md before a batch
 #   factory batch [dir] [--max-tasks N] [--stop-at HH:MM] [--no-chain] [--continue]
 #                             the overnight queue: each task bases on the previous task's branch; stops on the first failure
 #   factory report [n]        one line per run from the manifests: exit, judge rounds, verdict, PR
@@ -360,7 +360,7 @@ cmd_run() {
 }
 
 # ---------------------------------------------------------------- lint
-cmd_lint() {  # factory lint [dir]: the conventions in tasks.md that a sleeping operator cannot enforce. Exit 1 on any problem.
+cmd_lint() {  # factory lint [dir]: the task rules in README.md ("Writing tasks") that a sleeping operator cannot enforce. Exit 1 on any problem.
   dir="${1:-$QUEUE}"; bad=0; n=0; seen=" "
   for f in "$dir"/*.json; do
     [ -e "$f" ] || { echo "no task files in $dir"; return 0; }
@@ -371,7 +371,7 @@ cmd_lint() {  # factory lint [dir]: the conventions in tasks.md that a sleeping 
       [ "$id" = "$name" ] || p="$p; task_id '$id' is not the filename"
       [[ "$id" =~ $ID_RE && "$id" =~ ^[0-9]+- ]] || p="$p; task_id must be <number>-<name> matching $ID_RE"
       [[ "$base" =~ $BRANCH_RE ]] || p="$p; base_branch has unexpected characters"
-      # The five headings of tasks.md, each at the start of a line, in order, and something after "Done when:".
+      # The five headings (README.md, "Writing tasks"), each at the start of a line, in order, and something after "Done when:".
       jq -e '.instructions | test("(^|\n)Goal:[\\s\\S]*\nContext:[\\s\\S]*\nScope:[\\s\\S]*\nDone when:[ \t]*\\S[\\s\\S]*\nOut of scope:")' "$f" >/dev/null \
         || p="$p; instructions need the headings Goal, Context, Scope, Done when, Out of scope, in that order, each on its own line"
       case "$base" in
@@ -407,7 +407,7 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
   case "${FACTORY_NOTIFY_URL:-}" in *[\"\\[:space:]]*) die "FACTORY_NOTIFY_URL must not contain quotes, backslashes or whitespace (it is written into a curl config)";; esac
   [ -z "$stop_at" ] || deadline=$(date -j -f %H:%M "$stop_at" +%s 2>/dev/null) || die "--stop-at needs HH:MM (local time, today)"   # today at HH:MM, as an epoch
   [ -e "$HALT" ] && die "dispatch blocked by $HALT ($(cat "$HALT")); remove it to resume"
-  cmd_lint "$dir" || die "fix the queue before batching (see tasks.md)"
+  cmd_lint "$dir" || die "fix the queue before batching (see "Writing tasks" in README.md)"
   [ -z "$chain" ] || [ "$(jq -r .repo "$dir"/*.json 2>/dev/null | sort -u | wc -l)" -le 1 ] || die "a chained queue targets one repo; use --no-chain"
   batch_id="batch-$(date -u +%Y%m%dT%H%M%SZ)"; report="$RUNS/$batch_id.md"; mkdir -p "$RUNS"
   take_lock; echo "$batch_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"
