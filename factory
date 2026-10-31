@@ -47,7 +47,7 @@ cleanup() {
   rc=$?
   # Best effort, every step: a docker outage here must not stop the manifest from being finalized or the lock from being released.
   if [ -n "$run_id" ]; then c=$(docker ps -aq --filter "label=factory.run=$run_id" 2>/dev/null) || c=; [ -n "$c" ] && docker rm -f $c >/dev/null 2>&1 || true; fi
-  [ -n "$work" ] && rm -rf "$work"; [ -n "$jwork" ] && rm -rf "$jwork"; [ -n "$jout" ] && rm -rf "$jout"
+  for d in "$work" "$jwork" "$jout"; do [ -z "$d" ] || rm -rf "$d" 2>/dev/null || true; done   # never let a failed rm change the exit status
   # A run that died before finalizing still gets a terminal state, so no manifest is left open-ended.
   if [ -n "${rundir:-}" ] && [ -f "$rundir/manifest.json" ] && [ "$(jq -r .ended_at "$rundir/manifest.json")" = null ]; then
     manifest_set '. + {ended_at:$ended, exit_status:$rc}' --arg ended "$(now)" --argjson rc "$rc"
@@ -85,10 +85,12 @@ mint_github_token() {  # mint_github_token <owner/name> <pem> <permissions-json>
   esac
   [ -n "$inst" ] || return 1
   if [ -n "${rundir:-}" ]; then manifest_set '.installation_id = $id' --argjson id "$inst"; fi   # evidence: which installation issued this run's tokens
-  printf '%s\n' "$jwt_cfg" \
-  | curl -sS -K - -X POST "https://api.github.com/app/installations/$inst/access_tokens" \
-      -d "{\"repositories\":[\"${1##*/}\"],\"permissions\":$3}" \
-  | jq -r '.token // empty'
+  resp=$(printf '%s\n' "$jwt_cfg" | curl -sS -K - -w '\n%{http_code}' -X POST "https://api.github.com/app/installations/$inst/access_tokens" \
+      -d "{\"repositories\":[\"${1##*/}\"],\"permissions\":$3}")
+  code=${resp##*$'\n'}; body=${resp%$'\n'*}
+  tok=$(printf '%s' "$body" | jq -r '.token // empty' 2>/dev/null) || tok=
+  [ -n "$tok" ] || { echo "factory: GitHub did not issue an installation token for $1 (HTTP ${code:-none}): $(printf '%s' "$body" | jq -r '.message // empty' 2>/dev/null | head -c 300)" >&2; return 1; }
+  printf '%s\n' "$tok"
 }
 open_pr() {  # open_pr <owner/name> <task_id> <base> <instructions>: fresh pull_requests:write + contents:read token, one API call, prints the PR URL
   # contents:read is required: POST /pulls resolves head and base refs, and on a private repo that is 422 "not all refs are readable" without it.
@@ -101,9 +103,19 @@ open_pr() {  # open_pr <owner/name> <task_id> <base> <instructions>: fresh pull_
   | curl -sS -K - -w '\n%{http_code}' -X POST "https://api.github.com/repos/$1/pulls" -H "Accept: application/vnd.github+json" \
       -d "$(jq -nc --arg t "factory: $2" --arg h "factory/$2" --arg b "$3" --arg body "$4" \
              '{title:$t, head:$h, base:$b, body:("Opened by the factory for task `"+$t+"`.\n\n"+$body)}')")
-  code=${resp##*$'\n'}; body=${resp%$'\n'*}; body=${body//"$tok"/[REDACTED]}; body=${body:0:2000}; tok=
-  if [ "$code" = 201 ]; then printf '%s' "$body" | jq -r '.html_url // empty'; return; fi
+  code=${resp##*$'\n'}; body=${resp%$'\n'*}; body=${body//"$tok"/[REDACTED]}
+  # The 201 body carries the whole PR body, so it is parsed untruncated: a cut JSON would make jq fail and report a created PR as exit 4.
+  url=; [ "$code" != 201 ] || url=$(printf '%s' "$body" | jq -r '.html_url // empty' 2>/dev/null | head -1) || url=
+  case "$url" in https://*) tok=; printf '%s' "$url"; return 0 ;; esac
+  # Anything else is ambiguous, not failed: the PR may exist (422 "already exists", a 201 whose body was cut or lost in transit).
+  # Ask GitHub for the open PR from this head before reporting failure, so a PR that exists is never recorded as exit 4.
+  url=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" \
+  | curl -sS -K - -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$1/pulls?state=open&head=${1%%/*}:factory/$2" \
+  | jq -r 'if type=="array" then (.[0].html_url // empty) else empty end' 2>/dev/null | head -1) || url=
+  tok=
+  case "$url" in https://*) log "POST /repos/$1/pulls returned HTTP ${code:-none} but an open PR from factory/$2 exists; recorded it"; printf '%s' "$url"; return 0 ;; esac
   # Exit 4 must be diagnosable from the run dir alone: status and (redacted, bounded) body go to the log and the manifest.
+  body=${body:0:2000}
   log "POST /repos/$1/pulls failed: HTTP ${code:-none} $body"
   manifest_set '.pr_error = {status:(if $c=="" then null else ($c|tonumber) end), body:$b}' --arg c "$code" --arg b "$body"
   return 1
@@ -139,7 +151,7 @@ run_container() {  # run_container <mode> <secret> [docker args...] -- [entrypoi
   printf '%s\n' "$secret" \
   | docker run -i --name "$cname" --label "factory.run=$run_id" --rm --read-only --tmpfs /tmp --tmpfs /run/secrets:size=64k \
     --memory 4g --cpus 2 --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges \
-    -e MODE="$mode" -e TASK_ID="$task_id" -e BASE_BRANCH="$base_branch" "${dargs[@]}" "$image_digest" "$@" 2>&1 \
+    -e MODE="$mode" -e TASK_ID="$task_id" -e BASE_BRANCH="$from_branch" "${dargs[@]}" "$image_digest" "$@" 2>&1 \
   | while IFS= read -r line || [ -n "$line" ]; do
       line=${line//"$secret"/[REDACTED]}; line=${line//"$b64"/[REDACTED]}; printf '%s\n' "$line"
     done \
@@ -169,6 +181,10 @@ cmd_run() {
   task_id=$(jq -r .task_id "$task"); instructions=$(jq -r .instructions "$task")
   [[ "$task_id" =~ $ID_RE ]] || die "task_id must match $ID_RE"
   [[ "$base_branch" =~ $BRANCH_RE ]] || die "base_branch has unexpected characters"
+  # Chain mode (set by batch): the branch is cut from the previous task's branch, but the PR still targets the task's own
+  # base_branch. A PR whose base is factory/<prev> dies with 422 "base ref not found" once that branch is merged and auto-deleted.
+  chain_base="${FACTORY_CHAIN_BASE:-}"; [ -z "$chain_base" ] || [[ "$chain_base" =~ $BRANCH_RE ]] || die "FACTORY_CHAIN_BASE has unexpected characters"
+  from_branch="${chain_base:-$base_branch}"
   case "$repo" in
     https://github.com/*) repo="${repo#https://github.com/}"; repo="${repo%/}"; repo="${repo%.git}" ;;   # normalise to owner/name
     https://*|/*) repo_url="$repo" ;;                                   # other URL or local path (dry runs)
@@ -199,11 +215,12 @@ cmd_run() {
   run_id="$(date -u +%Y%m%dT%H%M%SZ)-$task_id"; echo "$run_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"
   orphans=$(docker ps -aq --filter label=factory.run); if [ -n "$orphans" ]; then docker rm -f $orphans >/dev/null; fi
 
-  rundir="$RUNS/$run_id"; mkdir -p "$rundir"; logf="$rundir/log.jsonl"; : > "$logf"
+  rundir="$RUNS/$run_id"; mkdir -p "$RUNS"; mkdir "$rundir" 2>/dev/null || die "run dir $rundir already exists (another run of $task_id started this second); try again"
+  logf="$rundir/log.jsonl"; : > "$logf"
   echo "run $run_id"; echo "  evidence: $rundir"
   # Manifest exists from the first moment there is a run, before any credential is issued; later steps fill it in.
   jq -n --arg run_id "$run_id" --arg task_id "$task_id" --arg job "$(shasum -a 256 "$task" | cut -d' ' -f1)" \
-        --arg repo "$repo" --arg base_branch "$base_branch" --arg cb "${FACTORY_CHAIN_BASE:-}" \
+        --arg repo "$repo" --arg base_branch "$base_branch" --arg cb "$chain_base" \
         --arg image "$image_digest" --arg fc "$factory_commit" --arg started "$(now)" --arg kz "$KEYCARD_ZONE" \
     '{run_id:$run_id, task_id:$task_id, job_sha256:$job, repo:$repo, base_branch:$base_branch, chain_base:(if $cb=="" then null else $cb end), base_sha:null,
       image_digest:$image, factory_commit:(if $fc=="" then null else $fc end), keycard_zone:$kz,
@@ -228,7 +245,7 @@ cmd_run() {
   git -c credential.helper= \
       -c credential.helper='!f() { h=; while IFS= read -r l; do case "$l" in host=*) h=${l#host=};; esac; done; [ "$h" = github.com ] || exit 0; echo username=x-access-token; echo "password=$(cat <&3)"; }; f' \
     clone -q "$repo_url" "$work" 3< <(printf '%s' "$gh_tok") || die "clone failed: $repo_url"
-  base_sha=$(git -C "$work" rev-parse "origin/$base_branch" 2>/dev/null) || die "base branch not found: $base_branch"
+  base_sha=$(git -C "$work" rev-parse "origin/$from_branch" 2>/dev/null) || die "base branch not found: $from_branch"
   log "cloned $repo_url at $base_sha"
   manifest_set '. + {base_sha:$sha}' --arg sha "$base_sha"
   if git -C "$work" rev-parse --verify -q "origin/factory/$task_id" >/dev/null; then
@@ -241,7 +258,7 @@ cmd_run() {
   # the judge has the Codex key, the push has the GitHub token. The judge reviews a fresh clone of the worker's checkout and
   # ends with a VERDICT line; anything but VERIFIED sends its findings back to the worker for a revision round, up to MAX_ROUNDS.
   # Nothing is pushed until the rounds are over, so no human sees the code before the judge has.
-  round=1 verdict= findings= head= prev_head= status=0
+  round=1 judged=0 verdict= findings= head= prev_head= status=0
   while :; do
     # Every worker round opens with the house rules (least code that satisfies "Done when"), read from this checkout like the judge prompt.
     prompt="$(cat "$FACTORY_DIR/worker-prompt.md")"$'\n\n'"## Task"$'\n'"$instructions"
@@ -262,14 +279,24 @@ cmd_run() {
     jstatus=$status; status=0   # the worker succeeded; a failed judge is a missing verdict (exit 6 below), not a failed run
     # The verdict counts only if the judge exited 0 and left a regular file in /out, a mount the repository cannot reach.
     # Bounded read; then redact the judge's key before the text goes anywhere (the next prompt, the PR body, evidence).
-    findings=
-    if [ "$jstatus" -eq 0 ] && [ -f "$jout/verdict.md" ] && [ ! -L "$jout/verdict.md" ]; then findings=$(head -c 200000 "$jout/verdict.md"); fi
+    findings= oversize=
+    if [ "$jstatus" -eq 0 ] && [ -f "$jout/verdict.md" ] && [ ! -L "$jout/verdict.md" ]; then
+      findings=$(head -c 200000 "$jout/verdict.md" | tr -d '\r')   # CRLF would pass the regex below and then equal no verdict
+      [ "$(wc -c < "$jout/verdict.md")" -le 200000 ] || oversize=1   # a cut review is no review: its last line is not the judge's
+    fi
     findings=${findings//"$oa_key"/[REDACTED]}; oa_key=
     rm -rf "$jwork" "$jout"; jwork= jout=
     printf '%s\n' "$findings" > "$rundir/judge-$round.md"   # evidence: the full review, one file per round
-    # The last non-blank line must be the verdict line, whole; anything else is no verdict.
-    verdict=$(printf '%s\n' "$findings" | sed -e '/^[[:space:]]*$/d' | tail -1 | grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)[[:space:]]*$' | awk '{print $2}' || true)
-    log "round $round: judge verdict ${verdict:-NONE} (container status $jstatus, $(printf '%s' "$findings" | wc -c | tr -d ' ') bytes)"
+    # Exactly one VERDICT line, and it is the last non-blank line, whole; anything else is no verdict (a second verdict quoted in
+    # the review, a verdict inside an unfinished example, a review cut by the bounded read all fail closed).
+    verdict=
+    if [ -z "$oversize" ] && [ "$(printf '%s\n' "$findings" | grep -c '^VERDICT:')" -eq 1 ]; then
+      verdict=$(printf '%s\n' "$findings" | sed -e '/^[[:space:]]*$/d' | tail -1 | grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)[[:space:]]*$' | awk '{print $2}' || true)
+    fi
+    judged=$((judged+1))
+    # Persist what is known now: a later failure (push token, HALT, a kill) must not leave the manifest without the judge's word.
+    manifest_set '. + {judge:{rounds:$n, verdict:(if $v=="" then null else $v end)}}' --argjson n "$judged" --arg v "$verdict"
+    log "round $round: judge verdict ${verdict:-NONE}${oversize:+ (review over 200000 bytes)} (container status $jstatus, $(printf '%s' "$findings" | wc -c | tr -d ' ') bytes)"
     echo "  round $round: judge verdict ${verdict:-NONE}"
     [ -n "$verdict" ] || break                 # judge error: nothing to revise against; fail closed below
     [ "$verdict" = VERIFIED ] && break
@@ -308,7 +335,7 @@ cmd_run() {
   fi
   manifest_set '. + {ended_at:$ended, exit_status:$status, final_sha:(if $final=="null" then null else $final end), pr_url:(if $pr=="" then null else $pr end),
                      judge:{rounds:$rounds, verdict:(if $v=="" then null else $v end)}}' \
-     --arg ended "$(now)" --argjson status "$status" --arg final "$final_sha" --arg pr "$pr_url" --argjson rounds "$round" --arg v "$verdict"
+     --arg ended "$(now)" --argjson status "$status" --arg final "$final_sha" --arg pr "$pr_url" --argjson rounds "$judged" --arg v "$verdict"
   echo "  exit status: $status"
   exit "$status"
 }
@@ -345,9 +372,9 @@ cmd_lint() {  # factory lint [dir]: the conventions in tasks.md that a sleeping 
 
 # ---------------------------------------------------------------- batch
 cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--no-chain] [--continue]: the overnight loop.
-  # Tasks run in filename order under one lock. Chain mode (default): every task after a successful one bases on
-  # factory/<previous task_id>, so the night ends as a stack of judged PRs to merge bottom-up; the rewritten base_branch lives in a
-  # temp copy of the task file under $TMPDIR, the file on disk is never changed. Any exit but 0 stops the batch: that task goes to
+  # Tasks run in filename order under one lock. Chain mode (default): every task after a successful one cuts its branch from
+  # factory/<previous task_id> (passed to run as FACTORY_CHAIN_BASE; the task file is never changed), while its PR still targets the
+  # task's own base_branch, so a merged-and-deleted chain head cannot break a later PR. Any exit but 0 stops the batch: that task goes to
   # <queue-dir>/failed/, every later one stays in the queue untouched. With --continue the batch goes on instead: a failed run still
   # pushes its branch (evidence), so every later task whose base names a task that failed tonight is moved to failed/ unrun, and the
   # chain resumes from the next task's own base_branch. HALT between tasks stops the batch either way. Exit 0 moves a task to
@@ -362,29 +389,31 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
   [ -e "$HALT" ] && die "dispatch blocked by $HALT ($(cat "$HALT")); remove it to resume"
   cmd_lint "$dir" || die "fix the queue before batching (see tasks.md)"
   [ -z "$chain" ] || [ "$(jq -r .repo "$dir"/*.json 2>/dev/null | sort -u | wc -l)" -le 1 ] || die "a chained queue targets one repo; use --no-chain"
-  batch_id="batch-$(date -u +%Y%m%dT%H%M%SZ)"; report="$RUNS/$batch_id.md"
+  batch_id="batch-$(date -u +%Y%m%dT%H%M%SZ)"; report="$RUNS/$batch_id.md"; mkdir -p "$RUNS"
   take_lock; echo "$batch_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"
-  tmpjob=; trap 'rm -rf "$LOCK" ${tmpjob:+"$tmpjob"}' EXIT; trap 'exit 130' INT TERM
+  trap 'rm -rf "$LOCK"' EXIT; trap 'exit 130' INT TERM
   rows= prev= why= failed=" " n=0 fail=0
   for task in "$dir"/*.json; do
     [ -e "$task" ] || { why="queue is empty"; break; }
     [ -e "$HALT" ] && { why="halted by $HALT ($(cat "$HALT"))"; break; }
     [ -z "$max" ] || [ "$n" -lt "$max" ] || { why="--max-tasks $max reached"; break; }
     [ -z "$deadline" ] || [ "$(date +%s)" -lt "$deadline" ] || { why="--stop-at $stop_at passed"; break; }
-    name=$(basename "$task" .json); id=$(jq -r .task_id "$task"); base=$(jq -r .base_branch "$task"); cb=; job="$task"
-    [ -z "$chain" ] || [ -z "$prev" ] || { cb="factory/$prev"; base="$cb"; }
-    case "$failed" in *" ${base#factory/} "*)   # --continue: its base failed tonight (branch pushed as evidence); do not build on it
-      echo "== $name: skipped, its base $base failed in this batch"; rows="$rows| - | skipped | - | - | - | $base | - |"$'\n'
-      failed="$failed$id "; mkdir -p "$dir/failed"; mv "$task" "$dir/failed/$batch_id-$name.json"; continue ;;
-    esac
-    if [ -n "$cb" ]; then tmpjob=$(mktemp "${TMPDIR:-/tmp}/factory-task.XXXXXX"); job="$tmpjob"; jq --arg b "$cb" '.base_branch=$b' "$task" > "$job"; fi
+    name=$(basename "$task" .json); id=$(jq -r .task_id "$task"); base=$(jq -r .base_branch "$task"); cb=
+    [ -z "$chain" ] || [ -z "$prev" ] || cb="factory/$prev"
+    # --continue: a base that failed tonight (declared in the file, or the chain head) was pushed as evidence only; do not build on it.
+    skip=; for d in "$base" "$cb"; do case "$d" in factory/*) case "$failed" in *" ${d#factory/} "*) skip=$d ;; esac ;; esac; done
+    if [ -n "$skip" ]; then
+      echo "== $name: skipped, its base $skip failed in this batch"; rows="$rows| - | skipped | - | - | - | $skip | - |"$'\n'
+      failed="$failed$id "; mkdir -p "$dir/failed"; mv "$task" "$dir/failed/$batch_id-$name.json"; continue
+    fi
     echo "== $name ($(now))${cb:+, base $cb}"
-    t0=$(date +%s); rc=0; FACTORY_BATCH=$$ FACTORY_CHAIN_BASE="$cb" "$0" run "$job" || rc=$?
-    [ -z "$tmpjob" ] || rm -f "$tmpjob"; tmpjob=
+    t0=$(date +%s); rc=0; FACTORY_BATCH=$$ FACTORY_CHAIN_BASE="$cb" "$0" run "$task" || rc=$?
     # The run left its id in the borrowed lock; take the lock back at once, so a later `factory stop <that run>` signals nothing
     # and a run that dies before it takes the lock (docker down) cannot be mistaken for the previous one.
     run_id=$(cat "$LOCK/run_id"); echo "$batch_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"; m="$RUNS/$run_id/manifest.json"
     if [ "$run_id" != "$batch_id" ] && [ -f "$m" ]; then
+      # A run killed before its cleanup (SIGKILL, power) has no exit_status; the loop saw it and writes it, so no row says "running".
+      [ "$(jq -r .exit_status "$m")" != null ] || { rundir="$RUNS/$run_id"; manifest_set '. + {ended_at:(.ended_at // $e), exit_status:$rc}' --arg e "$(now)" --argjson rc "$rc"; }
       cells=$(jq -r '[(.exit_status // "running" | tostring), (.judge.rounds // "-" | tostring), (.judge.verdict // "-"), (.pr_url // "-")] | join(" | ")' "$m")
     else run_id="$batch_id-$name"; cells="$rc | - | - | -"; fi   # died before it was a run (bad task file, docker down)
     rows="$rows| $run_id | $cells | ${cb:--} | $(( $(date +%s) - t0 ))s |"$'\n'; n=$((n+1))
@@ -417,9 +446,9 @@ cmd_stop() {
   echo "wrote $HALT (blocks new dispatch until removed)"
   if command -v docker >/dev/null; then
     # A run has one container at a time (worker, judge or push), all labelled with the run id.
-    c=$(docker ps -q --filter "label=factory.run=$run_id")
+    c=$(docker ps -q --filter "label=factory.run=$run_id" 2>/dev/null) || { c=; echo "docker is not answering; signalling the orchestrator anyway"; }
     if [ -n "$c" ]; then docker stop -t 5 $c >/dev/null 2>&1 && echo "stopped container(s) $c"; else echo "no container running for $run_id"; fi
-    c=$(docker ps -aq --filter "label=factory.run=$run_id"); [ -n "$c" ] && docker rm -f $c >/dev/null 2>&1 || true
+    c=$(docker ps -aq --filter "label=factory.run=$run_id" 2>/dev/null) || c=; [ -n "$c" ] && docker rm -f $c >/dev/null 2>&1 || true
   else
     echo "docker not found; nothing to stop on this host"
   fi

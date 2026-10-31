@@ -45,10 +45,16 @@ work)
   # Capability profile: these tools run without prompts (there is nobody to answer one); everything else is denied.
   claude -p "$*" --output-format stream-json --verbose \
     --allowedTools "Bash,Read,Edit,MultiEdit,Write,Glob,Grep,NotebookEdit,TodoWrite,Agent" < /dev/null
-  # Safety net: commit anything the agent left uncommitted so the work reaches the judge and the PR.
-  git add -A && git commit -qm "factory: ${TASK_ID} (uncommitted changes)" || true
-  # No commits beyond the base: the agent declined or produced nothing. Exit 3 so the manifest says so.
-  if [ "$(git rev-list --count "origin/${BASE_BRANCH}..HEAD")" -eq 0 ]; then echo "factory: no changes on factory/${TASK_ID}" >&2; exit 3; fi
+  # Safety net: commit anything the agent left uncommitted so the work reaches the judge and the PR. A commit that fails for a
+  # real reason (index lock, hook) is a failed round (exit 2), never "no changes".
+  git add -A
+  git diff --cached --quiet || git commit -qm "factory: ${TASK_ID} (uncommitted changes)" || { echo "factory: committing the agent's uncommitted changes failed" >&2; exit 2; }
+  # The host judges and pushes refs/heads/factory/<task_id>; work left on another branch or a detached HEAD would be judged stale.
+  [ "$(git symbolic-ref -q HEAD)" = "refs/heads/factory/${TASK_ID}" ] || { echo "factory: worker left HEAD on $(git symbolic-ref -q HEAD || git rev-parse HEAD), not factory/${TASK_ID}" >&2; exit 2; }
+  # No commits beyond the base: the agent declined or produced nothing. Exit 3 so the manifest says so. A count that cannot be
+  # taken (the base ref is gone) is an error, not zero.
+  n=$(git rev-list --count "origin/${BASE_BRANCH}..HEAD") || { echo "factory: cannot count commits against origin/${BASE_BRANCH}" >&2; exit 2; }
+  if [ "$n" -eq 0 ]; then echo "factory: no changes on factory/${TASK_ID}" >&2; exit 3; fi
   ;;
 judge)
   # Codex 0.164 does not read OPENAI_API_KEY; log in to a throwaway CODEX_HOME on the tmpfs.
