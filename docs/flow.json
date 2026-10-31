@@ -1,0 +1,195 @@
+{
+ "schema_version": 1,
+ "diagram_type": "workflow",
+ "meta": {
+  "title": "Software factory run",
+  "quality_profile": "showcase",
+  "legend": {
+   "mode": "hidden"
+  }
+ },
+ "lanes": [
+  {
+   "id": "you",
+   "label": "You"
+  },
+  {
+   "id": "host",
+   "label": "factory (Mac mini)"
+  },
+  {
+   "id": "sandbox",
+   "label": "Containers"
+  },
+  {
+   "id": "github",
+   "label": "GitHub"
+  }
+ ],
+ "mainPath": [
+  "task",
+  "factory",
+  "worker",
+  "judge",
+  "push",
+  "pr",
+  "review"
+ ],
+ "nodes": [
+  {
+   "id": "task",
+   "lane": "you",
+   "col": 0,
+   "type": "frontend",
+   "label": "Task file",
+   "sublabel": "queue/*.json"
+  },
+  {
+   "id": "keycard",
+   "lane": "host",
+   "col": 2,
+   "type": "security",
+   "label": "Keycard",
+   "sublabel": "1h credentials"
+  },
+  {
+   "id": "factory",
+   "lane": "host",
+   "col": 0,
+   "type": "backend",
+   "label": "Orchestrator",
+   "sublabel": "trust boundary"
+  },
+  {
+   "id": "ntfy",
+   "lane": "host",
+   "col": 5,
+   "type": "messagebus",
+   "label": "ntfy",
+   "sublabel": "failures, summary"
+  },
+  {
+   "id": "worker",
+   "lane": "sandbox",
+   "col": 0,
+   "type": "backend",
+   "label": "Worker",
+   "sublabel": "Claude Code"
+  },
+  {
+   "id": "judge",
+   "lane": "sandbox",
+   "col": 2,
+   "type": "security",
+   "label": "Judge",
+   "sublabel": "Codex"
+  },
+  {
+   "id": "push",
+   "lane": "sandbox",
+   "col": 4,
+   "type": "backend",
+   "label": "Push",
+   "sublabel": "contents:write"
+  },
+  {
+   "id": "nopr",
+   "lane": "sandbox",
+   "col": 5,
+   "type": "security",
+   "label": "No PR",
+   "sublabel": "exit 5 or 6"
+  },
+  {
+   "id": "pr",
+   "lane": "github",
+   "col": 4,
+   "type": "external",
+   "label": "Pull request",
+   "sublabel": "verdict in body"
+  },
+  {
+   "id": "review",
+   "lane": "github",
+   "col": 5,
+   "type": "security",
+   "label": "Human review",
+   "sublabel": "approve + CI"
+  }
+ ],
+ "edges": [
+  {
+   "from": "task",
+   "to": "factory",
+   "label": "batch",
+   "route": "drop",
+   "fromSide": "bottom",
+   "toSide": "top"
+  },
+  {
+   "from": "factory",
+   "to": "keycard",
+   "label": "tokens",
+   "role": "branch"
+  },
+  {
+   "from": "factory",
+   "to": "worker",
+   "label": "1 secret",
+   "variant": "emphasis",
+   "route": "drop",
+   "fromSide": "bottom",
+   "toSide": "top"
+  },
+  {
+   "from": "worker",
+   "to": "judge",
+   "label": "commits"
+  },
+  {
+   "from": "judge",
+   "to": "worker",
+   "label": "revise, max 3",
+   "role": "return",
+   "variant": "dashed",
+   "route": "bottom-channel",
+   "fromSide": "bottom",
+   "toSide": "bottom"
+  },
+  {
+   "from": "judge",
+   "to": "push",
+   "label": "verdict"
+  },
+  {
+   "from": "push",
+   "to": "nopr",
+   "label": "REFUTED",
+   "labelDy": -20,
+   "role": "error",
+   "variant": "security"
+  },
+  {
+   "from": "push",
+   "to": "pr",
+   "label": "VERIFIED, CAVEATS",
+   "variant": "emphasis",
+   "route": "drop",
+   "fromSide": "bottom",
+   "toSide": "top"
+  },
+  {
+   "from": "pr",
+   "to": "review"
+  },
+  {
+   "from": "nopr",
+   "to": "ntfy",
+   "label": "alert",
+   "role": "async",
+   "variant": "dashed",
+   "fromSide": "top",
+   "toSide": "bottom"
+  }
+ ]
+}
