@@ -400,6 +400,7 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
     -*) usage ;; *) [ -z "$dir" ] || usage; dir="$1"; shift ;; esac; done
   dir="${dir:-$QUEUE}"; [ -d "$dir" ] || die "no such queue: $dir"
   [ -z "$max" ] || [[ "$max" =~ ^[0-9]+$ ]] || die "--max-tasks needs a number"
+  case "${FACTORY_NOTIFY_URL:-}" in *[\"\\[:space:]]*) die "FACTORY_NOTIFY_URL must not contain quotes, backslashes or whitespace (it is written into a curl config)";; esac
   [ -z "$stop_at" ] || deadline=$(date -j -f %H:%M "$stop_at" +%s 2>/dev/null) || die "--stop-at needs HH:MM (local time, today)"   # today at HH:MM, as an epoch
   [ -e "$HALT" ] && die "dispatch blocked by $HALT ($(cat "$HALT")); remove it to resume"
   cmd_lint "$dir" || die "fix the queue before batching (see tasks.md)"
@@ -432,6 +433,10 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
       cells=$(jq -r '[(.exit_status // "running" | tostring), (.judge.rounds // "-" | tostring), (.judge.verdict // "-"), (.pr_url // "-")] | join(" | ")' "$m")
     else run_id="$batch_id-$name"; cells="$rc | - | - | -"; fi   # died before it was a run (bad task file, docker down)
     rows="$rows| $run_id | $cells | ${cb:--} | $(( $(date +%s) - t0 ))s |"$'\n'; n=$((n+1))
+    if [ "$rc" -ne 0 ] && [ -n "${FACTORY_NOTIFY_URL:-}" ]; then   # one line to a webhook; URL and body via curl config on stdin, not argv (the URL may carry a token)
+      printf 'url = "%s"\ndata = "%s"\n' "$FACTORY_NOTIFY_URL" "$batch_id: $name exited $rc ($(awk -F' [|] ' '{print $3}' <<< "$cells"), $([ -n "$cont" ] && echo continuing || echo stopped))" \
+        | curl -s -m 10 -o /dev/null -K - || true   # best effort: a dead webhook never stops the batch
+    fi
     if [ "$rc" -eq 0 ]; then dest=done; prev=$id; else dest=failed; prev=; failed="$failed$id "; fail=$rc; fi
     mkdir -p "$dir/$dest"; mv "$task" "$dir/$dest/$run_id.json"
     [ "$rc" -eq 0 ] || [ -n "$cont" ] || { why="$name exited $rc"; break; }   # 3 no changes, 4 PR failed, 5 REFUTED, 6 no verdict; the row has the verdict
