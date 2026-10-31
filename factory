@@ -26,6 +26,7 @@ ANTHROPIC_SERVICE_ACCOUNT="svac_01WjGbnYgXZB4GCXZgy9peKs"
 ANTHROPIC_WORKSPACE="wrkspc_01MdoKfH7Q8tMGuuWx1Fgrnk"
 ANTHROPIC_FEDERATION_RULE="fdrl_014KGxaZmUmk5veFbJ8uibXB"
 GITHUB_APP_ID="Iv23liCLESgW74Wn2Ie2"     # GitHub App client id (accepted as JWT issuer); the private key lives in Keycard Vault
+GITHUB_APP_SLUG="kmaida-software-factory"  # the App's bot user is <slug>[bot]; commits are attributed to it (its user id is looked up per run)
 GITHUB_APP_KEY_RESOURCE="urn:factory:github-app-key"
 OPENAI_RESOURCE="https://api.openai.com"       # Keycard Vault API Token credential on the OpenAI API resource: the Codex judge's key, fetched per judge round
 MAX_ROUNDS=3                                   # worker -> judge rounds before the verdict is final
@@ -151,7 +152,9 @@ run_container() {  # run_container <mode> <secret> [docker args...] -- [entrypoi
   printf '%s\n' "$secret" \
   | docker run -i --name "$cname" --label "factory.run=$run_id" --rm --read-only --tmpfs /tmp --tmpfs /run/secrets:size=64k \
     --memory 4g --cpus 2 --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges \
-    -e MODE="$mode" -e TASK_ID="$task_id" -e BASE_BRANCH="$from_branch" "${dargs[@]}" "$image_digest" "$@" 2>&1 \
+    -e MODE="$mode" -e TASK_ID="$task_id" -e BASE_BRANCH="$from_branch" \
+    -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
+    "${dargs[@]}" "$image_digest" "$@" 2>&1 \
   | while IFS= read -r line || [ -n "$line" ]; do
       line=${line//"$secret"/[REDACTED]}; line=${line//"$b64"/[REDACTED]}; printf '%s\n' "$line"
     done \
@@ -224,8 +227,18 @@ cmd_run() {
         --arg image "$image_digest" --arg fc "$factory_commit" --arg started "$(now)" --arg kz "$KEYCARD_ZONE" \
     '{run_id:$run_id, task_id:$task_id, job_sha256:$job, repo:$repo, base_branch:$base_branch, chain_base:(if $cb=="" then null else $cb end), base_sha:null,
       image_digest:$image, factory_commit:(if $fc=="" then null else $fc end), keycard_zone:$kz,
-      installation_id:null, started_at:$started, ended_at:null, exit_status:null, final_sha:null, pr_url:null}' \
+      installation_id:null, git_identity:null, started_at:$started, ended_at:null, exit_status:null, final_sha:null, pr_url:null}' \
     > "$rundir/manifest.json"
+
+  # Commits are authored by the App's bot user, so a ruleset that requires approval of unattributed changes accepts one human
+  # approval (a made-up bot email left keycard-workshop-platform#9 REVIEW_REQUIRED after approval). The user id comes from the
+  # public users API on every run, so the Dockerfile holds no id that can go stale. No id, no run: an unattributed PR is worse than none.
+  resp=$(curl -sS -w '\n%{http_code}' "https://api.github.com/users/${GITHUB_APP_SLUG}%5Bbot%5D" < /dev/null) || resp=
+  code=${resp##*$'\n'}; bot_id=$(printf '%s' "${resp%$'\n'*}" | jq -r 'if (.id|type)=="number" then .id else empty end' 2>/dev/null) || bot_id=
+  [ -n "$bot_id" ] || die "could not resolve the App bot user ${GITHUB_APP_SLUG}[bot] (GET /users returned HTTP ${code:-none}); commits would be unattributed"
+  git_name="${GITHUB_APP_SLUG}[bot]"; git_email="$bot_id+${GITHUB_APP_SLUG}[bot]@users.noreply.github.com"
+  manifest_set '. + {git_identity:{name:$n, email:$e}}' --arg n "$git_name" --arg e "$git_email"
+  log "commits authored as $git_name <$git_email>"
 
   # GitHub token for the clone and the push: this repo only, contents:write only, expires in 60 min. It cannot open, approve or
   # merge pull requests; the host opens the PR afterwards with a separate token. The worker and the judge never hold it.

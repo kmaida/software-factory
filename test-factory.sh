@@ -18,6 +18,7 @@ w= d= prev=; for a in "$@"; do case "$prev" in -d) d=$a;; esac; case "$a" in -w)
 code() { [ -n "$w" ] && printf '\n%s' "$1"; exit 0; }
 for a in "$@"; do case "$a" in
   resource=urn:factory:github-app-key) echo "{\"access_token\":\"$(cat "$STUB_APP_KEY")\"}"; exit 0;;
+  */users/*) if [ "${STUB_USER_FAIL:-}" = 1 ]; then printf '{"message":"Not Found"}'; code 404; else printf '{"login":"kmaida-software-factory[bot]","id":424243}'; code 200; fi;;   # the App bot user
   */installation) if [ "${STUB_INSTALL_404:-}" = 1 ]; then printf '{"message":"Not Found"}'; code 404; else printf '{"id":424242}'; code 200; fi;;
   */access_tokens) [ -z "${STUB_MINTS:-}" ] || printf '%s\n' "$d" >> "$STUB_MINTS"
      if [ -n "${STUB_MINT_FAIL_AFTER:-}" ] && [ "$(wc -l < "$STUB_MINTS")" -gt "$STUB_MINT_FAIL_AFTER" ]; then printf '{"message":"Bad credentials"}'; code 401; fi
@@ -73,6 +74,10 @@ runs="$here/runs"
 rc=$(run t1 "REFUTED,VERIFIED"); m=$(ls -d "$runs"/*-t1 | tail -1)
 check "$rc" 0 "t1 exit"; check "$(jq -r .judge.verdict "$m/manifest.json")" VERIFIED "t1 verdict"; check "$(jq -r .judge.rounds "$m/manifest.json")" 2 "t1 rounds"
 check "$(ls "$m" | grep -c judge-)" 2 "t1 judge files"; check "$(git -C "$t/remote.git" rev-parse refs/heads/factory/t1)" "$(jq -r .final_sha "$m/manifest.json")" "t1 pushed the judged commit"
+# The App bot identity reached `docker run` as git env: the stub commits with -c user.name=w, and env wins, so the pushed commit carries it.
+bot='kmaida-software-factory[bot] <424243+kmaida-software-factory[bot]@users.noreply.github.com>'
+check "$(git -C "$t/remote.git" log -1 --format='%an <%ae> %cn <%ce>' refs/heads/factory/t1)" "$bot $bot" "t1 commit authored and committed as the App bot"
+check "$(jq -r '"\(.git_identity.name) <\(.git_identity.email)>"' "$m/manifest.json")" "$bot" "t1 git_identity in manifest"
 grep -q 'Review of your previous attempt (round 1 verdict: REFUTED)' "$m/log.jsonl" || grep -q 'round 2: judge verdict VERIFIED' "$m/log.jsonl" || { echo "FAIL: t1 revision prompt/log"; exit 1; }
 rc=$(run t2 "REFUTED,REFUTED,REFUTED"); m=$(ls -d "$runs"/*-t2 | tail -1)
 check "$rc" 5 "t2 exit"; check "$(jq -r .judge.rounds "$m/manifest.json")" 3 "t2 rounds"; check "$(jq -r .pr_url "$m/manifest.json")" null "t2 no PR"
@@ -162,6 +167,10 @@ rc=$(run t7 CRLF); m=$(ls -d "$runs"/*-t7 | tail -1); check "$rc" 0 "t7 exit (CR
 rc=$(run t8 DOUBLE); m=$(ls -d "$runs"/*-t8 | tail -1); check "$rc" 6 "t8 exit (two VERDICT lines is no verdict)"
 rc=$(run t9 BIG); m=$(ls -d "$runs"/*-t9 | tail -1); check "$rc" 6 "t9 exit (review over 200000 bytes is no verdict)"; grep -q 'over 200000 bytes' "$m/log.jsonl" || { echo "FAIL: t9 oversize not logged"; exit 1; }
 rc=$(STUB_WORK_FAIL_ROUND=1 run t10 VERIFIED); m=$(ls -d "$runs"/*-t10 | tail -1); check "$rc" 7 "t10 exit"; check "$(jq -r '"\(.judge.rounds) \(.judge.verdict) \(.final_sha)"' "$m/manifest.json")" "0 null null" "t10 no judge round, nothing pushed"
+# The bot user lookup fails: no run (nothing cloned, nothing minted), with the HTTP status in the message.
+rc=$(STUB_USER_FAIL=1 run t11 VERIFIED); m=$(ls -d "$runs"/*-t11 | tail -1); check "$rc" 1 "t11 exit (bot user lookup failed)"
+grep -q 'could not resolve the App bot user kmaida-software-factory\[bot\] (GET /users returned HTTP 404)' "$t/t11.out" || { echo "FAIL: t11 message"; cat "$t/t11.out"; exit 1; }
+check "$(jq -r '"\(.git_identity) \(.base_sha) \(.exit_status)"' "$m/manifest.json")" "null null 1" "t11 nothing happened after the failed lookup"
 rm -rf "$runs"/*-t[0-9] "$runs"/*-t1[0-9]
 # GitHub App path: the installation is looked up per repo (recorded in the manifest), the token minted from it, the PR opened; a 404 fails closed before any clone.
 # git's insteadOf points the https URL at the local bare repo, so only curl is stubbed.
@@ -207,4 +216,4 @@ mkdir -p "$runs/stoptest"; echo '{"ended_at":null,"exit_status":null}' > "$runs/
 PATH="$t/bin:$PATH" STUB_DOCKER_PS_FAIL=1 "$here/factory" stop stoptest > "$t/stop.out" 2>&1 || { echo "FAIL: stop with docker down exited $?"; cat "$t/stop.out"; exit 1; }
 check "$(jq -r .exit_status "$runs/stoptest/manifest.json")" 137 "stop with docker down records the incident"; rm -f "$here/HALT"; rm -rf "$runs/stoptest"
 find "$runs" -maxdepth 1 -newer "$t/secrets" \( -name 'batch-*.md' -o -name '*-0[0-9]0-[a-z][a-z]-[a-d]' \) -exec rm -rf {} +   # the GitHub-path batch cases ran after the first sweep
-echo "ok: judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count), lint and batch (chain, refuted chain, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), stop with docker down"
+echo "ok: judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, App bot commit identity and its failed lookup), lint and batch (chain, refuted chain, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), stop with docker down"

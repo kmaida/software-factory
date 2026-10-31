@@ -12,6 +12,8 @@ Egress proxy / enforced network allowlist, Temporal, Socket, OpenShell, Kubernet
 
 The **orchestrator** on the mini is the trust boundary, not the container. It reads the task, mints credentials, builds the `docker run` command from a fixed schema, and collects results. Nothing the agent writes or says can change image, mounts, flags, repo, or token scope. Task text, repo contents, and tool output are untrusted input.
 
+Commits are attributed to the GitHub App's bot user (`kmaida-software-factory[bot]`, email `<id>+kmaida-software-factory[bot]@users.noreply.github.com`). The orchestrator resolves the id from the public users API at the start of every run, records it in the manifest as `git_identity`, and passes it to each container as `GIT_AUTHOR_*` and `GIT_COMMITTER_*`, so the image holds no identity and the safety-net commit uses the same one. A ruleset that requires approval of unattributed changes then accepts a single human approval; the earlier made-up `factory[bot]` identity could not be attributed to any account, and keycard-workshop-platform#9 stayed `REVIEW_REQUIRED` after approval. If the lookup fails the run does not start.
+
 ## Components
 
 ### 1. Sandboxed execution

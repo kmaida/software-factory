@@ -9,7 +9,11 @@
 #   push   GITHUB token      -v "$REPO_DIR":/src:ro -e REPO_URL -e HEAD_SHA              bare-clones /src, pushes HEAD_SHA to REPO_URL as factory/<task_id>
 #   printf '%s\n' "$SECRET" | docker run -i --rm --read-only --tmpfs /tmp --tmpfs /run/secrets:size=64k \
 #     --memory 4g --cpus 2 --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges \
-#     -e MODE=work -e TASK_ID -e BASE_BRANCH -v "$REPO_DIR":/work factory-sandbox@sha256:<digest> "<instructions>"
+#     -e MODE=work -e TASK_ID -e BASE_BRANCH -e GIT_AUTHOR_NAME -e GIT_AUTHOR_EMAIL -e GIT_COMMITTER_NAME -e GIT_COMMITTER_EMAIL \
+#     -v "$REPO_DIR":/work factory-sandbox@sha256:<digest> "<instructions>"
+# The four GIT_* variables carry the App's bot identity (<slug>[bot], <id>+<slug>[bot]@users.noreply.github.com), resolved by the
+# orchestrator per run; every commit here, the agent's and the safety net's, is attributed to the App. Nothing is hardcoded below:
+# without them git refuses to commit, which is the right failure.
 
 # Node 24 to match the target repos' CI (plan-my-today pins node-version: 24); the judge flagged the mismatch on the first run.
 FROM node:24-bookworm-slim@sha256:c86ecead9e55a5210ac1727de38a4ca840bf03dcaf34dc9749addbf383b1920c
@@ -31,8 +35,6 @@ export HOME=/tmp
 umask 077
 IFS= read -r SECRET
 printf '%s\n' "$SECRET" > /run/secrets/token; chmod 0400 /run/secrets/token
-git config --global user.name "factory[bot]"
-git config --global user.email "factory@users.noreply.github.com"
 git config --global --add safe.directory /work; git config --global --add safe.directory /src
 case "${MODE:-}" in
 work)
