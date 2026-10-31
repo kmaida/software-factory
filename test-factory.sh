@@ -206,8 +206,9 @@ jq -r 'select(.event.type=="factory") | .event.text' "$m/log.jsonl" | grep -q 'P
 # Chain against GitHub: 020 cuts its branch from factory/010-gc-a but both PRs are opened with base main (the task's own base_branch),
 # so a chain head merged and auto-deleted while the next task runs cannot make POST /pulls 422 "base ref not found".
 mkdir -p "$t/gc"; task o/r main 010-gc-a "$body" "$t/gc"; task o/r main 020-gc-b "$body" "$t/gc"
-rc=$(STUB_APP_KEY="$t/app-key.b64" STUB_PRS="$t/prs" batch "$t/gc" "VERIFIED,VERIFIED")
+rc=$(STUB_APP_KEY="$t/app-key.b64" STUB_PRS="$t/prs" FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/gc" "VERIFIED,VERIFIED")
 check "$rc" 0 "gh chain exit"; check "$(jq -r .base "$t/prs" | tr '\n' ' ')" "main main " "gh chain PRs both target main"
+check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" "done: 2 run, 2 PR(s), 0 failed. All tasks ran." "summary counts the PRs opened (no per-task line: both passed)"; rm -f "$t/notify"
 check "$(jq -r .head "$t/prs" | tr '\n' ' ')" "factory/010-gc-a factory/020-gc-b " "gh chain PR heads"
 m=$(ls -d "$runs"/*-020-gc-b | tail -1); check "$(jq -r '"\(.base_branch) \(.chain_base)"' "$m/manifest.json")" "main factory/010-gc-a" "gh chain 020 manifest"
 git -C "$t/remote.git" merge-base --is-ancestor refs/heads/factory/010-gc-a refs/heads/factory/020-gc-b || { echo "FAIL: gh chain 020 not cut from 010"; exit 1; }
