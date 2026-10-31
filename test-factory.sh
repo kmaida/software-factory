@@ -20,7 +20,7 @@ for a in "$@"; do case "$a" in
   resource=urn:factory:github-app-key) echo "{\"access_token\":\"$(cat "$STUB_APP_KEY")\"}"; exit 0;;
   */installation) if [ "${STUB_INSTALL_404:-}" = 1 ]; then printf '{"message":"Not Found"}'; code 404; else printf '{"id":424242}'; code 200; fi;;
   */access_tokens) [ -z "${STUB_MINTS:-}" ] || printf '%s\n' "$d" >> "$STUB_MINTS"; echo '{"token":"stub-installation-token"}'; exit 0;;
-  */pulls) [ -z "${STUB_PRS:-}" ] || printf '%s\n' "$d" >> "$STUB_PRS"; if [ "${STUB_PR_FAIL:-}" = 1 ]; then printf '{"message":"Validation Failed","errors":[{"message":"A pull request already exists for o:factory/gh3."}]}'; code 422; else printf '{"html_url":"https://github.com/o/r/pull/1"}'; code 201; fi;;
+  */pulls) [ -z "${STUB_PRS:-}" ] || printf '%s\n' "$d" >> "$STUB_PRS"; if [ "${STUB_PR_FAIL:-}" = 1 ]; then printf '{"message":"Validation Failed","errors":[{"message":"A pull request already exists for o:factory/gh3."}]}'; code 422; else printf '{"html_url":"https://github.com/o/r/pull/1","body":"%s"}' "$(printf 'x%.0s' $(seq 2500))"; code 201; fi;;   # >2000 bytes, like a real one: the URL must still be parsed
 esac; done
 echo '{"access_token":"stub-token"}'
 C
@@ -143,7 +143,7 @@ rm -rf "$runs"/*-t[1-8]
 export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.$t/remote.git.insteadOf" GIT_CONFIG_VALUE_0="https://github.com/o/r.git"
 rc=$(RUN_REPO=o/r STUB_MINTS="$t/mints" run gh1 VERIFIED); m=$(ls -d "$runs"/*-gh1 | tail -1)
 check "$rc" 0 "gh1 exit"; check "$(jq -r .installation_id "$m/manifest.json")" 424242 "gh1 installation_id in manifest"
-check "$(jq -r .pr_url "$m/manifest.json")" https://github.com/o/r/pull/1 "gh1 PR opened"
+check "$(jq -r .pr_url "$m/manifest.json")" https://github.com/o/r/pull/1 "gh1 PR opened (URL parsed from a >2000-byte 201 body)"
 # The PR mint (the last one) asks for exactly pull_requests:write + contents:read: contents:read so POST /pulls can resolve refs on a private repo, nothing that could push, approve or merge.
 check "$(tail -1 "$t/mints" | jq -c '.permissions == {"pull_requests":"write","contents":"read"} and .repositories == ["r"]')" true "gh1 PR token permissions"
 check "$(grep -c '"contents":"write"' "$t/mints")" 2 "gh1 clone and push mints are contents:write"

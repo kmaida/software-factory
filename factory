@@ -101,9 +101,11 @@ open_pr() {  # open_pr <owner/name> <task_id> <base> <instructions>: fresh pull_
   | curl -sS -K - -w '\n%{http_code}' -X POST "https://api.github.com/repos/$1/pulls" -H "Accept: application/vnd.github+json" \
       -d "$(jq -nc --arg t "factory: $2" --arg h "factory/$2" --arg b "$3" --arg body "$4" \
              '{title:$t, head:$h, base:$b, body:("Opened by the factory for task `"+$t+"`.\n\n"+$body)}')")
-  code=${resp##*$'\n'}; body=${resp%$'\n'*}; body=${body//"$tok"/[REDACTED]}; body=${body:0:2000}; tok=
+  code=${resp##*$'\n'}; body=${resp%$'\n'*}; body=${body//"$tok"/[REDACTED]}; tok=
+  # The 201 body carries the whole PR body, so it is parsed untruncated: a cut JSON would make jq fail and report a created PR as exit 4.
   if [ "$code" = 201 ]; then printf '%s' "$body" | jq -r '.html_url // empty'; return; fi
   # Exit 4 must be diagnosable from the run dir alone: status and (redacted, bounded) body go to the log and the manifest.
+  body=${body:0:2000}
   log "POST /repos/$1/pulls failed: HTTP ${code:-none} $body"
   manifest_set '.pr_error = {status:(if $c=="" then null else ($c|tonumber) end), body:$b}' --arg c "$code" --arg b "$body"
   return 1
