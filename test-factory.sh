@@ -9,9 +9,19 @@ mkdir -p "$t/bin" "$t/secrets" "$t/runs"
 for f in keycard_client_id keycard_client_secret github_token openai_key; do echo "dummy-$f" > "$t/secrets/$f"; done
 git init -q --bare "$t/remote.git"; git clone -q "$t/remote.git" "$t/seed" 2>/dev/null
 ( cd "$t/seed" && echo hi > README.md && git add . && git -c commit.gpgsign=false -c user.name=t -c user.email=t@t commit -qm init && git push -q origin HEAD:main )
+openssl genrsa 2048 2>/dev/null | openssl base64 -A > "$t/app-key.b64"   # a real key: mint_github_token signs a JWT with it
 cat > "$t/bin/curl" <<'C'
-#!/bin/sh
+#!/bin/bash
+# Stub: answers by URL. GitHub App calls (installation lookup, token, PR) are real-shaped; STUB_INSTALL_404=1 makes the lookup 404.
 [ -t 0 ] || cat >/dev/null
+w=; for a in "$@"; do case "$a" in -w) w=1;; esac; done
+code() { [ -n "$w" ] && printf '\n%s' "$1"; exit 0; }
+for a in "$@"; do case "$a" in
+  resource=urn:factory:github-app-key) echo "{\"access_token\":\"$(cat "$STUB_APP_KEY")\"}"; exit 0;;
+  */installation) if [ "${STUB_INSTALL_404:-}" = 1 ]; then printf '{"message":"Not Found"}'; code 404; else printf '{"id":424242}'; code 200; fi;;
+  */access_tokens) echo '{"token":"stub-installation-token"}'; exit 0;;
+  */pulls) echo '{"html_url":"https://github.com/o/r/pull/1"}'; exit 0;;
+esac; done
 echo '{"access_token":"stub-token"}'
 C
 cat > "$t/bin/docker" <<'D'
@@ -42,10 +52,10 @@ case "$mode" in
 esac
 D
 chmod +x "$t/bin/"*
-run() {  # run <task_id> <verdicts> -> prints exit status
-  echo "{\"repo\":\"$t/remote.git\",\"base_branch\":\"main\",\"task_id\":\"$1\",\"instructions\":\"do the thing\"}" > "$t/$1.json"
+run() {  # run <task_id> <verdicts> -> prints exit status; RUN_REPO overrides the local bare repo (a GitHub owner/name goes through the App path)
+  echo "{\"repo\":\"${RUN_REPO:-$t/remote.git}\",\"base_branch\":\"main\",\"task_id\":\"$1\",\"instructions\":\"do the thing\"}" > "$t/$1.json"
   rm -f "$t/state"; set +e
-  PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 \
+  PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_APP_KEY="$t/app-key.b64" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 \
     "$here/factory" run "$t/$1.json" >"$t/$1.out" 2>&1; rc=$?; set -e
   echo "$rc"
 }
@@ -127,4 +137,15 @@ find "$runs" -maxdepth 1 -newer "$t/secrets" \( -name 'batch-*.md' -o -name '*-0
 rc=$(STUB_WORK_IDLE_ROUND=2 run t6 "CAVEATS"); m=$(ls -d "$runs"/*-t6 | tail -1)
 check "$rc" 0 "t6 exit (caveats, idle revision ships)"; check "$(jq -r .judge.rounds "$m/manifest.json")" 1 "t6 rounds counts judged rounds only"
 rm -rf "$runs"/*-t[1-8]
-echo "ok: judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction), lint and batch (chain, refuted chain, max-tasks, stop-at, halt, no-chain, continue)"
+# GitHub App path: the installation is looked up per repo (recorded in the manifest), the token minted from it, the PR opened; a 404 fails closed before any clone.
+# git's insteadOf points the https URL at the local bare repo, so only curl is stubbed.
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.$t/remote.git.insteadOf" GIT_CONFIG_VALUE_0="https://github.com/o/r.git"
+rc=$(RUN_REPO=o/r run gh1 VERIFIED); m=$(ls -d "$runs"/*-gh1 | tail -1)
+check "$rc" 0 "gh1 exit"; check "$(jq -r .installation_id "$m/manifest.json")" 424242 "gh1 installation_id in manifest"
+check "$(jq -r .pr_url "$m/manifest.json")" https://github.com/o/r/pull/1 "gh1 PR opened"
+rc=$(RUN_REPO=o/r STUB_INSTALL_404=1 run gh2 VERIFIED); m=$(ls -d "$runs"/*-gh2 | tail -1)
+check "$rc" 1 "gh2 exit (404 fails closed)"; grep -q 'not installed on o/r' "$t/gh2.out" || { echo "FAIL: gh2 404 message"; cat "$t/gh2.out"; exit 1; }
+check "$(jq -r .installation_id "$m/manifest.json")" null "gh2 no installation recorded"; check "$(jq -r .base_sha "$m/manifest.json")" null "gh2 never cloned"
+unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+
+echo "ok: judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction), lint and batch (chain, refuted chain, max-tasks, stop-at, halt, no-chain, continue), GitHub App (installation lookup, 404)"
