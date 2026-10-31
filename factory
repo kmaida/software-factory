@@ -90,10 +90,12 @@ mint_github_token() {  # mint_github_token <owner/name> <pem> <permissions-json>
       -d "{\"repositories\":[\"${1##*/}\"],\"permissions\":$3}" \
   | jq -r '.token // empty'
 }
-open_pr() {  # open_pr <owner/name> <task_id> <base> <instructions>: fresh pull_requests:write token, one API call, prints the PR URL
+open_pr() {  # open_pr <owner/name> <task_id> <base> <instructions>: fresh pull_requests:write + contents:read token, one API call, prints the PR URL
+  # contents:read is required: POST /pulls resolves head and base refs, and on a private repo that is 422 "not all refs are readable" without it.
+  # The token can read refs but still cannot push (no contents:write), approve or merge.
   key=$(keycard_token "$GITHUB_APP_KEY_RESOURCE" | openssl base64 -d -A 2>/dev/null) || return 1
   [ -n "$key" ] || return 1
-  tok=$(mint_github_token "$1" "$key" '{"pull_requests":"write"}'); key=
+  tok=$(mint_github_token "$1" "$key" '{"pull_requests":"write","contents":"read"}'); key=
   [ -n "$tok" ] || return 1
   resp=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" \
   | curl -sS -K - -w '\n%{http_code}' -X POST "https://api.github.com/repos/$1/pulls" -H "Accept: application/vnd.github+json" \
@@ -294,7 +296,7 @@ cmd_run() {
       case "$verdict" in
         VERIFIED|CAVEATS)
           if [ "$gh_src" != file ]; then
-            # The PR is opened here, not by an agent: a separate token with pull_requests:write that no container ever held.
+            # The PR is opened here, not by an agent: a separate token (pull_requests:write + contents:read, so it can read refs but not push) that no container ever held.
             body="$instructions"$'\n\n'"## Judge (Codex), $round round(s), verdict $verdict"$'\n\n'"$findings"
             pr_url=$(open_pr "$repo" "$task_id" "$base_branch" "$body") || pr_url=
             if [ -n "$pr_url" ]; then log "opened $pr_url"; else log "branch factory/$task_id pushed but opening the PR failed; open it by hand"; status=4; fi

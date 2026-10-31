@@ -14,12 +14,12 @@ cat > "$t/bin/curl" <<'C'
 #!/bin/bash
 # Stub: answers by URL. GitHub App calls (installation lookup, token, PR) are real-shaped; STUB_INSTALL_404=1 makes the lookup 404.
 [ -t 0 ] || cat >/dev/null
-w=; for a in "$@"; do case "$a" in -w) w=1;; esac; done
+w= d= prev=; for a in "$@"; do case "$prev" in -d) d=$a;; esac; case "$a" in -w) w=1;; esac; prev=$a; done
 code() { [ -n "$w" ] && printf '\n%s' "$1"; exit 0; }
 for a in "$@"; do case "$a" in
   resource=urn:factory:github-app-key) echo "{\"access_token\":\"$(cat "$STUB_APP_KEY")\"}"; exit 0;;
   */installation) if [ "${STUB_INSTALL_404:-}" = 1 ]; then printf '{"message":"Not Found"}'; code 404; else printf '{"id":424242}'; code 200; fi;;
-  */access_tokens) echo '{"token":"stub-installation-token"}'; exit 0;;
+  */access_tokens) [ -z "${STUB_MINTS:-}" ] || printf '%s\n' "$d" >> "$STUB_MINTS"; echo '{"token":"stub-installation-token"}'; exit 0;;
   */pulls) if [ "${STUB_PR_FAIL:-}" = 1 ]; then printf '{"message":"Validation Failed","errors":[{"message":"A pull request already exists for o:factory/gh3."}]}'; code 422; else printf '{"html_url":"https://github.com/o/r/pull/1"}'; code 201; fi;;
 esac; done
 echo '{"access_token":"stub-token"}'
@@ -140,9 +140,12 @@ rm -rf "$runs"/*-t[1-8]
 # GitHub App path: the installation is looked up per repo (recorded in the manifest), the token minted from it, the PR opened; a 404 fails closed before any clone.
 # git's insteadOf points the https URL at the local bare repo, so only curl is stubbed.
 export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="url.$t/remote.git.insteadOf" GIT_CONFIG_VALUE_0="https://github.com/o/r.git"
-rc=$(RUN_REPO=o/r run gh1 VERIFIED); m=$(ls -d "$runs"/*-gh1 | tail -1)
+rc=$(RUN_REPO=o/r STUB_MINTS="$t/mints" run gh1 VERIFIED); m=$(ls -d "$runs"/*-gh1 | tail -1)
 check "$rc" 0 "gh1 exit"; check "$(jq -r .installation_id "$m/manifest.json")" 424242 "gh1 installation_id in manifest"
 check "$(jq -r .pr_url "$m/manifest.json")" https://github.com/o/r/pull/1 "gh1 PR opened"
+# The PR mint (the last one) asks for exactly pull_requests:write + contents:read: contents:read so POST /pulls can resolve refs on a private repo, nothing that could push, approve or merge.
+check "$(tail -1 "$t/mints" | jq -c '.permissions == {"pull_requests":"write","contents":"read"} and .repositories == ["r"]')" true "gh1 PR token permissions"
+check "$(grep -c '"contents":"write"' "$t/mints")" 2 "gh1 clone and push mints are contents:write"
 rc=$(RUN_REPO=o/r STUB_INSTALL_404=1 run gh2 VERIFIED); m=$(ls -d "$runs"/*-gh2 | tail -1)
 check "$rc" 1 "gh2 exit (404 fails closed)"; grep -q 'not installed on o/r' "$t/gh2.out" || { echo "FAIL: gh2 404 message"; cat "$t/gh2.out"; exit 1; }
 check "$(jq -r .installation_id "$m/manifest.json")" null "gh2 no installation recorded"; check "$(jq -r .base_sha "$m/manifest.json")" null "gh2 never cloned"
