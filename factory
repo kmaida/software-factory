@@ -76,8 +76,15 @@ mint_github_token() {  # mint_github_token <owner/name> <pem> <permissions-json>
   sig=$(printf '%s.%s' "$hdr" "$pld" | openssl dgst -sha256 -sign <(printf '%s\n' "$2") -binary | b64url)   # key never touches disk
   jwt_cfg=$(printf 'header = "Authorization: Bearer %s.%s.%s"\nheader = "Accept: application/vnd.github+json"\n' "$hdr" "$pld" "$sig")
   # The App has one installation per account it is installed on, so the installation is looked up from the repo, not pinned.
-  inst=$(printf '%s\n' "$jwt_cfg" | curl -sS -K - "https://api.github.com/repos/$1/installation" | jq -r '.id // empty')
+  resp=$(printf '%s\n' "$jwt_cfg" | curl -sS -K - -w '\n%{http_code}' "https://api.github.com/repos/$1/installation")
+  code=${resp##*$'\n'}; body=${resp%$'\n'*}
+  case "$code" in
+    200) inst=$(printf '%s' "$body" | jq -r '.id // empty') ;;
+    404) echo "factory: GitHub App $GITHUB_APP_ID is not installed on $1 (GET /repos/$1/installation returned 404). Install it on ${1%%/*}, or add the repo to the existing installation: https://github.com/apps/kmaida-software-factory/installations/new" >&2; return 1 ;;
+    *)   echo "factory: installation lookup for $1 failed (HTTP $code): $(printf '%s' "$body" | jq -r '.message // empty')" >&2; return 1 ;;
+  esac
   [ -n "$inst" ] || return 1
+  if [ -n "${rundir:-}" ]; then manifest_set '.installation_id = $id' --argjson id "$inst"; fi   # evidence: which installation issued this run's tokens
   printf '%s\n' "$jwt_cfg" \
   | curl -sS -K - -X POST "https://api.github.com/app/installations/$inst/access_tokens" \
       -d "{\"repositories\":[\"${1##*/}\"],\"permissions\":$3}" \
@@ -193,7 +200,7 @@ cmd_run() {
         --arg image "$image_digest" --arg fc "$factory_commit" --arg started "$(now)" --arg kz "$KEYCARD_ZONE" \
     '{run_id:$run_id, task_id:$task_id, job_sha256:$job, repo:$repo, base_branch:$base_branch, chain_base:(if $cb=="" then null else $cb end), base_sha:null,
       image_digest:$image, factory_commit:(if $fc=="" then null else $fc end), keycard_zone:$kz,
-      started_at:$started, ended_at:null, exit_status:null, final_sha:null, pr_url:null}' \
+      installation_id:null, started_at:$started, ended_at:null, exit_status:null, final_sha:null, pr_url:null}' \
     > "$rundir/manifest.json"
 
   # GitHub token for the clone and the push: this repo only, contents:write only, expires in 60 min. It cannot open, approve or
@@ -202,7 +209,7 @@ cmd_run() {
     https://github.com/*) app_key=$(keycard_token "$GITHUB_APP_KEY_RESOURCE" | openssl base64 -d -A 2>/dev/null) || app_key=
                           [ -n "$app_key" ] || die "Keycard did not issue the GitHub App key (zone $KEYCARD_ZONE, resource $GITHUB_APP_KEY_RESOURCE)"
                           gh_tok=$(mint_github_token "$repo" "$app_key" '{"contents":"write"}') || gh_tok=; app_key=
-                          [ -n "$gh_tok" ] || die "GitHub did not issue an installation token for $repo (app $GITHUB_APP_ID: is it installed on that repo?)"
+                          [ -n "$gh_tok" ] || die "GitHub did not issue an installation token for $repo"
                           gh_src="GitHub App $GITHUB_APP_ID, repo $repo; key from Keycard $GITHUB_APP_KEY_RESOURCE" ;;
     *) gh_tok=$(cat "$FACTORY_SECRETS_DIR/github_token"); gh_src="file" ;;
   esac
