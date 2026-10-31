@@ -97,10 +97,10 @@ check "$(jq -r .judge.rounds "$m/manifest.json")" 1 "t5 rounds counts judged rou
 body='Goal: g.\nContext: c.\nScope: s.\nDone when: tests pass.\nOut of scope: o.'
 task() { printf '{"repo":"%s","base_branch":"%s","task_id":"%s","instructions":"%s"}\n' "$1" "$2" "$3" "$4" > "$5/$3.json"; }
 mkdir -p "$t/lint-ok" "$t/lint-bad"
-task o/r main 010-a "$body" "$t/lint-ok"; task o/r factory/010-a 020-b "$body" "$t/lint-ok"
+task o/r main 010-a "$body" "$t/lint-ok"; task o/r factory/010-a 020-b "$body" "$t/lint-ok"; task o/r main 015a-c "$body" "$t/lint-ok"   # 015a: a split task
 printf '{"repo":"o/r","base_branch":"factory/030-c","task_id":"010-x","instructions":"%s"}\n' "$body" > "$t/lint-bad/010-a.json"
 task o/r main 020-b 'Goal: g.\nDone when: y.' "$t/lint-bad"; task o/r main 030-c "$body" "$t/lint-bad"
-check "$("$here/factory" lint "$t/lint-ok")" "lint ok: 2 task(s)" "lint ok"
+check "$("$here/factory" lint "$t/lint-ok")" "lint ok: 3 task(s)" "lint ok (including a split-task id)"
 set +e; out=$("$here/factory" lint "$t/lint-bad"); rc=$?; set -e
 check "$rc" 1 "lint bad exit"; check "$(printf '%s\n' "$out" | grep -c '^0[12]0-[ab]:')" 2 "lint bad reports the two broken files"
 printf '%s\n' "$out" | grep -q "010-a: task_id '010-x' is not the filename; base_branch factory/030-c is a later task in the queue" || { echo "FAIL: lint messages: $out"; exit 1; }
