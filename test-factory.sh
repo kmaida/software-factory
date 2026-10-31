@@ -133,13 +133,16 @@ rc=$(FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$
 check "$rc" 5 "refuted chain exit"; check "$(moved rf/done)" "010-rf-a.json " "refuted chain done/"; check "$(moved rf/failed)" "020-rf-b.json " "refuted chain failed/"
 check "$(moved rf)" "030-rf-c.json done failed " "refuted chain leaves 030 queued"; check "$(ls -d "$runs"/*-030-rf-c 2>/dev/null | wc -l | tr -d ' ')" 0 "refuted chain never ran 030"
 grep -q '^Stopped: 020-rf-b exited 5\. 1 task(s) left in queue\.' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: refuted report"; cat "$t/batch.out"; exit 1; }
-# FACTORY_NOTIFY_URL: one line per non-zero exit (010 passed: no line), with the verdict and whether the batch went on.
-check "$(cat "$t/notify")" "$(basename "$(ls "$runs"/batch-*.md | tail -1)" .md): 020-rf-b exited 5 (REFUTED, stopped)" "notify line on stop"; rm -f "$t/notify"
+# FACTORY_NOTIFY_URL: one line per non-zero exit (010 passed: no line), with the verdict and whether the batch went on, then one summary line.
+bid=$(basename "$(ls "$runs"/batch-*.md | tail -1)" .md)
+check "$(cat "$t/notify")" "$bid: 020-rf-b exited 5 (REFUTED, stopped)
+$bid: done: 2 run, 0 PR(s), 1 failed. Stopped: 020-rf-b exited 5. 1 task(s) left in queue." "notify lines on stop"; rm -f "$t/notify"
 # --max-tasks 1, --stop-at in the past (nothing runs, nothing moves), HALT written during 010's push (020 stays), --no-chain.
 queue mx 010-mx-a 020-mx-b; rc=$(batch "$t/mx" "VERIFIED" --max-tasks 1)
 check "$rc" 0 "max-tasks exit"; check "$(moved mx/done)" "010-mx-a.json " "max-tasks done/"; check "$(moved mx)" "020-mx-b.json done " "max-tasks leaves 020"
-queue st 010-st-a; rc=$(batch "$t/st" "VERIFIED" --stop-at 00:00)
+queue st 010-st-a; rc=$(FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/st" "VERIFIED" --stop-at 00:00)
 check "$rc" 0 "stop-at exit"; check "$(moved st)" "010-st-a.json " "stop-at runs nothing"; grep -q 'Stopped: --stop-at 00:00 passed' "$t/batch.out" || { echo "FAIL: stop-at message"; exit 1; }
+check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" "done: 0 run, 0 PR(s), 0 failed. Stopped: --stop-at 00:00 passed. 1 task(s) left in queue." "summary line when nothing ran"; rm -f "$t/notify"
 queue ha 010-ha-a 020-ha-b; rc=$(STUB_HALT_AFTER=010-ha-a STUB_HALT_FILE="$here/HALT" batch "$t/ha" "VERIFIED,VERIFIED")
 check "$rc" 0 "halt exit"; check "$(moved ha/done)" "010-ha-a.json " "halt done/"; check "$(moved ha)" "020-ha-b.json done " "halt leaves 020"
 grep -q 'Stopped: halted by' "$t/batch.out" || { echo "FAIL: halt message"; cat "$t/batch.out"; exit 1; }; rm -f "$here/HALT"
@@ -153,7 +156,8 @@ check "$rc" 5 "continue exit"; check "$(moved sw/done)" "010-sw-a.json 040-sw-d.
 check "$(ls -d "$runs"/*-030-sw-c 2>/dev/null | wc -l | tr -d ' ')" 0 "continue never ran the dependent of a failed task"
 m=$(ls -d "$runs"/*-040-sw-d | tail -1); check "$(jq -r '"\(.base_branch) \(.chain_base)"' "$m/manifest.json")" "main null" "continue resumes from the task's own base"
 grep -q '030-sw-c: skipped, its base factory/020-sw-b failed in this batch' "$t/batch.out" || { echo "FAIL: skip message"; cat "$t/batch.out"; exit 1; }
-check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" "020-sw-b exited 5 (REFUTED, continuing)" "notify line with --continue; a skipped task sends none"; rm -f "$t/notify"
+check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" "020-sw-b exited 5 (REFUTED, continuing)
+done: 3 run, 0 PR(s), 1 failed. All tasks ran." "notify lines with --continue; a skipped task sends none and is not counted as run"; rm -f "$t/notify"
 queue nn 010-nn-a; rc=$(STUB_NOTIFY="$t/notify" batch "$t/nn" "REFUTED,REFUTED,REFUTED"); check "$rc" 5 "no-notify exit"; [ ! -e "$t/notify" ] || { echo "FAIL: POST without FACTORY_NOTIFY_URL"; exit 1; }
 queue nu 010-nu-a; rc=$(FACTORY_NOTIFY_URL=$'http://x"\nwrite-out=INJECTED' batch "$t/nu" VERIFIED); check "$rc" 1 "a URL that could break the curl config is refused"; check "$(moved nu)" "010-nu-a.json " "refused URL: nothing ran"
 # --continue, chain on: 010 fails, 020 (on main) passes, 030 declares base factory/010 -> skipped although the chain would have put it on 020.
@@ -202,8 +206,9 @@ jq -r 'select(.event.type=="factory") | .event.text' "$m/log.jsonl" | grep -q 'P
 # Chain against GitHub: 020 cuts its branch from factory/010-gc-a but both PRs are opened with base main (the task's own base_branch),
 # so a chain head merged and auto-deleted while the next task runs cannot make POST /pulls 422 "base ref not found".
 mkdir -p "$t/gc"; task o/r main 010-gc-a "$body" "$t/gc"; task o/r main 020-gc-b "$body" "$t/gc"
-rc=$(STUB_APP_KEY="$t/app-key.b64" STUB_PRS="$t/prs" batch "$t/gc" "VERIFIED,VERIFIED")
+rc=$(STUB_APP_KEY="$t/app-key.b64" STUB_PRS="$t/prs" FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/gc" "VERIFIED,VERIFIED")
 check "$rc" 0 "gh chain exit"; check "$(jq -r .base "$t/prs" | tr '\n' ' ')" "main main " "gh chain PRs both target main"
+check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" "done: 2 run, 2 PR(s), 0 failed. All tasks ran." "summary counts the PRs opened (no per-task line: both passed)"; rm -f "$t/notify"
 check "$(jq -r .head "$t/prs" | tr '\n' ' ')" "factory/010-gc-a factory/020-gc-b " "gh chain PR heads"
 m=$(ls -d "$runs"/*-020-gc-b | tail -1); check "$(jq -r '"\(.base_branch) \(.chain_base)"' "$m/manifest.json")" "main factory/010-gc-a" "gh chain 020 manifest"
 git -C "$t/remote.git" merge-base --is-ancestor refs/heads/factory/010-gc-a refs/heads/factory/020-gc-b || { echo "FAIL: gh chain 020 not cut from 010"; exit 1; }
