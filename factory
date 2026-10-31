@@ -27,7 +27,6 @@ ANTHROPIC_WORKSPACE="wrkspc_01MdoKfH7Q8tMGuuWx1Fgrnk"
 ANTHROPIC_FEDERATION_RULE="fdrl_014KGxaZmUmk5veFbJ8uibXB"
 GITHUB_APP_ID="Iv23liCLESgW74Wn2Ie2"     # GitHub App client id (accepted as JWT issuer); the private key lives in Keycard Vault
 GITHUB_APP_KEY_RESOURCE="urn:factory:github-app-key"
-GITHUB_APP_INSTALLATION="176545264"
 OPENAI_RESOURCE="https://api.openai.com"       # Keycard Vault API Token credential on the OpenAI API resource: the Codex judge's key, fetched per judge round
 MAX_ROUNDS=3                                   # worker -> judge rounds before the verdict is final
 
@@ -70,21 +69,24 @@ keycard_token() {  # keycard_token <resource>: client-credentials token for this
   | curl -sS -K - "$KEYCARD_ZONE/oauth/2/token" -d grant_type=client_credentials -d "resource=$1" \
   | jq -r '.access_token // empty'
 }
-mint_github_token() {  # mint_github_token <repo-name> <pem> <permissions-json>: 1h installation token scoped to that repo
+mint_github_token() {  # mint_github_token <owner/name> <pem> <permissions-json>: 1h installation token scoped to that repo
   t=$(date +%s)
   hdr=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
   pld=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((t-60)) $((t+540)) "$GITHUB_APP_ID" | b64url)
   sig=$(printf '%s.%s' "$hdr" "$pld" | openssl dgst -sha256 -sign <(printf '%s\n' "$2") -binary | b64url)   # key never touches disk
-  printf 'header = "Authorization: Bearer %s.%s.%s"\n' "$hdr" "$pld" "$sig" \
-  | curl -sS -K - -X POST "https://api.github.com/app/installations/$GITHUB_APP_INSTALLATION/access_tokens" \
-      -H "Accept: application/vnd.github+json" \
-      -d "{\"repositories\":[\"$1\"],\"permissions\":$3}" \
+  jwt_cfg=$(printf 'header = "Authorization: Bearer %s.%s.%s"\nheader = "Accept: application/vnd.github+json"\n' "$hdr" "$pld" "$sig")
+  # The App has one installation per account it is installed on, so the installation is looked up from the repo, not pinned.
+  inst=$(printf '%s\n' "$jwt_cfg" | curl -sS -K - "https://api.github.com/repos/$1/installation" | jq -r '.id // empty')
+  [ -n "$inst" ] || return 1
+  printf '%s\n' "$jwt_cfg" \
+  | curl -sS -K - -X POST "https://api.github.com/app/installations/$inst/access_tokens" \
+      -d "{\"repositories\":[\"${1##*/}\"],\"permissions\":$3}" \
   | jq -r '.token // empty'
 }
 open_pr() {  # open_pr <owner/name> <task_id> <base> <instructions>: fresh pull_requests:write token, one API call, prints the PR URL
   key=$(keycard_token "$GITHUB_APP_KEY_RESOURCE" | openssl base64 -d -A 2>/dev/null) || return 1
   [ -n "$key" ] || return 1
-  tok=$(mint_github_token "${1##*/}" "$key" '{"pull_requests":"write"}'); key=
+  tok=$(mint_github_token "$1" "$key" '{"pull_requests":"write"}'); key=
   [ -n "$tok" ] || return 1
   printf 'header = "Authorization: Bearer %s"\n' "$tok" \
   | curl -sS -K - -X POST "https://api.github.com/repos/$1/pulls" -H "Accept: application/vnd.github+json" \
@@ -199,9 +201,9 @@ cmd_run() {
   case "$repo_url" in
     https://github.com/*) app_key=$(keycard_token "$GITHUB_APP_KEY_RESOURCE" | openssl base64 -d -A 2>/dev/null) || app_key=
                           [ -n "$app_key" ] || die "Keycard did not issue the GitHub App key (zone $KEYCARD_ZONE, resource $GITHUB_APP_KEY_RESOURCE)"
-                          gh_tok=$(mint_github_token "${repo##*/}" "$app_key" '{"contents":"write"}') || gh_tok=; app_key=
-                          [ -n "$gh_tok" ] || die "GitHub did not issue an installation token for $repo (app $GITHUB_APP_ID, installation $GITHUB_APP_INSTALLATION)"
-                          gh_src="GitHub App installation $GITHUB_APP_INSTALLATION, repo $repo; key from Keycard $GITHUB_APP_KEY_RESOURCE" ;;
+                          gh_tok=$(mint_github_token "$repo" "$app_key" '{"contents":"write"}') || gh_tok=; app_key=
+                          [ -n "$gh_tok" ] || die "GitHub did not issue an installation token for $repo (app $GITHUB_APP_ID: is it installed on that repo?)"
+                          gh_src="GitHub App $GITHUB_APP_ID, repo $repo; key from Keycard $GITHUB_APP_KEY_RESOURCE" ;;
     *) gh_tok=$(cat "$FACTORY_SECRETS_DIR/github_token"); gh_src="file" ;;
   esac
 
@@ -270,7 +272,7 @@ cmd_run() {
     case "$gh_src" in
       file) gh_tok=$(cat "$FACTORY_SECRETS_DIR/github_token") ;;
       *) app_key=$(keycard_token "$GITHUB_APP_KEY_RESOURCE" | openssl base64 -d -A 2>/dev/null) || app_key=
-         gh_tok=$(mint_github_token "${repo##*/}" "$app_key" '{"contents":"write"}') || gh_tok=; app_key= ;;
+         gh_tok=$(mint_github_token "$repo" "$app_key" '{"contents":"write"}') || gh_tok=; app_key= ;;
     esac
     [ -n "$gh_tok" ] || die "GitHub did not issue a push token for $repo"
     run_container push "$gh_tok" -v "$work":/src:ro -e REPO_URL="$repo_url" -e HEAD_SHA="$head" --; gh_tok=   # read-only mount; pushes the judged commit by SHA
