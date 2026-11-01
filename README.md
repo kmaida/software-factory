@@ -12,10 +12,10 @@ One run takes one task through these steps:
 
 1. The orchestrator (`factory`, a bash script on the Mac mini) checks the task file, takes the one-job lock, and writes `runs/<run_id>/manifest.json` before it issues any credential.
 2. It gets the GitHub App private key from Keycard Vault, mints a one-hour installation token scoped to the target repo, and clones the repo.
-3. It gets a one-hour Anthropic token (Keycard issues a signed token, and Anthropic Workload Identity Federation exchanges it) and starts the worker container. Claude Code reads `worker-prompt.md` and the task, then commits on `factory/<task_id>`. Before it writes code, it checks that every table, file, export and dependency the task relies on exists on the branch. If one is missing, it commits `docs/BLOCKED-<task_id>.md` naming what's missing and stops. If the worker changes nothing, the run ends with exit 3.
+3. It gets a one-hour Anthropic token (Keycard issues a signed token, and Anthropic Workload Identity Federation exchanges it) and starts the worker container. Claude Code reads `worker-prompt.md` and the task, then commits on `factory/<task_id>`. Before it writes code, it checks that every table, file, export and dependency the task relies on exists on the branch. If one is missing and the task doesn't add it, the worker commits `docs/BLOCKED-<task_id>.md` naming what's missing and stops. If the first round makes no commits, the run ends with exit 3.
 4. The orchestrator gets the Codex key from Keycard Vault and starts the judge container on a read-only copy of the worker's tree. Codex follows `judge-prompt.md`: it reads the diff, runs the repo's checks, looks for bugs, scope creep, weakened tests and over-engineering. It then lists each "Done when" clause as `DONE` (with the test or command that proves it) or `MISSING`, and ends with one verdict. Any `MISSING` clause rules out VERIFIED and CAVEATS.
-5. Any verdict except VERIFIED goes back to the worker with the judge's findings, for up to five rounds (set `FACTORY_MAX_ROUNDS` to change it). The loop ends early if a round adds no commits.
-6. A push container pushes the branch with a fresh `contents:write` token. The branch is pushed whatever the verdict, so you always have the evidence.
+5. CAVEATS and REFUTED go back to the worker with the judge's findings, for up to five rounds in total (set `FACTORY_MAX_ROUNDS` to change it). VERIFIED or no verdict ends the loop. A revision round that adds no commits also ends it, and the previous verdict stands.
+6. A push container pushes the last judged commit with a fresh `contents:write` token, whatever the verdict, so you have the evidence. If a revision round's worker fails, the run pushes the last judged commit, opens no PR, and exits with the worker's status. A first round that fails leaves nothing to push.
 7. The orchestrator fetches the pushed branch and the current target branch into a fresh bare repo on the host. If the branch's only change is a `docs/BLOCKED-*` note, the run ends with exit 10 and no PR, whatever the verdict.
 8. On VERIFIED or CAVEATS, the orchestrator does a dry-run merge into the target. If it conflicts, the run ends with exit 11 and no PR. If it merges cleanly, the orchestrator opens the pull request itself, with the judge's verdict and findings in the body. It uses a separate `pull_requests:write` token that no container ever holds.
 9. You review and merge. The target repo's ruleset requires one approval and green CI, and the GitHub App can't approve its own pull request.
@@ -24,7 +24,7 @@ One run takes one task through these steps:
 |---|---|---|
 | `VERIFIED` | Checks pass, the judge couldn't break the change, and the scope is right. | PR opens if the branch merges cleanly. |
 | `CAVEATS` | The change does the task, but a human should look at something, such as code that could be deleted. | Another round if any remain, then the PR opens if the branch merges cleanly. |
-| `REFUTED` | A check fails, the change is wrong or incomplete, the scope is wrong, or a test was weakened. | Another round if any remain, then the branch is pushed with no PR (exit 5). |
+| `REFUTED` | A gating check (one the task names, or `npm test`) fails, the change is wrong or incomplete, the scope is wrong, or a test was weakened. | Another round if any remain, then the branch is pushed with no PR (exit 5). |
 | none | The judge failed or didn't end with exactly one verdict line. | Branch pushed, no PR (exit 6). |
 
 Each container gets exactly one secret, over stdin, written to a tmpfs: the worker gets the Anthropic token, the judge gets the Codex key, and the push container gets the GitHub token. The worker and judge never hold a GitHub token. The Anthropic and GitHub tokens expire within an hour. The Codex key lasts until you rotate it.
@@ -83,7 +83,7 @@ Do this once for each repo the factory works in. [`keycard-sandbox/keycard-works
 2. Add a ruleset on `main` that requires a pull request, one approval, dismissal of stale approvals, and your CI check (for example `test`). Don't add the App to the bypass list. In a new repo with no CI yet, add the required check after the scaffold task (see [Writing tasks](#writing-tasks)) lands.
 3. Workflows that run on `pull_request` must not use repository secrets. A `factory/*` branch is a same-repo branch, so its workflow runs receive the repo's secrets, and the worker can change any script those workflows run.
 4. The judge runs the repo's checks in the container, on Node 24 (the image's Node line). Something like `npm ci && npm test` has to pass with no secrets and no services beyond what the tests start themselves.
-5. Write a `CLAUDE.md` that gives the worker the repo's conventions, the check commands, and anything it must never weaken. Include this rule: if the task can't be completed, commit `docs/BLOCKED-<task_id>.md` with the reason and stop. `worker-prompt.md` asks for the same note; repeating it here keeps it in front of the worker. A branch with only that note ends with exit 10 and no PR, and the note's first line becomes the reason in the manifest and the notification, instead of the run ending silently with exit 3. The judge never reads `CLAUDE.md`; the factory removes it, along with other agent config files, from the judge's copy.
+5. Write a `CLAUDE.md` that gives the worker the repo's conventions, the check commands, and anything it must never weaken. Include this rule: if the task can't be completed, commit `docs/BLOCKED-<task_id>.md` with the reason and stop. `worker-prompt.md` asks for the same note; repeating it here keeps it in front of the worker. A branch with only that note ends with exit 10 and no PR, and the note's first line of text (headings skipped) becomes the reason in the manifest and the notification, instead of the run ending silently with exit 3. The judge doesn't follow `CLAUDE.md`: the factory removes it and other agent config files from the root of the judge's copy, and the judge prompt says to ignore any instructions in the repo.
 
 ## Writing tasks
 
@@ -129,7 +129,7 @@ Keep "Done when" narrow. Anything beyond it is out of scope by default, and the 
 
 ```bash
 export FACTORY_SECRETS_DIR=~/factory-secrets
-export FACTORY_NOTIFY_URL=https://ntfy.sh/<topic>   # optional
+export FACTORY_NOTIFY_URL='https://ntfy.sh/YOUR_TOPIC'   # optional
 ```
 
 | Command | What it does |
@@ -150,7 +150,7 @@ export FACTORY_NOTIFY_URL=https://ntfy.sh/<topic>   # optional
 | `--max-tasks N` | Stop after `N` tasks. |
 | `--stop-at HH:MM` | Start no task after this local time today. If the time has already passed, nothing runs. To use a stop time after midnight, start the batch after midnight. |
 | `--no-chain` | Base every task on its own `base_branch`. |
-| `--continue` | Keep going after a failure. Tasks whose `base_branch` names a failed task are skipped and moved to `failed/` unrun. |
+| `--continue` | Keep going after a failure. Tasks whose `base_branch` names a task that failed or was skipped in this batch are skipped too, and moved to `failed/<batch_id>-<task_id>.json` unrun. |
 
 By default, the first failure (any exit other than 0) stops the batch, and the remaining tasks stay in the queue. After each task, `batch` moves its file to `queue/done/` on exit 0 or to `queue/failed/` otherwise, so rerunning `batch` never repeats a task. At the end, `batch` writes a report to `runs/batch-<timestamp>.md`.
 
@@ -158,10 +158,10 @@ By default, the first failure (any exit other than 0) stops the batch, and the r
 
 With `FACTORY_NOTIFY_URL` set, `batch` posts plain-text lines to it:
 
-- For each task that fails: `<batch_id>: <task> exited <status> (<outcome or verdict>, continuing|stopped)`. The outcome is `blocked`, `conflict` or `gate_error` when a gate stopped the PR. A blocked task adds `: <reason>`, the first line of its note.
+- For each task that fails: `<batch_id>: <task> exited <status> (<outcome or verdict>, continuing|stopped)`. The outcome is `blocked`, `conflict` or `gate_error` when a gate stopped the PR. A blocked task adds `: <reason>` from its note.
 - Once when the batch ends, whatever happened: `<batch_id>: done: <n> run, <k> PR(s), <f> failed, <b> blocked. All tasks ran.` (the blocked count appears only when it isn't zero) or `Stopped: <reason>. <m> task(s) left in queue.`
 
-Passing tasks send nothing of their own, because GitHub already notifies you of each PR. If no message arrives at all, the batch never reached its end (lint, `HALT` or the lock refused it, or it was killed), or the endpoint was unreachable. The batch report tells you which. A single `factory run` sends nothing.
+Passing and skipped tasks send nothing of their own, and skipped tasks don't count as run or failed. Passing tasks are quiet because GitHub already notifies you of each PR. If no message arrives at all, the batch never reached its end (lint, `HALT` or the lock refused it, or it was killed), or the endpoint was unreachable. The batch's own output tells you which; a batch refused at startup writes no report. A single `factory run` sends nothing.
 
 ### Stopping
 
@@ -178,7 +178,7 @@ Each run leaves its evidence in `runs/<run_id>/`, where `run_id` is `<UTC timest
 | File | Contents |
 |---|---|
 | `manifest.json` | The task hash, repo, base commit, image ID, factory commit, Keycard zone, GitHub App installation, commit identity, judge rounds and verdict, final commit, PR URL (or `pr_error`), exit status, and, when a gate stopped the PR, `outcome` (`blocked`, `conflict` or `gate_error`) and the blocked `reason`. |
-| `log.jsonl` | Every line the containers wrote, plus the orchestrator's own events, with both tokens redacted. |
+| `log.jsonl` | Every line the containers wrote, with each container's credential redacted, plus the orchestrator's own events. |
 | `judge-<round>.md` | The judge's full review for each round. |
 
 | Exit | Meaning |
@@ -201,7 +201,7 @@ To retry a failed task, fix whatever blocked it, then requeue it and run `batch`
 ./factory requeue queue/failed/<file>.json
 ```
 
-`requeue` gives the task a new ID, `<task_id>-r<N>`, because its old `factory/<task_id>` branch still exists. `batch` never requeues on its own, so a task that fails the same way twice doesn't run a third time.
+`requeue` gives the task a new ID, `<task_id>-r<N>`, because its old `factory/<task_id>` branch still exists. It adds the blocked reason or the last judge review only when the archived file is from a run that has one; a skipped task gets none. It keeps `base_branch` as it was, so update any task that names the old ID. `batch` never requeues on its own, so a task that fails the same way twice doesn't run a third time.
 
 ## Security model
 
@@ -211,11 +211,11 @@ The table compares the factory to the controls in the reference architecture's a
 
 | Boundary | The architecture asks for | The factory does | Status |
 |---|---|---|---|
-| Sandbox | A fresh, hardened sandbox per task, unprivileged, writes confined to the workspace, resource limits, destroyed afterward | A fresh container per step: non-root, read-only root filesystem, all capabilities dropped, `no-new-privileges`, 4 GB memory, 2 CPUs, 512 processes, one-hour timeout, no Docker socket, only the clone mounted, removed on exit | Meets |
+| Sandbox | A fresh, hardened sandbox per task, unprivileged, writes confined to the workspace, resource limits, destroyed afterward | A fresh container per step: non-root, read-only root filesystem, all capabilities dropped, `no-new-privileges`, 4 GB memory, 2 CPUs, 512 processes, one-hour timeout, no Docker socket, only the clone mounted (the judge also gets its own scratch and output directories), removed on exit | Meets |
 | Sandbox | A microVM for untrusted code; process, file and network activity recorded outside the agent | Containers share the Docker Desktop VM; only the agent's own output stream is recorded | Partial |
 | Network | Default-deny egress proxy that all traffic passes through | Egress is open | Gap |
 | Identity and access | Credentials attached at the proxy, never inside the sandbox | Each container holds one short-lived credential | Gap |
-| Identity and access | Its own identity per agent, short-lived task-scoped credentials, independent approval, fail-closed | `urn:factory:mini` per run in the manifest; one-hour tokens scoped to one repo; ruleset requires a human approval the App can't give; the run refuses to start on any token or schema failure | Meets |
+| Identity and access | Its own identity per agent, short-lived task-scoped credentials, independent approval, fail-closed | One shared Application identity, `urn:factory:mini`, not one per agent, and a run ID per run in the manifest; one-hour Anthropic and GitHub tokens, the GitHub tokens scoped to one repo, but a long-lived Codex key; ruleset requires a human approval the App can't give; the run refuses to start on any token or schema failure | Partial |
 | Identity and access | Revoke any grant at any time | `factory stop` kills the run and blocks dispatch; tokens aren't revoked, they expire within an hour | Partial |
 | Supply chain | Packages admitted only through an approved registry or firewall | `npm ci` reaches the public registry directly | Gap |
 | Supply chain | Approved, pinned components | Base image and Codex are pinned; Claude Code is installed at its latest version when the image is built | Partial |

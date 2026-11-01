@@ -50,7 +50,7 @@
    "col": 2,
    "type": "security",
    "label": "Keycard",
-   "sublabel": "1h credentials"
+   "sublabel": "credentials"
   },
   {
    "id": "factory",
@@ -149,7 +149,7 @@
   {
    "from": "judge",
    "to": "worker",
-   "label": "revise, max 5",
+   "label": "revise, ≤5 rounds",
    "role": "return",
    "variant": "dashed",
    "route": "bottom-channel",

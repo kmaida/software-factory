@@ -333,7 +333,7 @@ rect.c-bg-rect { fill: var(--bg); }
         <path data-edge-from="factory" data-edge-to="keycard" data-edge-label="tokens" data-edge-key="1" data-composition-points="134,243;254,243" d="M 134 243 L 254 243" class="a-default" stroke-width="1.4" marker-end="url(#arrowhead)"/>
         <path data-edge-from="factory" data-edge-to="worker" data-edge-label="1 secret" data-edge-key="2" data-composition-points="88,269;88,290;88,290;88,341" d="M 88 269 L 88 290 L 88 290 L 88 341" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
         <path data-edge-from="worker" data-edge-to="judge" data-edge-label="commits" data-edge-key="3" data-composition-points="134,367;254,367" d="M 134 367 L 254 367" class="a-default" stroke-width="1.4" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="judge" data-edge-to="worker" data-edge-label="revise, max 5" data-edge-key="4" data-composition-points="300,393;300,425;88,425;88,393" d="M 300 393 L 300 425 L 88 425 L 88 393" class="a-dashed" stroke-width="1.4" marker-end="url(#arrowhead-dashed)"/>
+        <path data-edge-from="judge" data-edge-to="worker" data-edge-label="revise, ≤5 rounds" data-edge-key="4" data-composition-points="300,393;300,425;88,425;88,393" d="M 300 393 L 300 425 L 88 425 L 88 393" class="a-dashed" stroke-width="1.4" marker-end="url(#arrowhead-dashed)"/>
         <path data-edge-from="judge" data-edge-to="push" data-edge-label="verdict" data-edge-key="5" data-composition-points="346,367;454,367" d="M 346 367 L 454 367" class="a-default" stroke-width="1.4" marker-end="url(#arrowhead)"/>
         <path data-edge-from="push" data-edge-to="nopr" data-edge-label="REFUTED, gate" data-edge-key="6" data-composition-points="546,367;579,367" d="M 546 367 L 579 367" class="a-security" stroke-width="1.4" marker-end="url(#arrowhead-security)"/>
         <path data-edge-from="push" data-edge-to="pr" data-edge-label="VERIFIED, CAVEATS" data-edge-key="7" data-composition-points="500,393;500,414;500,414;500,465" d="M 500 393 L 500 414 L 500 414 L 500 465" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
@@ -350,13 +350,13 @@ rect.c-bg-rect { fill: var(--bg); }
           <text x="88" y="131" class="t-muted" font-size="8" text-anchor="middle">queue/*.json</text>
         </g>
 
-        <g id="node-keycard" data-node-id="keycard" data-node-label="Keycard" tabindex="0" role="button" aria-label="Focus Keycard, 1h credentials, factory (Mac mini)" aria-pressed="false" data-node-kind="security" data-node-sublabel="1h credentials" data-node-context="factory (Mac mini)">
-          <title>Keycard · 1h credentials · factory (Mac mini)</title>
+        <g id="node-keycard" data-node-id="keycard" data-node-label="Keycard" tabindex="0" role="button" aria-label="Focus Keycard, credentials, factory (Mac mini)" aria-pressed="false" data-node-kind="security" data-node-sublabel="credentials" data-node-context="factory (Mac mini)">
+          <title>Keycard · credentials · factory (Mac mini)</title>
           <rect x="254" y="217" width="92" height="52" rx="6" class="c-mask"/>
           <rect x="254" y="217" width="92" height="52" rx="6" class="c-security" stroke-width="1.5"/>
           
           <text data-node-label="" x="300" y="238" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Keycard</text>
-          <text x="300" y="255" class="t-muted" font-size="8" text-anchor="middle">1h credentials</text>
+          <text x="300" y="255" class="t-muted" font-size="8" text-anchor="middle">credentials</text>
         </g>
 
         <g id="node-factory" data-node-id="factory" data-node-label="Orchestrator" tabindex="0" role="button" aria-label="Focus Orchestrator, trust boundary, factory (Mac mini)" aria-pressed="false" data-node-kind="backend" data-node-sublabel="trust boundary" data-node-context="factory (Mac mini)">
@@ -448,9 +448,9 @@ rect.c-bg-rect { fill: var(--bg); }
           <rect x="172.2" y="347" width="43.6" height="14" rx="3" class="c-mask"/>
           <text x="194" y="357" class="t-muted" font-size="8" text-anchor="middle">commits</text>
         </g>
-        <g data-edge-from="judge" data-edge-to="worker" data-edge-label="revise, max 5" data-edge-key="4">
+        <g data-edge-from="judge" data-edge-to="worker" data-edge-label="revise, ≤5 rounds" data-edge-key="4">
           <rect x="157.8" y="405" width="72.4" height="14" rx="3" class="c-mask"/>
-          <text x="194" y="415" class="t-database" font-size="8" text-anchor="middle">revise, max 5</text>
+          <text x="194" y="415" class="t-database" font-size="8" text-anchor="middle">revise, ≤5 rounds</text>
         </g>
         <g data-edge-from="judge" data-edge-to="push" data-edge-label="verdict" data-edge-key="5">
           <rect x="378.2" y="347" width="43.6" height="14" rx="3" class="c-mask"/>

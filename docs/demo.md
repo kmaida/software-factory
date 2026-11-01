@@ -34,6 +34,6 @@ This script runs a 10-minute demo of the factory on `keycard-sandbox/keycard-wor
    ```
 
    Point out that the container runs as non-root on a read-only filesystem, and holds one secret.
-4. Show the finished run (4 minutes). Open `runs/<run_id>/manifest.json`, then `judge-1.md`, then the PR on GitHub with the verdict in its body. Point out that the App opened the PR and can't approve it.
+4. Show the finished run (4 minutes). Open `runs/<run_id>/manifest.json`, then `judge-<n>.md`, where `<n>` is `judge.rounds` from the manifest (the final review), then the PR on GitHub with the verdict in its body. Point out that the App opened the PR and can't approve it.
 5. Walk through the security table in the README (2 minutes), including the Gap rows. The biggest are open egress, credentials inside the containers, and no package admission point.
 6. To close, if the live run has finished, show the `done:` notification on your phone. If not, show `./factory report`.
