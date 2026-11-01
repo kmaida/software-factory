@@ -33,7 +33,8 @@ cat > "$t/bin/docker" <<'D'
 #!/bin/bash
 # Stub: emulates the three entrypoint modes on the host-side mounts. $STUB_VERDICTS lists the verdict per judge round.
 case "$1" in info) exit 0;; image) echo sha256:stub; exit 0;; ps) [ "${STUB_DOCKER_PS_FAIL:-}" = 1 ] && exit 1; exit 0;; rm|stop|network) exit 0;;
-  logs) echo '{"listening":8888,"allow":"stub"}'; exit 0;; esac
+  logs) n=$(cat "$STUB_LOGS" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_LOGS"   # STUB_PROXY_DEAD: never listens; STUB_LOGS_FAIL=<n>: the n-th `docker logs` fails
+        [ "${STUB_PROXY_DEAD:-}" = 1 ] || echo '{"listening":8888,"allow":"stub"}'; [ "$n" -ge "${STUB_LOGS_FAIL:-999}" ] && exit 1; exit 0;; esac
 set -e; mode= work= jwork= net= detached= args=()
 while [ $# -gt 0 ]; do case "$1" in
   -e) case "$2" in MODE=*) mode=${2#MODE=};; *) export "$2";; esac; shift 2;;
@@ -77,8 +78,8 @@ D
 chmod +x "$t/bin/"*
 run() {  # run <task_id> <verdicts> -> prints exit status; RUN_REPO overrides the local bare repo (a GitHub owner/name goes through the App path)
   echo "{\"repo\":\"${RUN_REPO:-$t/remote.git}\",\"base_branch\":\"main\",\"task_id\":\"$1\",\"instructions\":\"do the thing\"}" > "$t/$1.json"
-  rm -f "$t/state" "$t/allow"; set +e   # FACTORY_MAX_ROUNDS=3: the verdict fixtures below are written for three rounds; one case sets 5
-  PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_ALLOW="$t/allow" STUB_APP_KEY="$t/app-key.b64" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_MAX_ROUNDS="${FACTORY_MAX_ROUNDS:-3}" \
+  rm -f "$t/state" "$t/allow" "$t/logs"; set +e   # FACTORY_MAX_ROUNDS=3: the verdict fixtures below are written for three rounds; one case sets 5
+  PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_ALLOW="$t/allow" STUB_LOGS="$t/logs" STUB_APP_KEY="$t/app-key.b64" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_MAX_ROUNDS="${FACTORY_MAX_ROUNDS:-3}" \
     "$here/factory" run "$t/$1.json" >"$t/$1.out" 2>&1; rc=$?; set -e
   echo "$rc"
 }
@@ -92,11 +93,17 @@ check "$(ls "$m" | grep -c judge-)" 2 "t1 judge files"; check "$(git -C "$t/remo
 bot='kmaida-software-factory[bot] <424243+kmaida-software-factory[bot]@users.noreply.github.com>'
 check "$(git -C "$t/remote.git" log -1 --format='%an <%ae> %cn <%ce>' refs/heads/factory/t1)" "$bot $bot" "t1 commit authored and committed as the App bot"
 check "$(jq -r '"\(.git_identity.name) <\(.git_identity.email)>"' "$m/manifest.json")" "$bot" "t1 git_identity in manifest"
+grep -q 'Review of your previous attempt (round 1 verdict: REFUTED)' "$m/log.jsonl" || grep -q 'round 2: judge verdict VERIFIED' "$m/log.jsonl" || { echo "FAIL: t1 revision prompt/log"; exit 1; }
 # Egress: each step ran on the run's internal network behind its own proxy, the proxy got that step's allowlist, and its decisions are in the log.
 grep -q 'stub work secret=\[REDACTED\] net=factory-[0-9TZ]*-t1 proxy=http://factory-[0-9TZ]*-t1-work-1-proxy:8888' "$m/log.jsonl" || { echo "FAIL: t1 worker not on the run network behind its proxy"; grep 'stub work' "$m/log.jsonl"; exit 1; }
 check "$(tr '\n' ' ' < "$t/allow")" 'api\.anthropic\.com|registry\.npmjs\.org api\.openai\.com|registry\.npmjs\.org api\.anthropic\.com|registry\.npmjs\.org api\.openai\.com|registry\.npmjs\.org github\.com ' "t1 allowlist per step"
 check "$(jq -r 'select(.event.type=="proxy") | .event.mode' "$m/log.jsonl" | tr '\n' ' ')" "work judge work judge push " "t1 proxy record per step"
-grep -q 'Review of your previous attempt (round 1 verdict: REFUTED)' "$m/log.jsonl" || grep -q 'round 2: judge verdict VERIFIED' "$m/log.jsonl" || { echo "FAIL: t1 revision prompt/log"; exit 1; }
+# A proxy that never listens: the run fails (exit 1) before the step runs, with the proxy's output in the log. A step whose network
+# record cannot be collected (the 3rd `docker logs`: readiness poll, readiness check, collection) fails the run too; the step itself ran.
+rc=$(STUB_PROXY_DEAD=1 run t1p "VERIFIED"); m=$(ls -d "$runs"/*-t1p | tail -1)
+check "$rc" 1 "t1p dead proxy exit"; check "$(grep -c 'stub work' "$m/log.jsonl")" 0 "t1p no step ran without its proxy"; check "$(jq -r .exit_status "$m/manifest.json")" 1 "t1p manifest"
+rc=$(STUB_LOGS_FAIL=3 run t1l "VERIFIED"); m=$(ls -d "$runs"/*-t1l | tail -1)
+check "$rc" 1 "t1l lost network record exit"; check "$(grep -c 'stub work' "$m/log.jsonl")" 1 "t1l the step ran"; check "$(jq -r .exit_status "$m/manifest.json")" 1 "t1l manifest"
 rc=$(run t2 "REFUTED,REFUTED,REFUTED"); m=$(ls -d "$runs"/*-t2 | tail -1)
 check "$rc" 5 "t2 exit"; check "$(jq -r .judge.rounds "$m/manifest.json")" 3 "t2 rounds"; check "$(jq -r .pr_url "$m/manifest.json")" null "t2 no PR"
 rc=$(run t3 "NONE"); m=$(ls -d "$runs"/*-t3 | tail -1)
@@ -280,4 +287,4 @@ mkdir -p "$runs/stoptest"; echo '{"ended_at":null,"exit_status":null}' > "$runs/
 PATH="$t/bin:$PATH" STUB_DOCKER_PS_FAIL=1 "$here/factory" stop stoptest > "$t/stop.out" 2>&1 || { echo "FAIL: stop with docker down exited $?"; cat "$t/stop.out"; exit 1; }
 check "$(jq -r .exit_status "$runs/stoptest/manifest.json")" 137 "stop with docker down records the incident"; rm -f "$here/HALT"; rm -rf "$runs/stoptest"
 find "$runs" -maxdepth 1 -newer "$t/secrets" \( -name 'batch-*.md' -o -name '*-0[0-9]0-[a-z][a-z]-[a-d]' \) -exec rm -rf {} +   # the GitHub-path batch cases ran after the first sweep
-echo "ok: egress (per-step proxy, allowlists, network record), judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, five rounds, App bot commit identity and its failed lookup), gates (blocked note, conflict with the target), lint, batch (chain, refuted chain, chain after a failure, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run, blocked reason on the phone), requeue (blocked, refuted, skipped), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), stop with docker down"
+echo "ok: egress (per-step proxy, allowlists, network record, dead proxy, lost record), judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, five rounds, App bot commit identity and its failed lookup), gates (blocked note, conflict with the target), lint, batch (chain, refuted chain, chain after a failure, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run, blocked reason on the phone), requeue (blocked, refuted, skipped), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), stop with docker down"

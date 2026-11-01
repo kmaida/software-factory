@@ -213,7 +213,15 @@ Status is Implemented, Partial, or Planned. Each has a check that proves it. (re
   the push. Decisions are collected after the step, not streamed: simplest, and the only loss is a run the
   orchestrator abandons. Not in the manifest; the log is the network record. The README's Network row is Partial:
   host filtering, credentials still inside. Codex's `chatgpt.com` call stays denied until a real judge round shows
-  it matters.
+  it matters. Codex reviewed the wiring (2026-11-01), five findings, all confirmed and fixed: a proxy that never
+  listened still dispatched the step (now `die`, with the proxy's output in the log); a proxy whose removal failed
+  stayed on the run network where the next step could use its allowlist (now `die`); a failed `docker logs` lost the
+  network record under `|| true` while the step stayed successful (now `die`); the network was created before the
+  manifest existed, so its failure left no run record (moved after the manifest); `factory stop` after an
+  orchestrator crash left the network until the next run's sweep, which HALT blocks (stop removes it). Two stub
+  cases cover the first and third. Its speculative item, services on the Docker host's bridge address being
+  reachable from an internal network, is the "no route to the internet except the proxy" wording already in the
+  plan; the demo script says that now too.
 
 ## TODO (Kim)
 
