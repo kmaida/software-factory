@@ -98,7 +98,7 @@
    "col": 5,
    "type": "security",
    "label": "No PR",
-   "sublabel": "exit 5 or 6"
+   "sublabel": "exit 5, 6, 10–12"
   },
   {
    "id": "pr",
@@ -149,7 +149,7 @@
   {
    "from": "judge",
    "to": "worker",
-   "label": "revise, max 3",
+   "label": "revise, max 5",
    "role": "return",
    "variant": "dashed",
    "route": "bottom-channel",
@@ -164,7 +164,7 @@
   {
    "from": "push",
    "to": "nopr",
-   "label": "REFUTED",
+   "label": "REFUTED, gate",
    "labelDy": -20,
    "role": "error",
    "variant": "security"
