@@ -19,9 +19,10 @@ The biggest gap, and it does not need Keycard's proxy to close most of the way. 
 Keycard's proxy later replaces the proxy container without changing it.
 
 - `docker network create --internal factory-net`: containers on it have no route out and no external DNS. One small
-  forward-proxy container (tinyproxy, pinned image) sits on both `factory-net` and the default bridge, with a domain
-  allowlist and `FilterDefaultDeny`. The orchestrator starts it once per run with the allowlist for that mode, on the
-  fixed `docker run` line, so the task can't change it.
+  proxy container sits on both `factory-net` and the default bridge: `proxy.js` in the repo, ~30 lines, CONNECT to an
+  allowlisted host on 443 only, run in the image the factory already pins (no third-party proxy image to approve).
+  The orchestrator starts it per mode with that mode's allowlist as `ALLOW`, on the fixed `docker run` line, so the
+  task can't change it. Prototyped on the laptop 2026-11-01 (`factory.md`); the mini repeats it on Docker Desktop.
 - Per mode: worker → `api.anthropic.com`, `registry.npmjs.org`; judge → `api.openai.com`, `registry.npmjs.org`;
   push → `github.com`. `HTTPS_PROXY`/`https_proxy` env in the container; Claude Code, Codex (reqwest), npm, git and
   curl all honor it. Setting the env is a convenience: with no route out, ignoring it means no network, not open network.
@@ -35,10 +36,10 @@ Keycard's proxy later replaces the proxy container without changing it.
   stays listed.
 - Internal networks on Docker Desktop still reach the bridge gateway and whatever the VM exposes there; "private
   ranges unreachable" is not a claim to make. Say "no route to the internet except the proxy".
-- Proxy config: tinyproxy's `Filter` is regex, so anchor each host (`^api\.anthropic\.com$`), set `FilterDefaultDeny
-  Yes`, and `ConnectPort 443` only. One proxy container per run, started with the current mode's allowlist and
-  replaced between modes, so a worker can't reach the judge's or push's proxy.
-- Enforced by: Docker's network namespace. ~40 lines in `factory` plus three `proxy-<mode>.conf` files in the repo.
+- `ALLOW` is one anchored regex per mode (`^api\.anthropic\.com$|^registry\.npmjs\.org$`). One proxy container per
+  mode, replaced between modes, so a worker can't reach the judge's or push's proxy. Its stdout (one JSON line per
+  decision) goes into `log.jsonl` like the containers' output: that is the network record the architecture asks for.
+- Enforced by: Docker's network namespace. ~40 lines in `factory` plus `proxy.js`.
   Test: a stub case for the `--network` and `-e HTTPS_PROXY` args. The real checks, by hand once on the laptop and
   once on the mini, recorded in `factory.md`: from a worker shell, `curl https://example.com` and `curl
   https://1.1.1.1` fail with the proxy vars unset too, external DNS fails, `curl https://api.anthropic.com` connects,
@@ -277,8 +278,10 @@ Four options, checked against the SDK source and docs.keycard.ai on 2026-11-01:
     the JWK for `docs/jwks.json`. The default access control in the macOS SDK is
     `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` with no flags: no biometric, no presence, usable after the
     mini has been unlocked once since boot. ~40 lines of Swift, compiled and ad-hoc signed on the mini with
-    `swiftc`. `keycard_token` calls it where `mint_github_token` calls `openssl dgst`, and a signer failure aborts
-    before the token request.
+    `swiftc`. `keycard_token` calls it where `mint_github_token` calls `openssl dgst`, writing the signature to a
+    tmpfs file with `|| die` rather than inside `$(... | b64url)` (a command substitution loses `PIPESTATUS`), so a
+    signer failure aborts before the token request. Prototyped on the laptop 2026-11-01: checks 1 to 5 and 7 pass
+    (`factory.md`); 2's device binding, 6 and 8 are the mini's.
   - The credential's `identifier` is the OAuth client ID and is generated when omitted, so the cutover writes the
     new identifier into `~/factory-secrets/keycard_client_id`; the old one is the password credential's and would
     be rejected as the wrong credential type. `application_id` is the Application's Keycard ID, not its URN.

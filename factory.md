@@ -153,6 +153,46 @@ Status is Implemented, Partial, or Planned. Each has a check that proves it. (re
 - **Known:** Docker's default `/tmp` tmpfs is `noexec`. Revisit if Claude Code needs to execute something from `/tmp`.
 - **Judge added 2026-10-30, not yet run for real:** the entrypoint gained `MODE=work|judge|push`, the image gained `@openai/codex@0.164.0` (pinned), and the orchestrator runs the worker → judge loop above. Codex runs with its own sandbox off (`--dangerously-bypass-approvals-and-sandbox`): it cannot start inside the capability-dropped container, and the container is the sandbox, as in v1's CI judge. The judge clones `/src` (the worker's tree, mounted read-only) inside the container so no hook or index state the worker left behind is reused and nothing the judge runs can modify the worker's checkout; the host only ever reads one text file (`.factory-verdict.md`) out of the judge's directory. The push step likewise never runs git inside the worker's checkout: it clones the branch from the read-only mount into a fresh bare repo and pushes to the URL the orchestrator passes, with hooks disabled, so a hook or config the worker planted cannot run with the GitHub token (the worker no longer holds that token, and this keeps it that way). The orchestrator logic is covered by `test-factory.sh`; the image, Codex login with a Vault-fetched key, and a full round in a real container still need the rebuild and one real run.
 
+- **Secure Enclave signer prototype, laptop, 2026-11-01** (docs/parity-plan.md item 13; macOS 26.7.1, arm64, `swiftc` from
+  Command Line Tools): `se-sign.swift` compiles, ad-hoc `codesign -s -` succeeds, `codesign -d --entitlements -` shows none.
+  `keygen` writes a 284-byte blob (0400); a fresh process loads it and signs; the blob fails to load when truncated
+  (`CryptoTokenKit -3 corrupted objectID`) and `openssl pkey` can't decode it. `pubkey` JWK matches `pubpem` loaded by
+  `openssl ec -pubin` (same coordinates). Ten random inputs signed to exactly 64 bytes each verify in `node` with
+  `dsaEncoding: 'ieee-p1363'`, and a flipped byte fails. A full client assertion (`iss` = `sub`, `aud`, `jti`, `iat`,
+  `exp` +300) built with the factory's `b64url` helper verifies with `jose` 6 (`ES256`, issuer, subject, audience, age)
+  and a wrong audience is rejected. Signer failures exit 2 with nothing on stdout. Gotcha for `keycard_token`: don't sign
+  inside `$(... | b64url)`; `PIPESTATUS` is lost in a command substitution. Write the signature to a tmpfs file with
+  `|| die`, then encode it. Not done here: device binding (the blob on a second Mac), signing over SSH with the console
+  locked or nobody logged in, and a reboot; the mini does those. Scratch: `se-sign` built in `$TMPDIR/se/`.
+- **Egress network prototype, laptop, 2026-11-01** (item 1; OrbStack 29.8.2, so Docker Desktop on the mini must repeat it):
+  `docker network create --internal`, `proxy.js` (a ~30-line CONNECT-only allowlist proxy in the pinned node image, no
+  third-party image) on the bridge and connected to the internal network, worker-like container on the internal network
+  only. From the worker: direct `fetch` to example.com fails `EAI_AGAIN`, to 1.1.1.1 fails `ENETUNREACH`, external DNS
+  fails, the proxy's name resolves through embedded DNS, `npm view` through `HTTPS_PROXY` succeeds, `npm ping` against a
+  non-allowlisted registry gets the proxy's 403, and with the proxy container removed the same `npm view` fails. A second
+  `npm view` with the proxy unset succeeded only because the first had cached the packument; a fresh container fails
+  `EAI_AGAIN`. The internal network's gateway answers at the IP level (`ECONNREFUSED`, not unreachable), so "no route to
+  the internet except the proxy" is the claim, not "no route to the host". Locally the proxy also refused port 80, plain
+  `GET`, and a lookalike host. Not done here: the pinned Codex and Claude Code builds through the proxy (the image isn't
+  built on the laptop); the first real worker and judge rounds on the mini settle that.
+- **Both prototypes reviewed 2026-11-01** (two Claude reviewers, then Codex on the fixed code), all findings verified
+  before fixing. `se-sign.swift`: POSIX read/write loops instead of `FileHandle` (whose I/O errors are ObjC exceptions
+  Swift can't catch; a closed stdout now exits 2, not SIGABRT), `SIGPIPE` ignored, `keygen` opens the blob
+  `O_EXCL|O_NOFOLLOW` 0400 before generating the key and unlinks it on any failure, including a failed round trip
+  (which now also sign-and-verifies), the blob is read `O_NOFOLLOW|O_NONBLOCK` and must be a regular file of at most
+  4 KiB (a FIFO or a 5000-byte file is refused), stdin is capped at 64 KiB, the key is loaded with
+  `LAContext.interactionNotAllowed` so a substituted blob that wants presence fails instead of waiting for a human,
+  `kid` is the RFC 7638 thumbprint (checked against an independent computation), and stdout is defined as meaningful
+  only on exit 0. `proxy.js`: an error listener on the client socket (a reset after `CONNECT` crashed the process), the
+  allowlist is anchored by the proxy (`^(?:ALLOW)$`) and the host lowercased, IP literals are refused even when ALLOW
+  matches them (Node skips `lookup` for literals, so the private-address check never ran), strict `host:443` parsing,
+  empty ALLOW refuses to start, names resolving to private, loopback or link-local addresses are refused through a
+  `lookup` wrapper (handles Node 24's `all: true`), connect and idle timeouts, `stream.pipeline` so either side closing
+  closes the other, the upstream is torn down if the client leaves during the connect (otherwise `pipeline` threw
+  synchronously), `maxConnections` 64, `clientError` and `drop` are logged as denials, logged strings are truncated,
+  and a 1 MiB stdout backlog or a closed stdout exits the proxy so the run fails closed. All checks rerun green after
+  the fixes; the list is in the Bash history of that session, the important ones in the plan's item 1 and item 13.
+
 ## TODO (Kim)
 
 - Judge done 2026-10-30: `https://api.openai.com` is a zone resource with the `software-factory-judge` key as a Vault API Token credential, permitted to `urn:factory:mini`; first judged run above. The v1-era "Plan My Today factory" keys at Anthropic and OpenAI were deleted 2026-10-31.
