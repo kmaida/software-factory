@@ -22,10 +22,11 @@ Next, in order, one branch and one PR each, merged before the next starts:
    findings, regression-or-unmet, gate cycles with their own counter, `gate_pending` as infra, an image rebuild. Folded in
    from the parity handoff: the spend cap dropped, an unknown container mode dies. Left for loop 7: re-gating a
    `gate_pending` head in place (the batch retries as `-i1` for now); the Codex integrity lens.
-3. Loop 7's canary queue and the negative ruleset tests; then the merge into `next` with chain taint, `scope_widened` and
-   the accumulation cap. **Before this step is enabled, with the operator: the `next` ruleset on the target repo and a
-   separate merger App with its Keycard resource (parity, not yet started). Until they exist the gate stays in PR-only
-   mode.**
+3. Loop 7's canary queue (`canary.sh`, four of the seven canaries) and the negative ruleset tests (`factory
+   ruleset-check`); the merge into `next` with chain taint and the accumulation cap, behind `MERGER_APP_ID` (empty: PR-only).
+   **To enable, with the operator: the `next` ruleset on the target repo and a separate merger App with its Keycard
+   resource (factory.md, "The merge gate"), then `ruleset-check` and `canary.sh` on the mini, then `MERGER_APP_ID` by PR.**
+   `scope_widened` holds come with loop 5, which creates them.
 4. Loop 1 (deep lint: additions and holds only, `held/`, `unhold`) and loop 6 (`factory status`, the `main` ⊆ `next`
    invariant, the revert procedure).
 5. Loop 5 (triage with attribution, the revision file, host requeue with locked Goal and Done when and the Scope refusal
