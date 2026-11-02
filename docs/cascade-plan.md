@@ -7,8 +7,8 @@ Landed on `main`, one line each:
 - Parity 1, egress allowlist on a per-run internal network: PR #42.
 - Parity 2, target-repo rulesets so the push token reaches only `factory/**`: on `keycard-workshop-platform` since 2026-10-31.
 - Parity 3 to 5, credential screening, the dependency-manifest gate, npm policy: PR #43.
-- Parity 6 to 9, image pin, model pins, cost record, evidence fails closed, redaction by shape: PR #44. Still in the code
-  and to drop: the worker's `--max-budget-usd` (decided 2026-11-02: no spend ceiling; the cost record stays).
+- Parity 6 to 9, image pin, model pins, cost record, evidence fails closed, redaction by shape: PR #44. The worker's
+  `--max-budget-usd` is dropped with loop 0 (decided 2026-11-02: no spend ceiling; the cost record stays).
 - This plan; the judge's test-a-claim rule (31edc5f); loop 2 (task or infra, `pushed`, one `-i1` retry, circuit breaker,
   `stopped` is class task, notify state); loop 3 (`depends_on`, lint graph rules, `dep_state`, waits in place, dead waits
   notified and non-zero): PR #45.
@@ -17,10 +17,11 @@ Landed on `main`, one line each:
 
 Next, in order, one branch and one PR each, merged before the next starts:
 
-1. Loop 4: the worker's BLOCKED note ends the run before the judge; the note-at-head gate; gate order (`gt`, manifest,
-   blocked); the fact-separated judge prompt (orchestrator facts apart from prior claims, REPEAT re-established at head).
+1. Loop 4 (the note ends the run before the judge, the note-at-head gate, the fact-separated judge prompt): PR #48, merged.
 2. Loop 0 in PR-only mode: the `review` and `verify` entrypoint arms, the gate after the push and the cheap gates, JSON
-   findings, regression-or-unmet, gate cycles with their own counter, `gate_pending` as infra, an image rebuild.
+   findings, regression-or-unmet, gate cycles with their own counter, `gate_pending` as infra, an image rebuild. Folded in
+   from the parity handoff: the spend cap dropped, an unknown container mode dies. Left for loop 7: re-gating a
+   `gate_pending` head in place (the batch retries as `-i1` for now); the Codex integrity lens.
 3. Loop 7's canary queue and the negative ruleset tests; then the merge into `next` with chain taint, `scope_widened` and
    the accumulation cap. **Before this step is enabled, with the operator: the `next` ruleset on the target repo and a
    separate merger App with its Keycard resource (parity, not yet started). Until they exist the gate stays in PR-only

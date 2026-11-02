@@ -17,17 +17,19 @@ One run takes one task through these steps:
 5. CAVEATS and REFUTED go back to the worker with the judge's findings, for up to five rounds in total (set `FACTORY_MAX_ROUNDS` to change it). VERIFIED or no verdict ends the loop. A revision round that adds no commits also ends it, and the previous verdict stands.
 6. A push container pushes the last judged commit with a fresh `contents:write` token, whatever the verdict, so you have the evidence. If a revision round's worker fails, the run pushes the last judged commit, opens no PR, and exits with the worker's status. A first round that fails leaves nothing to push.
 7. The orchestrator fetches the pushed branch and the current target branch into a fresh bare repo on the host. If the task's `docs/BLOCKED-<task_id>.md` note is at the pushed head, the run ends with exit 10 and no PR, whatever the verdict (a note written in round 1 was never judged: the worker's note ends the run before the judge).
-8. On VERIFIED or CAVEATS, the orchestrator does a dry-run merge into the target. If it conflicts, the run ends with exit 11 and no PR. If it merges cleanly, the orchestrator opens the pull request itself, with the judge's verdict and findings in the body. It uses a separate `pull_requests:write` token that no container ever holds.
-9. You review and merge. The target repo's ruleset requires one approval and green CI, and the GitHub App can't approve its own pull request.
+8. On VERIFIED or CAVEATS, the orchestrator does a dry-run merge into the target. If it conflicts, the run ends with exit 11 and no PR.
+9. The verification gate. A fresh Claude Code session (`review-prompt.md`, the break-it lens, in its own container on a fresh clone; it never sees the judge's findings) writes JSON findings: BLOCKs, each with a shell command that reproduces the problem, and NOTEs. Then a container with no model and no credential (`verify.js`) runs every BLOCK's command at the pushed head and at the base, plus two checks on the changed test files (the base's tests against the head's code, the head's tests against the base's code). A BLOCK counts only when the machine reproduced it: a regression (fails at head, passes at base) or an unmet "Done when" clause (fails at both, clause named). A command that passes, times out or isn't found is invalid; one that fails at both with no clause is pre-existing, a note. Nothing reproduced: the PR. Something reproduced: one more worker round with those findings as facts, one more judge round, the push again, and the gate again (a gate cycle). The gate records every cycle in the manifest (`gate`) and the evidence files `gate-<n>-breakit.json` and `gate-<n>-verify.json`. A review or verifier that crashed, or left no valid record, is `gate_pending` (exit 12, infra: the batch retries the task once). No new commits in a cycle, the same command reproducing in a later cycle, REFUTED from the judge in a cycle, or a fourth cycle: `refuted` by the gate, exit 5, no PR.
+10. The orchestrator opens the pull request itself, with the judge's verdict and findings and the gate's record in the body. It uses a separate `pull_requests:write` token that no container ever holds.
+11. You review and merge. The target repo's ruleset requires one approval and green CI, and the GitHub App can't approve its own pull request.
 
 | Verdict | Meaning | Result |
 |---|---|---|
-| `VERIFIED` | Checks pass, the judge couldn't break the change, and the scope is right. | PR opens if the branch merges cleanly. |
-| `CAVEATS` | The change does the task, but a human should look at something, such as code that could be deleted. | Another round if any remain, then the PR opens if the branch merges cleanly. |
+| `VERIFIED` | Checks pass, the judge couldn't break the change, and the scope is right. | PR opens if the branch merges cleanly and the verification gate reproduces nothing. |
+| `CAVEATS` | The change does the task, but a human should look at something, such as code that could be deleted. | Another round if any remain, then the PR opens if the branch merges cleanly and the gate reproduces nothing. |
 | `REFUTED` | A gating check (one the task names, or `npm test`) fails, the change is wrong or incomplete, the scope is wrong, or a test was weakened. | Another round if any remain, then the branch is pushed with no PR (exit 5). |
 | none | The judge failed or didn't end with exactly one verdict line. | Branch pushed, no PR (exit 6). |
 
-Each container gets exactly one secret, over stdin, written to a tmpfs: the worker gets the Anthropic token, the judge gets the Codex key, and the push container gets the GitHub token. The worker and judge never hold a GitHub token. The Anthropic and GitHub tokens expire within an hour. The Codex key lasts until you rotate it.
+Each container gets exactly one secret, over stdin, written to a tmpfs: the worker and the gate's reviewer get an Anthropic token, the judge gets the Codex key, the push container gets the GitHub token, and the verifier gets nothing. The worker and judge never hold a GitHub token. The Anthropic and GitHub tokens expire within an hour. The Codex key lasts until you rotate it.
 
 ## Requirements
 
@@ -69,7 +71,6 @@ These two files are the only credentials stored on the machine. The factory gets
 | `FACTORY_NOTIFY_URL` | No | Where `batch` posts notifications, for example `https://ntfy.sh/<topic>`. The topic name acts as the secret. |
 | `FACTORY_QUEUE` | No | A queue directory other than `queue/`. |
 | `FACTORY_MAX_ROUNDS` | No | Worker and judge rounds per task. Defaults to 5. |
-| `FACTORY_BUDGET_USD` | No | The worker's spend cap per round, passed to Claude Code as `--max-budget-usd`. Defaults to 10. |
 | `FACTORY_ALLOW_DIRTY` | No | Set to `1` to run from a checkout with uncommitted changes. For development only; the manifest marks the commit `-dirty`. |
 
 The Keycard zone URL, the Anthropic federation IDs and the GitHub App ID are constants at the top of `factory`. None of them is a secret.
@@ -195,11 +196,11 @@ Each run leaves its evidence in `runs/<run_id>/`, where `run_id` is `<UTC timest
 | `0` | The PR is open. |
 | `3` | The worker made no changes. Nothing was pushed. |
 | `4` | The branch was pushed, but opening the PR failed (`outcome: pr_failed`). `pr_error` in the manifest has the HTTP status and body. |
-| `5` | The judge refuted the final round. The branch was pushed with no PR. |
+| `5` | The judge refuted the final round, or the verification gate refuted the branch (`refuted_by: gate` in the manifest: no new commits in a cycle, the same reproduced command twice, REFUTED in a cycle, or four cycles). The branch was pushed with no PR. |
 | `6` | The judge gave no verdict. The branch was pushed with no PR. |
 | `10` | Blocked: the task's `docs/BLOCKED-<task_id>.md` note is at the pushed head. `reason` in the manifest has its first line; `judge.rounds` is 0 when the note came in round 1. No PR. |
 | `11` | The branch conflicts with the current target branch. No PR. |
-| `12` | A gate couldn't run (the credential scan of the base tree, or the fetch, diff or merge-check of the branch; the end of `log.jsonl` has git's output), or the log pipeline failed during a step (`outcome: evidence_error`): the run stopped there. No PR. If that step was the push, the branch may already be on GitHub and `final_sha` says which commit. |
+| `12` | A gate couldn't run (the credential scan of the base tree, or the fetch, diff or merge-check of the branch; the end of `log.jsonl` has git's output), the verification gate left no valid record (`outcome: gate_pending`: a review or verifier that crashed, invalid findings, a failed install; the branch is judged and pushed, only the gate is missing), or the log pipeline failed during a step (`outcome: evidence_error`): the run stopped there. No PR. If that step was the push, the branch may already be on GitHub and `final_sha` says which commit. |
 | `13` | Refused to start: the task text or the base tree contains something shaped like a credential. `reason` names the file (or `instructions`), never the content. No container ran and no agent credential was issued; the task-text check runs before anything is minted, the tree check after the clone, so by then the one-hour clone token exists. |
 | `14` | The branch changes a dependency manifest (`package.json`, a lockfile) and the task's Scope doesn't name `package.json`. The branch was pushed with no PR; `reason` lists the files. |
 | Other | The orchestrator or a worker round failed. Check the end of `log.jsonl` and the factory's stderr. |

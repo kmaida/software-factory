@@ -40,21 +40,23 @@ echo '{"access_token":"stub-token"}'
 C
 cat > "$t/bin/docker" <<'D'
 #!/bin/bash
-# Stub: emulates the three entrypoint modes on the host-side mounts. $STUB_VERDICTS lists the verdict per judge round.
+# Stub: emulates the entrypoint modes on the host-side mounts. $STUB_VERDICTS lists the verdict per judge round; $STUB_REVIEW the
+# break-it review's findings per gate cycle (none, regress, preexist, unmet, invalid, many, bad, crash; default none); the verifier runs
+# the real verify.js against the host mounts (STUB_VERIFY_CRASH=1: it exits 1 with no record).
 case "$1" in info) exit 0;; image) echo sha256:stub; exit 0;; ps) [ "${STUB_DOCKER_PS_FAIL:-}" = 1 ] && exit 1; exit 0;; rm|stop|network) exit 0;;
   logs) n=$(cat "$STUB_LOGS" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_LOGS"   # STUB_PROXY_DEAD: never listens; STUB_LOGS_FAIL=<n>: the n-th `docker logs` fails
         [ "${STUB_PROXY_DEAD:-}" = 1 ] || echo '{"listening":8888,"allow":"stub"}'; [ "$n" -ge "${STUB_LOGS_FAIL:-999}" ] && exit 1; exit 0;; esac
 set -e; mode= work= jwork= net= detached= args=()
 while [ $# -gt 0 ]; do case "$1" in
   -e) case "$2" in MODE=*) mode=${2#MODE=};; *) export "$2";; esac; shift 2;;
-  -v) case "$2" in *:/work) work=${2%%:*};; *:/src:ro) src=${2%%:*};; *:/out) out=${2%%:*};; esac; shift 2;;
+  -v) case "$2" in *:/work) work=${2%%:*};; *:/src:ro) src=${2%%:*};; *:/out) out=${2%%:*};; *:/in:ro) vin=${2%%:*};; *:/verify.js:ro) vjs=${2%%:*};; esac; shift 2;;
   --network) net=$2; shift 2;;
   --name|--label|--tmpfs|--memory|--cpus|--pids-limit|--security-opt|--entrypoint) shift 2;;
   -d) detached=1; shift;;
   -*) shift;; *) args+=("$1"); shift;; esac; done
 # The step's proxy (`run -d … --entrypoint node`): record its allowlist and pretend to start.
 [ -z "$detached" ] || { [ -z "${STUB_ALLOW:-}" ] || echo "${ALLOW:-}" >> "$STUB_ALLOW"; echo stub-proxy; exit 0; }
-IFS= read -r secret; echo "stub $mode secret=$secret net=$net proxy=${HTTPS_PROXY:-} npm=${NPM_CONFIG_IGNORE_SCRIPTS:-}/${NPM_CONFIG_BEFORE:-} model=${FACTORY_MODEL:-}/${FACTORY_BUDGET_USD:-}/${JUDGE_MODEL:-}"
+IFS= read -r secret; echo "stub $mode secret=$secret net=$net proxy=${HTTPS_PROXY:-} npm=${NPM_CONFIG_IGNORE_SCRIPTS:-}/${NPM_CONFIG_BEFORE:-} model=${FACTORY_MODEL:-}/${JUDGE_MODEL:-}/${REVIEW_MODEL:-} schema=${#FINDINGS_SCHEMA}"
 # The worker leaks its secret encoded and a token by shape, and ends with Claude Code's cost event. STUB_PROMPT: the prompt's task_id line is kept there.
 [ "$mode" != work ] || { [ -z "${STUB_PROMPT:-}" ] || printf '%s\n' "${args[$((${#args[@]}-1))]}" | grep -m1 '^task_id:' > "$STUB_PROMPT" || true; echo "b64=$(printf '%s' "$secret" | base64) shape=sk-ant-$(printf 'x%.0s' $(seq 24))"; echo '{"type":"result","total_cost_usd":0.12,"num_turns":3,"duration_ms":100}'; }
 case "$mode" in
@@ -62,7 +64,11 @@ case "$mode" in
         [ "${STUB_KILL_RUN:-}" = "$TASK_ID" ] && kill -9 "$(cat "$STUB_LOCK_PID")"   # the orchestrator dies mid-run, before its cleanup
         [ "${STUB_WORK_IDLE_ROUND:-0}" = "$(git rev-list --count "origin/$BASE_BRANCH..HEAD" | xargs -I{} expr {} + 1)" ] && exit 0
         [ "${STUB_WORK_FAIL_ROUND:-0}" = "$(git rev-list --count "origin/$BASE_BRANCH..HEAD" | xargs -I{} expr {} + 1)" ] && exit 7
-        if [ "${STUB_WORK_BLOCKED:-}" = "$TASK_ID" ]; then   # the note; STUB_NOTE: code (on top of a change), dep (beside a manifest change), deleted (written, committed, removed), dir (a directory at the note's path: not a note), replace (round 2: code, plus a replace ref that makes the real head read as a note commit), round2 (code in round 1, the note in round 2)
+        p=${args[$((${#args[@]}-1))]}
+        if [[ "$p" == *"## A verification gate reproduced these findings"* ]]; then   # the fix: the regression repro is `! test -e work.log`
+          case "${STUB_FIX:-}" in idle) exit 0;; nofix) echo again >> work.log;; *) rm -f work.log; echo fixed >> fixed.txt;; esac
+          [ -z "${STUB_FIXES:-}" ] || printf '%s\n' "$p" | grep '^- ' >> "$STUB_FIXES"   # the facts the worker was given
+        elif [ "${STUB_WORK_BLOCKED:-}" = "$TASK_ID" ]; then   # the note; STUB_NOTE: code (on top of a change), dep (beside a manifest change), deleted (written, committed, removed), dir (a directory at the note's path: not a note), replace (round 2: code, plus a replace ref that makes the real head read as a note commit), round2 (code in round 1, the note in round 2)
           r=$(git rev-list --count "origin/$BASE_BRANCH..HEAD"); case "${STUB_NOTE:-}" in code|deleted) echo x >> work.log;; replace) [ "$r" -ge 1 ] || { echo x >> work.log; git add -A; git -c commit.gpgsign=false -c user.name=w -c user.email=w@w commit -qm round; exit 0; }
             echo y >> work.log; git add -A; git -c commit.gpgsign=false -c user.name=w -c user.email=w@w commit -qm code; real=$(git rev-parse HEAD)
             mkdir -p docs; echo '# BLOCKED' > "docs/BLOCKED-$TASK_ID.md"; git add -A; git -c commit.gpgsign=false -c user.name=w -c user.email=w@w commit -qm note; git replace -f "$real" "$(git rev-parse HEAD)"; git reset -q --hard "$real"; exit 0;;   # the real head reads as the note commit through refs/replace
@@ -70,7 +76,8 @@ case "$mode" in
           mkdir -p docs; printf '# BLOCKED: %s\n\nno "url" column on sandboxes\nmore\n' "$TASK_ID" > "docs/BLOCKED-$TASK_ID.md"
           [ "${STUB_NOTE:-}" != deleted ] || { git add -A; git -c commit.gpgsign=false -c user.name=w -c user.email=w@w commit -qm note; git rm -q "docs/BLOCKED-$TASK_ID.md"; }
         elif [ -n "${STUB_CONFLICT:-}" ] && [ "${STUB_CONFLICT_TASK:-$TASK_ID}" = "$TASK_ID" ]; then echo worker > README.md   # STUB_CONFLICT_TASK: only that task conflicts
-        elif [ -n "${STUB_WORK_DEP:-}" ]; then mkdir -p apps/wéb; echo x > apps/wéb/package-lock.json   # a nested manifest, in a path git quotes in --name-only output
+        elif [ -n "${STUB_WORK_DEP:-}" ]; then mkdir -p apps/wéb; echo x > apps/wéb/package-lock.json
+        elif [ -n "${STUB_WORK_DIFF:-}" ]; then echo new > a.txt; sed -i '' 's/old/new/' t.test.js   # the code and its test change together   # a nested manifest, in a path git quotes in --name-only output
         else echo "${args[0]}" >> work.log; fi
         git add -A; git -c commit.gpgsign=false -c user.name=w -c user.email=w@w commit -qm "round";;
   judge) n=$(cat "$STUB_STATE" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_STATE"
@@ -79,6 +86,7 @@ case "$mode" in
          [ -z "${STUB_CONFLICT:-}" ] || [ "${STUB_CONFLICT_TASK:-$TASK_ID}" != "$TASK_ID" ] || ( git clone -q "$STUB_CONFLICT" "$out/c" && cd "$out/c" && echo moved > README.md && git -c commit.gpgsign=false -c user.name=m -c user.email=m@m commit -qam moved && git push -q origin HEAD:main ) || true   # already moved on a retry's round
          [ -z "${STUB_DROP_BASE:-}" ] || git -C "$STUB_DROP_BASE" update-ref -d refs/heads/main   # STUB_DROP_BASE=<remote>: the PR target vanishes, so the base fetch fails
          [ "$HEAD_SHA" = "$(git -C "$src" rev-parse "refs/heads/factory/$TASK_ID")" ] || { echo "stub: HEAD_SHA mismatch" >&2; exit 9; }
+         case "${args[$((${#args[@]}-1))]}" in *"## Facts observed by the orchestrator"*"A verification gate then reproduced these findings at $(git -C "$src" rev-parse "refs/heads/factory/$TASK_ID~1"), each by running its command:"*"- a.js:1:"*"## Claims from the previous"*) echo "stub judge: saw gate facts";; esac
          p=$(git -C "$src" rev-parse "refs/heads/factory/$TASK_ID~1"); case "${args[$((${#args[@]}-1))]}" in *"## Facts observed by the orchestrator"*"judged at $p and ended REFUTED"*"## Claims from the previous round's reviewer (round $((n-1)), verdict REFUTED)"*"about $p."*"finding 1: fix it"*) echo "stub judge: saw previous findings";; esac
          # NONE: a judge that fails after something (the worker, say) preseeded a passing verdict; it must not count.
          [ "$v" = NONE ] && { echo 'VERDICT: VERIFIED' > "$out/verdict.md"; exit 1; }
@@ -88,7 +96,25 @@ case "$mode" in
            BIG)    { head -c 199982 /dev/zero | tr '\0' x; printf 'VERDICT: VERIFIED\n\nVERDICT: REFUTED\n'; } > "$out/verdict.md"; exit 0;;   # byte 200000 ends the first verdict
          esac
          printf 'finding %d: fix it (file.js:1)\nsaw key ghs_%s and mine b64 %s\nVERDICT: %s\n\n' "$n" "$(printf 'y%.0s' $(seq 36))" "$(printf '%s' "$secret" | base64)" "$v" > "$out/verdict.md";;   # a token by shape, and the judge's own key encoded
+  review) n=$(cat "$STUB_STATE.r" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_STATE.r"; v=$(echo "${STUB_REVIEW:-none}" | cut -d, -f$n)
+         [ "$HEAD_SHA" = "$(git -C "$src" rev-parse "refs/heads/factory/$TASK_ID")" ] || { echo "stub: review HEAD_SHA mismatch" >&2; exit 9; }
+         case "${args[$((${#args[@]}-1))]}" in *"## Commits"*"Head: $HEAD_SHA"*"## Task given to the agent"*) ;; *) echo "stub: review prompt lacks the commits or the task" >&2; exit 9;; esac
+         case "${args[$((${#args[@]}-1))]}" in *"Claims from the previous"*|*"VERDICT"*) echo "stub: the review saw the loop judge's findings" >&2; exit 9;; esac
+         b() { printf '{"loc":"a.js:1","claim":"%s","clause":"%s","repro":"%s"}' "$1" "$2" "$3"; }
+         case "$v" in
+           none)     echo '{"blocks":[],"notes":["looks fine"]}' > "$out/review.json";;
+           regress)  echo "{\"blocks\":[$(b 'work.log must not exist' '' '! test -e work.log')],\"notes\":[]}" > "$out/review.json";;
+           preexist) echo "{\"blocks\":[$(b 'always fails' '' 'false')],\"notes\":[]}" > "$out/review.json";;
+           unmet*)   echo "{\"blocks\":[$(b 'fixed.txt is missing' 'fixed exists' "test -e fixed.txt # $v")],\"notes\":[]}" > "$out/review.json";;   # fails at both until the fix writes fixed.txt; unmet1, unmet2: distinct repros
+           invalid)  echo "{\"blocks\":[$(b 'passes' '' 'true'),$(b 'times out' '' 'sleep 5; exit 1'),$(b 'not found' '' 'no-such-cmd-xyz'),$(b 'base cannot run' '' 'if test -e work.log; then false; else no-such-cmd-xyz; fi'),$(b 'writes then fails' '' 'echo x > work.log; false')],\"notes\":[]}" > "$out/review.json";;
+           many)     { printf '{"blocks":['; for i in $(seq 12); do [ "$i" -eq 1 ] || printf ','; b "b$i" '' 'true'; done; printf '],"notes":[]}'; } > "$out/review.json";;
+           bad)      echo 'not json' > "$out/review.json";;
+           crash)    exit 1;;
+         esac; [ "${STUB_HALT_IN_REVIEW:-}" != 1 ] || echo test-factory > "$STUB_HALT_FILE";;   # a stop lands while the review runs
+  verify) [ "${STUB_VERIFY_CRASH:-}" != 1 ] || exit 1; [ -z "$secret" ] || { echo "stub: the verifier got a secret" >&2; exit 9; }
+         SRC=$src IN=$vin WORK=$work OUT=$out VERIFY_TIMEOUT_MS=1500 node "$vjs";;
   push) [ -n "${HEAD_SHA:-}" ] && [ -n "${REPO_URL:-}" ] || exit 9
+        n=$(cat "$STUB_STATE.p" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_STATE.p"; [ "$n" != "${STUB_PUSH_FAIL_AT:-}" ] || exit 8   # STUB_PUSH_FAIL_AT=<n>: the n-th push fails
         git -C "$src" push -q "$REPO_URL" "$HEAD_SHA:refs/heads/factory/$TASK_ID"   # a chained task clones this branch as its base
         [ "$TASK_ID" = "${STUB_HALT_AFTER:-}" ] && echo test-factory > "$STUB_HALT_FILE"; exit 0;;
 esac
@@ -103,7 +129,7 @@ J
 chmod +x "$t/bin/"*
 run() {  # run <task_id> <verdicts> -> prints exit status; RUN_REPO overrides the local bare repo (a GitHub owner/name goes through the App path); RUN_INSTR the instructions (JSON-escaped)
   echo "{\"repo\":\"${RUN_REPO:-$t/remote.git}\",\"base_branch\":\"main\",\"task_id\":\"$1\",\"instructions\":\"${RUN_INSTR:-do the thing}\"}" > "$t/$1.json"
-  rm -f "$t/state" "$t/allow" "$t/logs"; set +e   # FACTORY_MAX_ROUNDS=3: the verdict fixtures below are written for three rounds; one case sets 5
+  rm -f "$t/state" "$t/state.r" "$t/state.p" "$t/allow" "$t/logs"; set +e   # FACTORY_MAX_ROUNDS=3: the verdict fixtures below are written for three rounds; one case sets 5
   PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_ALLOW="$t/allow" STUB_LOGS="$t/logs" STUB_PROMPT="$t/prompt" STUB_APP_KEY="$t/app-key.b64" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_MAX_ROUNDS="${FACTORY_MAX_ROUNDS:-3}" \
     "$here/factory" run "$t/$1.json" >"$t/$1.out" 2>&1; rc=$?; set -e
   echo "$rc"
@@ -121,12 +147,13 @@ check "$(jq -r '"\(.git_identity.name) <\(.git_identity.email)>"' "$m/manifest.j
 grep -q 'Review of your previous attempt (round 1 verdict: REFUTED)' "$m/log.jsonl" || grep -q 'round 2: judge verdict VERIFIED' "$m/log.jsonl" || { echo "FAIL: t1 revision prompt/log"; exit 1; }
 # Egress: each step ran on the run's internal network behind its own proxy, the proxy got that step's allowlist, and its decisions are in the log.
 grep -q 'stub work secret=\[REDACTED\] net=factory-[0-9TZ]*-t1 proxy=http://factory-[0-9TZ]*-t1-work-1-proxy:8888' "$m/log.jsonl" || { echo "FAIL: t1 worker not on the run network behind its proxy"; grep 'stub work' "$m/log.jsonl"; exit 1; }
-check "$(tr '\n' ' ' < "$t/allow")" 'api\.anthropic\.com|registry\.npmjs\.org api\.openai\.com|registry\.npmjs\.org api\.anthropic\.com|registry\.npmjs\.org api\.openai\.com|registry\.npmjs\.org github\.com ' "t1 allowlist per step"
-check "$(jq -r 'select(.event.type=="proxy") | .event.mode' "$m/log.jsonl" | tr '\n' ' ')" "work judge work judge push " "t1 proxy record per step"
-grep -q 'stub work secret=\[REDACTED\] net=[^ ]* proxy=[^ ]* npm=true/20[0-9][0-9]-[^ ]* model=claude-opus-5-5/10/gpt-6.1-sol' "$m/log.jsonl" || { echo "FAIL: t1 npm policy or model/budget not on the docker run line"; grep 'stub work' "$m/log.jsonl"; exit 1; }
-# Pins, cost and redaction: model and budget in the manifest; each worker round's reported cost; the report sums them; the encoded secret
+check "$(tr '\n' ' ' < "$t/allow")" 'api\.anthropic\.com|registry\.npmjs\.org api\.openai\.com|registry\.npmjs\.org api\.anthropic\.com|registry\.npmjs\.org api\.openai\.com|registry\.npmjs\.org github\.com api\.anthropic\.com|registry\.npmjs\.org registry\.npmjs\.org ' "t1 allowlist per step (the gate's review and verifier after the push)"
+check "$(jq -r 'select(.event.type=="proxy") | .event.mode' "$m/log.jsonl" | tr '\n' ' ')" "work judge work judge push review verify " "t1 proxy record per step"
+grep -q 'stub work secret=\[REDACTED\] net=[^ ]* proxy=[^ ]* npm=true/20[0-9][0-9]-[^ ]* model=claude-opus-5-5/gpt-6.1-sol/claude-opus-5-5 schema=[1-9]' "$m/log.jsonl" || { echo "FAIL: t1 npm policy, models or schema not on the docker run line"; grep 'stub work' "$m/log.jsonl"; exit 1; }
+! grep -q 'max-budget\|FACTORY_BUDGET' "$m/log.jsonl" "$here/factory" "$here/Dockerfile" || { echo "FAIL: a spend cap is still wired"; exit 1; }
+# Pins, cost and redaction: models in the manifest; each worker round's reported cost; the report sums them; the encoded secret
 # and a token by shape are redacted in the log, and the shaped token in the judge's review is redacted in judge-<n>.md.
-check "$(jq -r '"\(.model) \(.judge_model) \(.budget_usd) \(.image_pinned)"' "$m/manifest.json")" "claude-opus-5-5 gpt-6.1-sol 10 false" "t1 model, budget and image pin in manifest"
+check "$(jq -r '"\(.model) \(.judge_model) \(.review_model) \(.image_pinned)"' "$m/manifest.json")" "claude-opus-5-5 gpt-6.1-sol claude-opus-5-5 false" "t1 models and image pin in manifest"
 check "$(jq -c '.worker.rounds | map([.round, .status, .reported_cost_usd, .num_turns])' "$m/manifest.json")" "[[1,0,0.12,3],[2,0,0.12,3]]" "t1 worker rounds with cost"
 check "$("$here/factory" report 1 | tail -1 | awk '{print $5}')" 0.24 "t1 report cost column"
 ! grep -q "$(printf '%s' stub-token | base64)" "$m/log.jsonl" || { echo "FAIL: t1 base64 of the token leaked into the log"; exit 1; }
@@ -134,10 +161,9 @@ check "$(grep -c 'b64=\[REDACTED\] shape=\[REDACTED\]' "$m/log.jsonl")" 2 "t1 en
 check "$(grep -c 'saw key \[REDACTED\] and mine b64 \[REDACTED\]' "$m/judge-1.md")" 1 "t1 shaped token and the judge's encoded key redacted in the judge file"
 ! grep -q "ghs_yyyy\|$(printf '%s' dummy-openai_key | base64)" "$m/judge-1.md" "$m/log.jsonl" || { echo "FAIL: t1 shaped token or encoded judge key leaked"; exit 1; }
 check "$(jq -r '.npm_policy.ignore_scripts' "$m/manifest.json")" true "t1 npm policy in manifest"; check "$(jq -r '.npm_policy.before' "$m/manifest.json" | cut -c1-2)" 20 "t1 npm before date in manifest"
-# Image pin: without FACTORY_ALLOW_DIRTY, an image other than IMAGE_ID refuses to start (before the dirty-tree check). A bad budget refuses too.
+# Image pin: without FACTORY_ALLOW_DIRTY, an image other than IMAGE_ID refuses to start (before the dirty-tree check).
 set +e; out=$(PATH="$t/bin:$PATH" FACTORY_SECRETS_DIR="$t/secrets" "$here/factory" run "$t/t1.json" 2>&1); rc=$?; set -e
 check "$rc" 1 "image pin exit"; case "$out" in *"is sha256:stub, not the pinned sha256:"*) ;; *) echo "FAIL: image pin message: $out"; exit 1;; esac
-check "$(FACTORY_BUDGET_USD=abc run b1 "VERIFIED")" 1 "bad budget exit"
 # Evidence: a failing log stage (jq here) in a worker or a judge round is outcome evidence_error, exit 12: nothing further runs, nothing is pushed.
 rc=$(STUB_JQ_FAIL=work run e1 "VERIFIED"); m=$(ls -d "$runs"/*-e1 | tail -1)
 check "$rc" 12 "e1 evidence error exit"; check "$(jq -r '"\(.outcome) \(.final_sha) \(.exit_status)"' "$m/manifest.json")" "evidence_error null 12" "e1 manifest"; check "$(grep -c 'stub judge' "$m/log.jsonl")" 0 "e1 no judge ran"
@@ -223,7 +249,7 @@ printf '%s\n' "$out" | grep -q "080-h: depends_on '010-a 020-b' is not a task id
 # batch: a three-task chain. 020 and 030 cut their branch from the previous task's branch (the files on disk are not touched: same
 # bytes after the move to done/), base_branch stays the task's own and chain_base is in the manifest, and the report has one row per task.
 batch() {  # batch <queue-dir> <verdicts> [flags...] -> exit status; output in $t/batch.out
-  rm -f "$t/state"; set +e
+  rm -f "$t/state" "$t/state.r" "$t/state.p"; set +e
   PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_MAX_ROUNDS=3 \
     "$here/factory" batch "$1" "${@:3}" > "$t/batch.out" 2>&1; rc=$?; set -e
   echo "$rc"
@@ -259,14 +285,16 @@ grep -q '^notify: off (FACTORY_NOTIFY_URL not set)$' "$t/batch.out" && { echo "F
 # A POST that fails is said so on stderr (the batch goes on), so a silent night can be told from a dead webhook.
 queue nf 010-nf-a; rc=$(FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" STUB_NOTIFY_FAIL=1 batch "$t/nf" "REFUTED,REFUTED,REFUTED")
 check "$rc" 5 "failed POST: batch exit unchanged"; check "$(grep -c '^notify: POST failed (curl exit 7)$' "$t/batch.out")" 2 "failed POST reported once per line (task, summary)"; [ ! -e "$t/notify" ] || { echo "FAIL: failed POST recorded a body"; exit 1; }
-# --max-tasks 1, --stop-at in the past (nothing runs, nothing moves), HALT written during 010's push (020 stays), --no-chain.
+# --max-tasks 1, --stop-at in the past (nothing runs, nothing moves), HALT written during 010's push: the gate after it is pending (exit 12,
+# infra, pushed), the retry file is written for tomorrow, the batch halts before it and 020 stays. --no-chain.
 queue mx 010-mx-a 020-mx-b; rc=$(batch "$t/mx" "VERIFIED" --max-tasks 1)
 check "$rc" 0 "max-tasks exit"; check "$(moved mx/done)" "010-mx-a.json " "max-tasks done/"; check "$(moved mx)" "020-mx-b.json done " "max-tasks leaves 020"
 queue st 010-st-a; rc=$(FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/st" "VERIFIED" --stop-at 00:00)
 check "$rc" 0 "stop-at exit"; check "$(moved st)" "010-st-a.json " "stop-at runs nothing"; grep -q 'Stopped: --stop-at 00:00 passed' "$t/batch.out" || { echo "FAIL: stop-at message"; exit 1; }
 check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" "done: 0 run, 0 PR(s), 0 failed. Stopped: --stop-at 00:00 passed. 1 task(s) left in queue." "summary line when nothing ran"; rm -f "$t/notify"
 queue ha 010-ha-a 020-ha-b; rc=$(STUB_HALT_AFTER=010-ha-a STUB_HALT_FILE="$here/HALT" batch "$t/ha" "VERIFIED,VERIFIED")
-check "$rc" 0 "halt exit"; check "$(moved ha/done)" "010-ha-a.json " "halt done/"; check "$(moved ha)" "020-ha-b.json done " "halt leaves 020"
+check "$rc" 12 "halt exit (the gate after the push is pending)"; check "$(moved ha/failed)" "010-ha-a.json " "halt: the attempt archived (pushed, infra)"; check "$(moved ha)" "010-ha-a-i1.json 020-ha-b.json failed " "halt leaves the retry and 020 for tomorrow"
+m=$(ls -d "$runs"/*-010-ha-a | tail -1); check "$(jq -r '"\(.outcome) \(.class) \(.pushed) \(.gate.cycles[0].halted)"' "$m/manifest.json")" "gate_pending infra true true" "halt: gate_pending, the cycle says halted"
 grep -q 'Stopped: halted by' "$t/batch.out" || { echo "FAIL: halt message"; cat "$t/batch.out"; exit 1; }; rm -f "$here/HALT"
 queue nc 010-nc-a 020-nc-b; rc=$(batch "$t/nc" "VERIFIED,VERIFIED" --no-chain)
 check "$rc" 0 "no-chain exit"; m=$(ls -d "$runs"/*-020-nc-b | tail -1); check "$(jq -r '"\(.base_branch) \(.chain_base)"' "$m/manifest.json")" "main null" "no-chain 020 on its own base"
@@ -372,7 +400,7 @@ queue bk 010-bk-a 020-bk-b
 rc=$(STUB_WORK_BLOCKED=010-bk-a FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/bk" "VERIFIED" --continue)
 check "$rc" 10 "blocked batch exit"; m=$(ls -d "$runs"/*-010-bk-a | tail -1)
 check "$(jq -r '"\(.outcome) \(.reason) \(.pr_url) \(.judge.rounds) \(.judge.verdict) \(.pushed) \(.class)"' "$m/manifest.json")" 'blocked no "url" column on sandboxes null 0 null true task' "blocked manifest: outcome, reason, no PR, no judge round, pushed, task"
-check "$(grep -c 'stub judge' "$m/log.jsonl")" 0 "blocked: no judge container ran"; check "$(ls "$m" | grep -c judge-)" 0 "blocked: no judge file"
+check "$(grep -c 'stub judge\|stub review\|stub verify' "$m/log.jsonl")" 0 "blocked: no judge, review or verifier container ran"; check "$(ls "$m" | grep -c judge-)" 0 "blocked: no judge file"; check "$(jq -c .gate "$m/manifest.json")" '{"cycles":[],"result":null}' "blocked: the gate never ran"
 check "$(moved bk/failed)" "010-bk-a.json " "blocked -> failed/"; check "$(moved bk/done)" "020-bk-b.json " "blocked: the next task still ran"
 check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" '010-bk-a exited 10 (blocked, continuing): no \"url\" column on sandboxes
 done: 2 run, 0 PR(s), 0 failed, 1 blocked. All tasks ran.' "notify: reason on the phone, blocked counted apart from failed"; rm -f "$t/notify"
@@ -408,6 +436,68 @@ check "$rc" 0 "t20 exit (a replace ref does not skip the judge)"; check "$(jq -r
 rc=$(STUB_WORK_BLOCKED=t21 STUB_NOTE=round2 run t21 CAVEATS); m=$(ls -d "$runs"/*-t21 | tail -1)
 check "$rc" 10 "t21 exit (note in round 2 after CAVEATS does not ship)"; check "$(jq -r '"\(.outcome) \(.judge.rounds) \(.judge.verdict) \(.pr_url)"' "$m/manifest.json")" "blocked 1 CAVEATS null" "t21 blocked wins over caveats"
 check "$(cat "$t/prompt")" 'task_id: t21 (a blocked note is docs/BLOCKED-t21.md)' "t21 worker prompt names the task_id and note path"
+# The verification gate (loop 0), after the push and the cheap gates: a fresh break-it review (its prompt never carries the loop judge's
+# findings), then the verifier runs each BLOCK's repro at head and base (the real verify.js, against the host mounts). Nothing reproduced:
+# the PR, with the cycle in the manifest and the evidence files. A BLOCK failing at both with no clause is pre-existing; a repro that passes,
+# times out or is not found is invalid; more than MAX_BLOCKS is truncated. None of these block.
+g() { jq -r "$1" "$m/manifest.json"; }
+rc=$(run g1 VERIFIED); m=$(ls -d "$runs"/*-g1 | tail -1)
+check "$rc" 0 "g1 exit (clean gate ships)"; check "$(g '"\(.gate.result) \(.gate.cycles|length) \(.gate.cycles[0].reproduced) \(.gate.cycles[0].reviews[0].lens) \(.gate.cycles[0].reviews[0].valid) \(.gate.cycles[0].verifier.valid) \(.gate.cycles[0].reviews[0].notes[0])"')" "pass 1 0 break-it true true looks fine" "g1 gate record"
+check "$(ls "$m" | grep -c '^gate-0-')" 2 "g1 evidence: gate-0-breakit.json and gate-0-verify.json"; check "$(jq -c '.install' "$m/gate-0-verify.json")" '{"head":null,"base":null}' "g1 nothing to install in the stub repo"
+rc=$(STUB_REVIEW=preexist run g2 VERIFIED); m=$(ls -d "$runs"/*-g2 | tail -1)
+check "$rc" 0 "g2 exit (pre-existing failure is a note)"; check "$(g '"\(.gate.cycles[0].verifier.blocks[0].class) \(.gate.cycles[0].verifier.blocks[0].head_exit) \(.gate.cycles[0].verifier.blocks[0].base_exit) \(.gate.cycles[0].reproduced)"')" "pre-existing 1 1 0" "g2 classified pre-existing"
+rc=$(STUB_REVIEW=invalid run g3 VERIFIED); m=$(ls -d "$runs"/*-g3 | tail -1)
+check "$rc" 0 "g3 exit (invalid repros never block)"; check "$(g '[.gate.cycles[0].verifier.blocks[] | "\(.class):\(.head_exit)/\(.base_exit)"] | join(" ")')" "invalid:0/0 invalid:124/124 invalid:127/127 invalid:1/127 pre-existing:1/1" "g3 passes, a real timeout, not found, a base that cannot run: all invalid; a repro that writes the tree does not change the next one's answer"
+rc=$(STUB_REVIEW=many run g4 VERIFIED); m=$(ls -d "$runs"/*-g4 | tail -1)
+check "$rc" 0 "g4 exit"; check "$(g '"\(.gate.cycles[0].reviews[0].blocks) \(.gate.cycles[0].reviews[0].truncated) \(.gate.cycles[0].verifier.blocks|length)"')" "10 true 10" "g4 blocks truncated to MAX_BLOCKS"
+# A reproduced regression (fails at head, passes at base) costs one worker round with the facts, one judge round with the facts, and a
+# re-gate; judge.rounds counts the cycle's round; the second gate passes and the PR opens. An unmet clause (fails at both, clause named)
+# reproduces too.
+rc=$(STUB_REVIEW=regress,none STUB_FIXES="$t/fixes" run g5 "VERIFIED,VERIFIED"); m=$(ls -d "$runs"/*-g5 | tail -1)
+check "$rc" 0 "g5 exit (regression fixed in one cycle ships)"; check "$(g '"\(.gate.result) \(.gate.cycles|length) \(.gate.cycles[0].reproduced) \(.gate.cycles[0].verifier.blocks[0].class) \(.gate.cycles[1].reproduced) \(.judge.rounds) \(.judge.verdict) \(.worker.rounds|length) \(.outcome // "none")"')" "pass 2 1 regression 0 2 VERIFIED 2 none" "g5 two cycles, two judged rounds"
+check "$(cat "$t/fixes")" '- a.js:1: work.log must not exist [regression; exit 1 at head, 0 at base; repro: ! test -e work.log]' "g5 the worker got the reproduced finding as a fact"; rm -f "$t/fixes"
+check "$(grep -c 'stub judge: saw gate facts' "$m/log.jsonl")" 1 "g5 the cycle's judge got the gate's facts in the facts section"; check "$(ls "$m" | grep -c '^gate-1-')" 2 "g5 second cycle's evidence files"
+rc=$(STUB_REVIEW=unmet,unmet run g6 "VERIFIED,VERIFIED"); m=$(ls -d "$runs"/*-g6 | tail -1)
+check "$rc" 0 "g6 exit (unmet clause, then fixed)"; check "$(g '"\(.gate.cycles[0].verifier.blocks[0].class) \(.gate.cycles[0].reproduced) \(.gate.cycles|length) \(.gate.cycles[1].verifier.blocks[0].head_exit) \(.gate.cycles[1].verifier.blocks[0].class) \(.gate.cycles[1].reproduced)"')" "unmet 1 2 0 invalid 0" "g6 unmet reproduces; the same repro passes after the fix and is not a repeat"
+# Missing verification is never approval: a review that crashed, invalid findings, or a verifier that left no record is gate_pending, exit 12, infra.
+rc=$(STUB_REVIEW=crash run g7 VERIFIED); m=$(ls -d "$runs"/*-g7 | tail -1)
+check "$rc" 12 "g7 exit (review crashed)"; check "$(g '"\(.outcome) \(.class) \(.pushed) \(.pr_url) \(.gate.result) \(.gate.cycles[0].reviews[0].valid) \(.gate.cycles[0].reviews[0].status) \(.reason)"')" "gate_pending infra true null gate_pending false 1 the review left no valid findings (container status 1)" "g7 gate_pending with the reason, never a pass"
+rc=$(STUB_REVIEW=bad run g8 VERIFIED); m=$(ls -d "$runs"/*-g8 | tail -1); check "$rc" 12 "g8 exit (invalid findings file)"; check "$(g '"\(.outcome) \(.gate.cycles[0].reviews[0].valid)"')" "gate_pending false" "g8 invalid JSON is no review"
+rc=$(STUB_VERIFY_CRASH=1 run g9 VERIFIED); m=$(ls -d "$runs"/*-g9 | tail -1); check "$rc" 12 "g9 exit (verifier crashed)"; check "$(g '"\(.outcome) \(.gate.cycles[0].reviews[0].valid) \(.gate.cycles[0].verifier.valid) \(.gate.cycles[0].verifier.status)"')" "gate_pending true false 1" "g9 no verifier record is gate_pending"
+# Death is on no progress: no new commits in a cycle; the same repro reproducing in a later cycle; REFUTED from the loop judge in a cycle;
+# the ceiling of MAX_GATES cycles. Each: outcome refuted, refuted_by gate, exit 5, class task, no PR, branch pushed.
+rc=$(STUB_REVIEW=regress STUB_FIX=idle run g10 VERIFIED); m=$(ls -d "$runs"/*-g10 | tail -1)
+check "$rc" 5 "g10 exit (no new commits in a cycle)"; check "$(g '"\(.outcome) \(.refuted_by) \(.class) \(.pr_url) \(.pushed) \(.judge.rounds) \(.gate.result) \(.gate.cycles|length)"')" "refuted gate task null true 1 refuted 1" "g10 refuted by the gate"
+rc=$(STUB_REVIEW=regress,regress STUB_FIX=nofix run g11 "VERIFIED,VERIFIED"); m=$(ls -d "$runs"/*-g11 | tail -1)
+check "$rc" 5 "g11 exit (the same repro reproduced twice)"; check "$(g '"\(.outcome) \(.refuted_by) \(.judge.rounds) \(.gate.cycles|length) \(.gate.cycles[1].reproduced)"')" "refuted gate 2 2 1" "g11 dead after the second reproduction"
+grep -q 'a finding reproduced again' "$m/log.jsonl" || { echo "FAIL: g11 reason not logged"; exit 1; }
+rc=$(STUB_REVIEW=regress run g12 "VERIFIED,REFUTED"); m=$(ls -d "$runs"/*-g12 | tail -1)
+check "$rc" 5 "g12 exit (REFUTED in a gate cycle is dead)"; check "$(g '"\(.outcome) \(.refuted_by) \(.judge.rounds) \(.judge.verdict) \(.gate.cycles|length)"')" "refuted gate 2 REFUTED 1" "g12 no second gate, no more rounds"; check "$(ls "$m" | grep -c judge-)" 2 "g12 two judge files"
+rc=$(FACTORY_MAX_ROUNDS=1 STUB_FIX=nofix STUB_REVIEW=regress,unmet1,unmet2,unmet3 run g13 "VERIFIED,VERIFIED,VERIFIED,VERIFIED"); m=$(ls -d "$runs"/*-g13 | tail -1)
+check "$rc" 5 "g13 exit (MAX_GATES ceiling; cycles run past MAX_ROUNDS)"; check "$(g '"\(.outcome) \(.refuted_by) \(.judge.rounds) \(.gate.cycles|length) \([.gate.cycles[].reproduced]|add)"')" "refuted gate 4 4 4" "g13 four cycles, four judged rounds"
+grep -q 'the gate ceiling (4) is reached' "$m/log.jsonl" || { echo "FAIL: g13 reason not logged"; exit 1; }
+# Pushed means pushed, across cycles: a push that fails in cycle 2 leaves the first cycle's commit recorded as what is on GitHub (pushed true,
+# final_sha the remote branch), outcome push_failed; a first push that fails records nothing on GitHub. A stop landing while the review runs
+# keeps the review's record and the push facts: gate_pending, halted, pushed.
+rc=$(STUB_REVIEW=regress STUB_PUSH_FAIL_AT=2 run g15 "VERIFIED,VERIFIED"); m=$(ls -d "$runs"/*-g15 | tail -1)
+check "$rc" 8 "g15 exit (the second push failed)"; check "$(g '"\(.outcome) \(.pushed) \(.push_status) \(.class) \(.pr_url) \(.gate.cycles|length)"')" "push_failed true 8 infra null 1" "g15 the first push stands"
+check "$(g .final_sha)" "$(git -C "$t/remote.git" rev-parse refs/heads/factory/g15)" "g15 final_sha is the commit on GitHub (cycle 1's), not the unpushed fix"
+rc=$(STUB_PUSH_FAIL_AT=1 run g16 VERIFIED); m=$(ls -d "$runs"/*-g16 | tail -1)
+check "$rc" 8 "g16 exit (first push failed)"; check "$(g '"\(.outcome) \(.pushed) \(.final_sha) \(.push_status) \(.class)"')" "push_failed false null 8 infra" "g16 nothing on GitHub"
+rc=$(STUB_HALT_IN_REVIEW=1 STUB_HALT_FILE="$here/HALT" run g17 VERIFIED); m=$(ls -d "$runs"/*-g17 | tail -1); rm -f "$here/HALT"
+check "$rc" 12 "g17 exit (stopped during the review)"; check "$(g '"\(.outcome) \(.class) \(.pushed) \(.gate.cycles[0].halted) \(.gate.cycles[0].reviews[0].valid) \(.gate.cycles[0].verifier) \(.reason)"')" "gate_pending infra true true true null stopped before the gate's verify step" "g17 the review's record and the push are kept; the verifier never ran"
+check "$(g .final_sha)" "$(git -C "$t/remote.git" rev-parse refs/heads/factory/g17)" "g17 final_sha persisted before the stop"
+# The differential test checks, on a repo with a package.json and a lockfile (npm ci installs nothing): the worker changes a test and the
+# file it reads, so the base's test fails at head (a test changed under the code: a note) and the head's test fails at base (it tests the change).
+git init -q --bare "$t/diff.git"; git clone -q "$t/remote.git" "$t/diff" 2>/dev/null
+( cd "$t/diff" && echo old > a.txt && printf 'if (require("fs").readFileSync("a.txt","utf8").trim() !== "new") process.exit(1)\n' | sed 's/"new"/"old"/' > t.test.js \
+  && echo '{"name":"x","version":"1.0.0","scripts":{"test":"node t.test.js"}}' > package.json && echo '{"name":"x","version":"1.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"x","version":"1.0.0"}}}' > package-lock.json \
+  && git add . && git -c commit.gpgsign=false -c user.name=t -c user.email=t@t commit -qm diff && git push -q "$t/diff.git" HEAD:main )
+rc=$(RUN_REPO="$t/diff.git" STUB_WORK_DIFF=1 run g14 VERIFIED); m=$(ls -d "$runs"/*-g14 | tail -1)
+check "$rc" 0 "g14 exit (differential checks are notes)";
+check "$(g '.gate.cycles[0].verifier | "\(.install.head) \(.install.base) \(.checks.test_files|join(",")) \(.checks.base_tests_at_head) \(.checks.head_tests_at_base)"')" "0 0 t.test.js 1 1" "g14 npm ci ran at both, base tests fail at head, head tests fail at base"
+( cd "$t/diff" && git rm -q package-lock.json && git -c commit.gpgsign=false -c user.name=t -c user.email=t@t commit -qm nolock && git push -q "$t/diff.git" HEAD:main )
+rc=$(RUN_REPO="$t/diff.git" run g18 VERIFIED); m=$(ls -d "$runs"/*-g18 | tail -1); check "$rc" 12 "g18 exit (no lockfile: npm ci fails)"; check "$(g '"\(.outcome) \(.gate.cycles[0].verifier.install.head) \(.reason)"')" 'gate_pending 1 npm ci failed in the verifier: {"head":1,"base":null} (a package.json with no lockfile fails it)' "g18 a failed install is gate_pending with the reason, never a pass"
 # Verdict parsing fails closed: CRLF is normalised (else VERIFIED\r equals no verdict); two VERDICT lines, or a review the bounded
 # read cut (its first 200000 bytes end in a clean VERDICT line), are no verdict. A worker that fails in round 1 has zero judged rounds.
 rc=$(run t7 CRLF); m=$(ls -d "$runs"/*-t7 | tail -1); check "$rc" 0 "t7 exit (CRLF verdict)"; check "$(jq -r '"\(.judge.verdict) \(.judge.rounds)"' "$m/manifest.json")" "VERIFIED 1" "t7 verdict without \\r"
@@ -417,7 +507,7 @@ rc=$(STUB_WORK_FAIL_ROUND=1 run t10 VERIFIED); m=$(ls -d "$runs"/*-t10 | tail -1
 # Conflict gate: main moves under the run (the judge stub pushes a conflicting README.md), so a VERIFIED branch gets no PR: exit 11.
 rc=$(STUB_CONFLICT="$t/remote.git" run t12 VERIFIED); m=$(ls -d "$runs"/*-t12 | tail -1)
 check "$rc" 11 "t12 exit (conflicts with the target)"; check "$(jq -r '"\(.outcome) \(.judge.verdict) \(.pr_url) \(.class)"' "$m/manifest.json")" "conflict VERIFIED null infra" "t12 outcome conflict, verdict kept, no PR, infra"
-grep -q 'conflicts with main; no PR' "$m/log.jsonl" || { echo "FAIL: t12 conflict not logged"; exit 1; }
+grep -q 'conflicts with main; no PR' "$m/log.jsonl" || { echo "FAIL: t12 conflict not logged"; exit 1; }; check "$(grep -c 'stub review' "$m/log.jsonl")" 0 "t12 a conflict never reaches the verification gate"
 ( cd "$t/seed" && git pull -q origin main && echo hi > README.md && git -c commit.gpgsign=false -c user.name=t -c user.email=t@t commit -qam reset && git push -q origin HEAD:main )   # put main back
 # A base fetch that fails is a gate error (exit 12), never reported as a conflict.
 rc=$(STUB_DROP_BASE="$t/remote.git" run t14 VERIFIED); m=$(ls -d "$runs"/*-t14 | tail -1)
@@ -446,6 +536,9 @@ check "$(jq -r .pr_url "$m/manifest.json")" https://github.com/o/r/pull/1 "gh1 P
 # The PR mint (the last one) asks for exactly pull_requests:write + contents:read: contents:read so POST /pulls can resolve refs on a private repo, nothing that could push, approve or merge.
 check "$(tail -1 "$t/mints" | jq -c '.permissions == {"pull_requests":"write","contents":"read"} and .repositories == ["r"]')" true "gh1 PR token permissions"
 check "$(grep -c '"contents":"write"' "$t/mints")" 2 "gh1 clone and push mints are contents:write"
+rc=$(RUN_REPO=o/r STUB_PRS="$t/prs-g" STUB_REVIEW=preexist run gh7 VERIFIED); m=$(ls -d "$runs"/*-gh7 | tail -1); check "$rc" 0 "gh7 exit"
+for l in '## Judge (Codex), 1 round(s), verdict VERIFIED' '## Verification gate, 1 cycle(s), result pass' 'cycle 1: review break-it (claude-opus-5-5): 1 block(s), 0 note(s); verifier: 0 reproduced' '- pre-existing a.js:1: always fails (exit 1 at head, 1 at base; `false`)'; do
+  jq -r .body "$t/prs-g" | grep -qxF -e "$l" || { echo "FAIL: gh7 PR body lacks: $l"; jq -r .body "$t/prs-g"; exit 1; }; done
 rc=$(RUN_REPO=o/r STUB_INSTALL_404=1 run gh2 VERIFIED); m=$(ls -d "$runs"/*-gh2 | tail -1)
 check "$rc" 1 "gh2 exit (404 fails closed)"; grep -q 'not installed on o/r' "$t/gh2.out" || { echo "FAIL: gh2 404 message"; cat "$t/gh2.out"; exit 1; }
 check "$(jq -r .installation_id "$m/manifest.json")" null "gh2 no installation recorded"; check "$(jq -r .base_sha "$m/manifest.json")" null "gh2 never cloned"
@@ -465,6 +558,10 @@ m=$(ls -d "$runs"/*-020-p4-b | tail -1); check "$(jq -r '"\(.chain_base) \(.exit
 check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" "010-p4-a exited 4 (PR open failed, open it by hand, continuing)
 020-p4-b exited 4 (PR open failed, open it by hand, continuing)
 done: 2 run, 0 PR(s), 0 failed. All tasks ran." "exit 4 chains: a line per task, none failed"; rm -f "$t/notify"
+# gate_pending is infra: the attempt is archived and retried once as -i1, which gates clean and passes.
+mkdir -p "$t/gp"; task o/r main 010-gp-a "$body" "$t/gp"; rc=$(STUB_APP_KEY="$t/app-key.b64" STUB_REVIEW=crash,none batch "$t/gp" "VERIFIED,VERIFIED")
+check "$rc" 0 "gate_pending retry: recovered"; check "$(moved gp/failed)" "010-gp-a.json " "gate_pending retry: the attempt archived"; check "$(moved gp/done)" "010-gp-a-i1.json " "gate_pending retry: the retry passed"
+m=$(ls -d "$runs"/*-010-gp-a | tail -1); check "$(jq -r '"\(.outcome) \(.class) \(.pushed)"' "$m/manifest.json")" "gate_pending infra true" "gate_pending retry: original classed infra"
 # Chain against GitHub: 020 cuts its branch from factory/010-gc-a but both PRs are opened with base main (the task's own base_branch),
 # so a chain head merged and auto-deleted while the next task runs cannot make POST /pulls 422 "base ref not found".
 mkdir -p "$t/gc"; task o/r main 010-gc-a "$body" "$t/gc"; task o/r main 020-gc-b "$body" "$t/gc"
@@ -514,4 +611,4 @@ mkdir -p "$runs/stoptest"; echo '{"ended_at":null,"exit_status":null}' > "$runs/
 PATH="$t/bin:$PATH" STUB_DOCKER_PS_FAIL=1 "$here/factory" stop stoptest > "$t/stop.out" 2>&1 || { echo "FAIL: stop with docker down exited $?"; cat "$t/stop.out"; exit 1; }
 check "$(jq -r '"\(.exit_status) \(.outcome) \(.class)"' "$runs/stoptest/manifest.json")" "137 stopped task" "stop with docker down records the incident; a stopped task is class task (never re-dispatched by the batch)"; rm -f "$here/HALT"; rm -rf "$runs/stoptest"
 find "$runs" -mindepth 1 -maxdepth 1 -newer "$t/secrets" -exec rm -rf {} +   # everything the run tree gained since this test began is the test's (the lock keeps a real run out)
-echo "ok: egress (per-step proxy, allowlists, network record, dead proxy, lost record), pins (image id, model, budget), cost per round and report, evidence error (worker, judge), redaction (encoded, by shape: log, judge file, PR body), supply chain (credential in tree, in task, in lint; dependency manifest gate and its Scope permission; npm policy; requeue notes), judge loop (revise with facts and claims apart, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, five rounds, App bot commit identity and its failed lookup), gates (blocked: round-1 note skips the judge, note on code, note in round 2 after REFUTED and after CAVEATS, deleted note, a directory is not a note, a replace ref does not skip the judge, manifest ahead of blocked; the worker prompt names the note path; conflict with the target), lint, batch (chain, refuted chain, chain after a failure, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run left in queue, blocked reason on the phone, notify host and off state, failed POST visible, infra retry recovered / failed the same way / conflict cut from its own base / conflict mid-chain not retried, hand-queued -i1 after a pass, circuit breaker, pr_failed chains, a stopped run is class task, depends_on: passed tonight / not merged waits / merged runs / no-chain waits / queued waits / dead notified and non-zero / pruned record unknown / worst dependency decides / declared base waiting / GitHub merged, open, reverted by exact title, 502 and 403 unknown, merged elsewhere dead / one cached read-only token), class and pushed in the manifest, lint depends_on (graph, later, self, unknown, other repo, schema, id grammar, malformed archive), requeue (blocked, refuted, skipped), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), stop with docker down"
+echo "ok: egress (per-step proxy, allowlists, network record, dead proxy, lost record), pins (image id, models, no spend cap), cost per round and report, evidence error (worker, judge), redaction (encoded, by shape: log, judge file, PR body), supply chain (credential in tree, in task, in lint; dependency manifest gate and its Scope permission; npm policy; requeue notes), judge loop (revise with facts and claims apart, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, five rounds, App bot commit identity and its failed lookup), verification gate (clean gate ships with the record in the PR body; pre-existing, invalid and truncated never block; a regression and an unmet clause cost one worker round with the facts, one judge round with the facts and a re-gate; crashed or invalid review, crashed verifier, a stop during the review are gate_pending and retried as -i1; a failed second push keeps the first; no new commits, the same repro twice, REFUTED in a cycle and the MAX_GATES ceiling are refuted by the gate; blocked and conflict never reach it; the differential test checks with npm ci), gates (blocked: round-1 note skips the judge, note on code, note in round 2 after REFUTED and after CAVEATS, deleted note, a directory is not a note, a replace ref does not skip the judge, manifest ahead of blocked; the worker prompt names the note path; conflict with the target), lint, batch (chain, refuted chain, chain after a failure, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run left in queue, blocked reason on the phone, notify host and off state, failed POST visible, infra retry recovered / failed the same way / conflict cut from its own base / conflict mid-chain not retried, hand-queued -i1 after a pass, circuit breaker, pr_failed chains, a stopped run is class task, depends_on: passed tonight / not merged waits / merged runs / no-chain waits / queued waits / dead notified and non-zero / pruned record unknown / worst dependency decides / declared base waiting / GitHub merged, open, reverted by exact title, 502 and 403 unknown, merged elsewhere dead / one cached read-only token), class and pushed in the manifest, lint depends_on (graph, later, self, unknown, other repo, schema, id grammar, malformed archive), requeue (blocked, refuted, skipped), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), stop with docker down"

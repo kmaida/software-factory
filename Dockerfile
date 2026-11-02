@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Factory sandbox image. See factory.md.
+# Factory sandbox image. See factory.md. Rebuilt for loop 0 (2026-11-02): the review and verify arms; the worker's spend cap removed.
 # Build:  docker build -t factory-sandbox .
 # Run (orchestrator does this; shown for reference). One container per step, MODE selects the step, exactly one
 # secret arrives on stdin:
@@ -7,6 +7,10 @@
 #   judge  OPENAI key        -v "$REPO_DIR":/src:ro -v "$JUDGE_DIR":/work -v "$OUT_DIR":/out -e HEAD_SHA "<prompt>"
 #                                                                                    Codex clones /src at HEAD_SHA, reviews, writes /out/verdict.md
 #   push   GITHUB token      -v "$REPO_DIR":/src:ro -e REPO_URL -e HEAD_SHA              bare-clones /src, pushes HEAD_SHA to REPO_URL as factory/<task_id>
+#   review ANTHROPIC token   -v "$REPO_DIR":/src:ro -v "$RW_DIR":/work -v "$OUT_DIR":/out -e HEAD_SHA -e REVIEW_MODEL -e FINDINGS_SCHEMA "<prompt>"
+#                                                                                    Claude Code reviews a fresh clone at HEAD_SHA, writes /out/review.json
+#   verify (empty line)      -v "$REPO_DIR":/src:ro -v "$IN_DIR":/in:ro -v "$V_DIR":/work -v "$OUT_DIR":/out -v verify.js:/verify.js:ro -e HEAD_SHA -e BASE_SHA
+#                                                                                    no model, no credential: runs each BLOCK's repro at head and base, writes /out/verify.json
 #   printf '%s\n' "$SECRET" | docker run -i --rm --read-only --tmpfs /tmp --tmpfs /run/secrets:size=64k \
 #     --memory 4g --cpus 2 --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges \
 #     -e MODE=work -e TASK_ID -e BASE_BRANCH -e GIT_AUTHOR_NAME -e GIT_AUTHOR_EMAIL -e GIT_COMMITTER_NAME -e GIT_COMMITTER_EMAIL \
@@ -45,8 +49,8 @@ work)
   git checkout -q "factory/${TASK_ID}" 2>/dev/null || git checkout -qb "factory/${TASK_ID}" "origin/${BASE_BRANCH}"
   # Stream tool calls as JSON; the orchestrator on the host writes them to runs/<id>/log.jsonl.
   # Capability profile: these tools run without prompts (there is nobody to answer one); everything else is denied.
-  # Model and spend cap come from the orchestrator (a full model id is the pin; the cap is Claude Code's own estimate, so it can overshoot). Both required.
-  claude -p "$*" --output-format stream-json --verbose --model "${FACTORY_MODEL:?}" --max-budget-usd "${FACTORY_BUDGET_USD:?}" \
+  # The model comes from the orchestrator (a full model id is the pin). No spend cap: thrash is bounded by rounds, not dollars (factory.md).
+  claude -p "$*" --output-format stream-json --verbose --model "${FACTORY_MODEL:?}" \
     --allowedTools "Bash,Read,Edit,MultiEdit,Write,Glob,Grep,NotebookEdit,TodoWrite,Agent" < /dev/null
   # Safety net: commit anything the agent left uncommitted so the work reaches the judge and the PR. A commit that fails for a
   # real reason (index lock, hook) is a failed round (exit 2), never "no changes".
@@ -87,7 +91,36 @@ push)
   git clone -q --no-local --bare /src /tmp/push.git
   git -C /tmp/push.git -c core.hooksPath=/dev/null push "$REPO_URL" "$HEAD_SHA:refs/heads/factory/${TASK_ID}"
   ;;
-*) echo "factory: MODE must be work, judge or push" >&2; exit 2 ;;
+review)
+  # The verification gate's reviewer: a fresh Claude Code session with the break-it lens, the worker's kind of token, on a fresh clone at the
+  # judged head. --safe-mode disables CLAUDE.md, hooks, MCP, plugins and commands and keeps auth (--bare would drop the ANTHROPIC_AUTH_TOKEN
+  # path); the flags are the control and the strip below is the backstop, at every depth, since the worker could plant a config file anywhere.
+  export ANTHROPIC_AUTH_TOKEN="$SECRET"; SECRET=; rm -f /run/secrets/token
+  git clone -q --no-local /src /work
+  cd /work
+  git checkout -q --detach "$HEAD_SHA"
+  [ "$(git rev-parse HEAD)" = "$HEAD_SHA" ] || { echo "factory: review checkout is not $HEAD_SHA" >&2; exit 2; }
+  find . -path ./.git -prune -o \( -name CLAUDE.md -o -name CLAUDE.local.md -o -name AGENTS.md -o -name AGENTS.override.md -o -name .claude -o -name .codex -o -name .cursor -o -name .mcp.json \) -prune -exec rm -rf {} +
+  rc=0; claude -p "$*" --output-format stream-json --verbose --model "${REVIEW_MODEL:?}" --safe-mode --setting-sources "" --strict-mcp-config \
+    --disable-slash-commands --no-session-persistence --allowedTools "Bash,Read,Glob,Grep,Edit" --json-schema "${FINDINGS_SCHEMA:?}" < /dev/null > /tmp/review.jsonl || rc=$?
+  cat /tmp/review.jsonl   # the stream reaches the run log like the worker's
+  [ "$rc" -eq 0 ] || { echo "factory: claude exited $rc" >&2; exit "$rc"; }
+  # The findings: the last result event's structured output (the image has no jq), written only when the CLI reported no error; anything
+  # else leaves no file, which the host treats as a gate error, never as a pass. The host validates the shape.
+  node -e '
+    const fs = require("fs"); let r = null;
+    for (const l of fs.readFileSync("/tmp/review.jsonl", "utf8").split("\n")) { try { const o = JSON.parse(l); if (o.type === "result") r = o; } catch {} }
+    if (!r) { console.error("factory: no result event"); process.exit(3); }
+    if (r.is_error) { console.error("factory: result is_error: " + String(r.result).slice(0, 500)); process.exit(3); }
+    let f = r.structured_output; if (f === undefined) { try { f = JSON.parse(r.result); } catch { console.error("factory: result is not JSON"); process.exit(3); } }
+    fs.writeFileSync("/out/review.json", JSON.stringify(f));'
+  ;;
+verify)
+  # The verifier: no model, no credential (the line read above is empty). verify.js is mounted from the factory checkout, like proxy.js.
+  SECRET=; rm -f /run/secrets/token
+  exec node /verify.js
+  ;;
+*) echo "factory: MODE must be work, judge, push, review or verify" >&2; exit 2 ;;
 esac
 EOF
 

@@ -24,12 +24,11 @@ IMAGE="factory-sandbox"
 # PR bumping this, pull again. FACTORY_ALLOW_DIRTY=1 runs on any image and the manifest says so (image_pinned:false).
 IMAGE_ID="sha256:74cb924e384145d9c5ca1fca9003c22704e904518218b528f56800ba9106f8e9"
 TIMEOUT_SEC=3600
-# Inference: a full model id is the pin (an alias moves), and the worker's cap is Claude Code's own estimate (it can overshoot, and a
-# worker that calls the API itself is outside it), so a five-round task is bounded at about 5 x the budget. Codex has no spend flag; the
-# per-workspace hard limits in the two consoles are the backstop (factory.md). The judge's cost is not visible here.
+# Inference: a full model id is the pin (an alias moves). No spend cap: thrash is bounded by rounds and gate cycles, never by dollars
+# (docs/cascade-plan.md); the one backstop is a hard limit on the judge's OpenAI project as a stolen-key damage cap. The judge's cost is not visible here.
 FACTORY_MODEL="claude-opus-5-5"
 JUDGE_MODEL="gpt-6.1-sol"
-BUDGET_USD="${FACTORY_BUDGET_USD:-10}"
+REVIEW_MODEL="claude-opus-5-5"   # the verification gate's break-it reviewer (a fresh session; the gate also has the verifier, which is no model)
 KEYCARD_ZONE="https://1jgewf106fax3oaf70vyykwj2i.keycard.cloud"   # software factory zone; brokers the Claude credential
 ANTHROPIC_RESOURCE="https://api.anthropic.com"
 # Anthropic Workload Identity Federation: Keycard's token is exchanged here for a 1h API token. None of these are secrets.
@@ -42,6 +41,10 @@ GITHUB_APP_SLUG="kmaida-software-factory"  # the App's bot user is <slug>[bot]; 
 GITHUB_APP_KEY_RESOURCE="urn:factory:github-app-key"
 OPENAI_RESOURCE="https://api.openai.com"       # Keycard Vault API Token credential on the OpenAI API resource: the Codex judge's key, fetched per judge round
 MAX_ROUNDS="${FACTORY_MAX_ROUNDS:-5}"          # worker -> judge rounds before the verdict is final; a round with no new commits ends the loop early
+MAX_GATES=4      # verification gate cycles per run, a ceiling under the progress rule (a repro reproducing twice is dead before it)
+MAX_BLOCKS=10    # BLOCKs the verifier runs per review; more is noise, and each costs up to two 300 s runs
+# The reviewer's output contract (also the CLI's --json-schema): BLOCKs, each with a repro the verifier runs, and NOTEs for the human.
+FINDINGS_SCHEMA='{"type":"object","properties":{"blocks":{"type":"array","items":{"type":"object","properties":{"loc":{"type":"string"},"claim":{"type":"string"},"clause":{"type":"string"},"repro":{"type":"string"}},"required":["loc","claim","clause","repro"],"additionalProperties":false}},"notes":{"type":"array","items":{"type":"string"}}},"required":["blocks","notes"],"additionalProperties":false}'
 # Egress. Every step runs on a per-run internal network (no route out, no external DNS) with its own proxy container on both that
 # network and the bridge: proxy.js in this checkout, run in the sandbox image, CONNECT to the step's hosts on 443 and nothing else,
 # one JSON line per decision into log.jsonl. The proxy vars are a courtesy to the clients: with no route out, a client that ignores
@@ -49,6 +52,7 @@ MAX_ROUNDS="${FACTORY_MAX_ROUNDS:-5}"          # worker -> judge rounds before t
 ALLOW_WORK='api\.anthropic\.com|registry\.npmjs\.org'   # Claude Code, and the repo's own installs
 ALLOW_JUDGE='api\.openai\.com|registry\.npmjs\.org'     # Codex (its chatgpt.com model-list refresh is denied; non-fatal), and the repo's checks
 ALLOW_PUSH='github\.com'
+ALLOW_VERIFY='registry\.npmjs\.org'   # the verifier: the repo's own installs, nothing else; the review arm uses the worker's list
 # Supply chain. CRED_RE: common credential shapes (a heuristic: these shapes, not every provider's format), refused in the task text and
 # in the tree the worker will check out, before any credential is issued; the gate reports file names, never content. MANIFEST_RE:
 # dependency manifests at any depth; a PR that changes one needs the task's Scope section to name package.json. That is a gate on
@@ -104,7 +108,7 @@ notify() {  # notify <line>: POST "<batch_id>: <line>" to FACTORY_NOTIFY_URL whe
 }
 
 # ---------------------------------------------------------------- run
-run_id= net= work= jwork= jout= gate= logf= borrowed=
+run_id= net= work= jwork= jout= gate= rwork= rout= vin= vwork= vout= logf= borrowed=
 manifest_set() {  # manifest_set <jq-filter> [jq args...]: atomic update of this run's manifest
   f="$1"; shift
   jq "$@" "$f" "$rundir/manifest.json" > "$rundir/manifest.json.tmp.$$" && mv "$rundir/manifest.json.tmp.$$" "$rundir/manifest.json"
@@ -114,7 +118,7 @@ cleanup() {
   # Best effort, every step: a docker outage here must not stop the manifest from being finalized or the lock from being released.
   if [ -n "$run_id" ]; then c=$(docker ps -aq --filter "label=factory.run=$run_id" 2>/dev/null) || c=; [ -n "$c" ] && docker rm -f $c >/dev/null 2>&1 || true; fi
   [ -z "$net" ] || docker network rm "$net" >/dev/null 2>&1 || true   # after the containers: a network with members cannot be removed
-  for d in "$work" "$jwork" "$jout" "$gate"; do [ -z "$d" ] || rm -rf "$d" 2>/dev/null || true; done   # never let a failed rm change the exit status
+  for d in "$work" "$jwork" "$jout" "$gate" "$rwork" "$rout" "$vin" "$vwork" "$vout"; do [ -z "$d" ] || rm -rf "$d" 2>/dev/null || true; done   # never let a failed rm change the exit status
   # A run that died before finalizing still gets a terminal state, so no manifest is left open-ended.
   if [ -n "${rundir:-}" ] && [ -f "$rundir/manifest.json" ] && [ "$(jq -r .ended_at "$rundir/manifest.json")" = null ]; then
     manifest_set '. + {ended_at:$ended, exit_status:$rc} | '"$END_JQ" --arg ended "$(now)" --argjson rc "$rc"
@@ -217,7 +221,7 @@ run_container() {  # run_container <mode> <secret> [docker args...] -- [entrypoi
   # are collected into the log after the step, so a run the orchestrator abandons loses them (cleanup removes the container).
   # Any proxy failure is the run's failure (die), never the step's: a step must not run without its proxy, a proxy must not outlive
   # its step on the run network, and a step whose network record cannot be collected is not a recorded step.
-  case "$mode" in work) allow=$ALLOW_WORK;; judge) allow=$ALLOW_JUDGE;; *) allow=$ALLOW_PUSH;; esac
+  case "$mode" in work|review) allow=$ALLOW_WORK;; judge) allow=$ALLOW_JUDGE;; verify) allow=$ALLOW_VERIFY;; push) allow=$ALLOW_PUSH;; *) die "run_container: unknown mode $mode";; esac   # an unknown mode dies, never gets another's allowlist
   pname="$cname-proxy"
   egress_record() { docker logs "$pname" 2>&1 | jq -R -c --arg r "$run_id" --arg m "$mode" '{run_id:$r, ts:(now|todate), event:((. as $l | try fromjson catch {text:$l}) + {type:"proxy", mode:$m})}' >> "$logf"; }
   docker run -d --name "$pname" --label "factory.run=$run_id" --read-only --memory 256m --pids-limit 64 --cap-drop ALL --security-opt no-new-privileges \
@@ -226,14 +230,15 @@ run_container() {  # run_container <mode> <secret> [docker args...] -- [entrypoi
   for i in 1 2 3 4 5 6 7 8 9 10; do docker logs "$pname" 2>&1 | grep -q '"listening"' && break; sleep 0.5; done   # ~100 ms normally
   docker logs "$pname" 2>&1 | grep -q '"listening"' || { egress_record || true; die "proxy $pname is not listening after 5s; its output is in the log"; }
   log "container $cname starting; egress ^(?:$allow)$ via $pname"
-  ( sleep "$TIMEOUT_SEC" && docker stop -t 10 "$cname" >/dev/null 2>&1 ) & watchdog=$!
+  wd=$TIMEOUT_SEC; [ "$mode" != verify ] || wd=$((TIMEOUT_SEC * 2))   # ponytail: 2 x MAX_BLOCKS + 4 runs at 300 s is 7200 s; a total budget in verify.js if this ever bites
+  ( sleep "$wd" && docker stop -t 10 "$cname" >/dev/null 2>&1 ) & watchdog=$!
   set +e
   printf '%s\n' "$secret" \
   | docker run -i --name "$cname" --label "factory.run=$run_id" --rm --read-only --tmpfs /tmp --tmpfs /run/secrets:size=64k \
     --memory 4g --cpus 2 --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges \
     --network "$net" -e HTTPS_PROXY="http://$pname:8888" -e https_proxy="http://$pname:8888" -e HTTP_PROXY="http://$pname:8888" -e http_proxy="http://$pname:8888" \
     -e NPM_CONFIG_IGNORE_SCRIPTS=true -e NPM_CONFIG_BEFORE="$npm_before" \
-    -e FACTORY_MODEL="$FACTORY_MODEL" -e FACTORY_BUDGET_USD="$BUDGET_USD" -e JUDGE_MODEL="$JUDGE_MODEL" \
+    -e FACTORY_MODEL="$FACTORY_MODEL" -e JUDGE_MODEL="$JUDGE_MODEL" -e REVIEW_MODEL="$REVIEW_MODEL" -e FINDINGS_SCHEMA="$FINDINGS_SCHEMA" \
     -e MODE="$mode" -e TASK_ID="$task_id" -e BASE_BRANCH="$from_branch" \
     -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
     "${dargs[@]}" "$image_digest" "$@" 2>&1 \
@@ -263,6 +268,88 @@ run_container() {  # run_container <mode> <secret> [docker args...] -- [entrypoi
   docker rm -f "$pname" >/dev/null 2>&1 || die "cannot remove proxy $pname; the next step would share the run network with it"
 }
 
+run_gate() {  # The verification gate on $head (factory.md, loop 0). Step 1: a fresh Claude reviewer with the break-it lens, in its own container
+  # on a fresh clone, that never saw the loop judge's findings; it emits JSON findings, each BLOCK with a repro command. Step 2: the
+  # verifier, a container with no model and no credential, runs every repro at $head and at $base_sha and the two differential test
+  # checks. The host classifies each BLOCK (invalid, regression, unmet, pre-existing); only regression and unmet count. Sets gres: pass,
+  # blocks (gfacts holds the reproduced findings as text; gagain=1 when one of their repros reproduced in an earlier cycle), or error (a
+  # step left no valid record: gate_pending, never a pass). The cycle's record goes to the manifest before this returns.
+  gres=error gfacts= gagain= greason=; gc="$rundir/gate-$cycle"
+  # A stop that landed after the push: the branch is judged and on GitHub, only the gate is missing. gate_pending says exactly that.
+  # Checked before each step (run_container would die, leaving no cycle record), with the review's record kept when the stop comes after it.
+  halted() { manifest_set '.gate.cycles += [{reviews:$r, verifier:null, reproduced:null, halted:true}]' --argjson r "${1:-[]}"; greason="stopped before the gate's $2 step"; log "gate cycle $cycle: dispatch blocked by $HALT; the gate is pending"; }
+  if [ -e "$HALT" ]; then halted '[]' review; return 0; fi
+  rwork=$(mktemp -d "${TMPDIR:-/tmp}/factory-review.XXXXXX"); rout=$(mktemp -d "${TMPDIR:-/tmp}/factory-review-out.XXXXXX")
+  rprompt="$(cat "$FACTORY_DIR/review-prompt.md")"$'\n\n'"## Commits"$'\n'"Base: $base_sha"$'\n'"Head: $head"$'\n\n'"## Task given to the agent"$'\n'"$instructions"
+  an_tok=$(anthropic_token) || an_tok=; [ -n "$an_tok" ] || die "Anthropic did not exchange the Keycard token for the review (rule $ANTHROPIC_FEDERATION_RULE, workspace $ANTHROPIC_WORKSPACE)"
+  log "gate cycle $cycle: review (break-it, $REVIEW_MODEL) at $head"
+  run_container review "$an_tok" -v "$work":/src:ro -v "$rwork":/work -v "$rout":/out -e HEAD_SHA="$head" -- "$rprompt"; an_tok=
+  rstatus=$status; status=0
+  # Valid findings: the container exited 0 and left a regular, bounded file of the agreed shape. At most MAX_BLOCKS blocks go to the verifier.
+  rev=
+  if [ "$rstatus" -eq 0 ] && [ -f "$rout/review.json" ] && [ ! -L "$rout/review.json" ] && [ "$(wc -c < "$rout/review.json")" -le 200000 ]; then
+    rev=$(jq -c --argjson max "$MAX_BLOCKS" 'select(type=="object" and (.blocks|type=="array") and (.notes|type=="array")
+          and all(.blocks[]; type=="object" and (.loc|type=="string") and (.claim|type=="string") and (.clause|type=="string") and (.repro|type=="string" and length>0))
+          and all(.notes[]; type=="string")) | {blocks:.blocks[:$max], notes:.notes, truncated:((.blocks|length) > $max)}' "$rout/review.json" 2>/dev/null) || rev=
+  fi
+  rev=$(printf '%s' "$rev" | redact)   # shapes only: a token has no quote or backslash, so the JSON stays valid
+  rm -rf "$rwork" "$rout"; rwork= rout=
+  if [ -z "$rev" ]; then
+    manifest_set '.gate.cycles += [{reviews:[{lens:"break-it", arm:"review", model:$m, status:$s, valid:false}], verifier:null, reproduced:null}]' --arg m "$REVIEW_MODEL" --argjson s "$rstatus"
+    greason="the review left no valid findings (container status $rstatus)"; log "gate cycle $cycle: $greason"; return 0
+  fi
+  printf '%s\n' "$rev" > "$gc-breakit.json"
+  rrec=$(jq -c --arg m "$REVIEW_MODEL" --argjson s "$rstatus" '[{lens:"break-it", arm:"review", model:$m, status:$s, valid:true, blocks:(.blocks|length), notes:.notes, truncated:.truncated}]' <<< "$rev")
+  if [ -e "$HALT" ]; then halted "$rrec" verify; return 0; fi
+  vin=$(mktemp -d "${TMPDIR:-/tmp}/factory-verify-in.XXXXXX"); vwork=$(mktemp -d "${TMPDIR:-/tmp}/factory-verify.XXXXXX"); vout=$(mktemp -d "${TMPDIR:-/tmp}/factory-verify-out.XXXXXX")
+  printf '%s' "$rev" > "$vin/findings.json"
+  log "gate cycle $cycle: verify $(jq '.blocks|length' <<< "$rev") block(s) at $head and at $base_sha"
+  run_container verify "" -v "$work":/src:ro -v "$vin":/in:ro -v "$vwork":/work -v "$vout":/out -v "$FACTORY_DIR/verify.js":/verify.js:ro -e HEAD_SHA="$head" -e BASE_SHA="$base_sha" --
+  vstatus=$status; status=0
+  ver=
+  if [ "$vstatus" -eq 0 ] && [ -f "$vout/verify.json" ] && [ ! -L "$vout/verify.json" ] && [ "$(wc -c < "$vout/verify.json")" -le 200000 ]; then
+    ver=$(jq -c --argjson n "$(jq '.blocks|length' <<< "$rev")" 'select(type=="object" and (.install|type=="object") and all(.install[]; type=="number" or .==null) and (.checks|type=="object")
+          and (.blocks|type=="array" and length==$n) and (((all(.install[]; .==null or .==0)) | not) or all(.blocks[]; type=="object" and (.head_exit|type=="number") and (.base_exit|type=="number"))))' "$vout/verify.json" 2>/dev/null) || ver=
+  fi
+  rm -rf "$vin" "$vwork" "$vout"; vin= vwork= vout=
+  # A failed install is a gate error, not a downgrade: nothing was verified. So is a verifier that left no valid record.
+  if [ -z "$ver" ] || [ "$(jq -r '[.install[]] | any(. != null and . != 0)' <<< "$ver")" = true ]; then
+    manifest_set '.gate.cycles += [{reviews:[{lens:"break-it", arm:"review", model:$m, status:$s, valid:true, blocks:($r.blocks|length), notes:$r.notes, truncated:$r.truncated}], verifier:{status:$v, valid:false, install:($x.install // null)}, reproduced:null}]' \
+      --arg m "$REVIEW_MODEL" --argjson s "$rstatus" --argjson r "$rev" --argjson v "$vstatus" --argjson x "${ver:-null}"
+    greason="the verifier left no valid record (container status $vstatus)"; [ -z "$ver" ] || greason="npm ci failed in the verifier: $(jq -c .install <<< "$ver") (a package.json with no lockfile fails it)"
+    log "gate cycle $cycle: $greason"; return 0
+  fi
+  # Classification (principle 3): invalid (head exit 0, or a head run that did not execute: 124 timeout, 126, 127, 128 or more), regression
+  # (fails at head, passes at base), unmet (fails at head and names a Done when clause: what the base does is beside the point, the clause is
+  # about the head, and a tool the task adds has no base run), pre-existing (fails validly at both, no clause: a note for the human). A base
+  # run that could not execute decides nothing: no clause, no regression, no pre-existing, so invalid.
+  rec=$(jq -c --argjson v "$ver" 'def bad: . == 124 or . == 126 or . == 127 or . >= 128; [range(0; .blocks|length) as $i | .blocks[$i] + ($v.blocks[$i]) | .class =
+          (if .head_exit == 0 or (.head_exit|bad) then "invalid" elif .base_exit == 0 then "regression" elif (.clause|length) > 0 then "unmet"
+           elif (.base_exit|bad) then "invalid" else "pre-existing" end)]' <<< "$rev")
+  printf '%s\n' "$ver" > "$gc-verify.json"
+  nrep=$(jq '[.[] | select(.class=="regression" or .class=="unmet")] | length' <<< "$rec")
+  manifest_set '.gate.cycles += [{reviews:[{lens:"break-it", arm:"review", model:$m, status:$s, valid:true, blocks:($r.blocks|length), notes:$r.notes, truncated:$r.truncated}],
+                 verifier:{status:$v, valid:true, install:$x.install, checks:$x.checks, blocks:$b}, reproduced:$n}]' \
+    --arg m "$REVIEW_MODEL" --argjson s "$rstatus" --argjson r "$rev" --argjson v "$vstatus" --argjson x "$ver" --argjson b "$rec" --argjson n "$nrep"
+  log "gate cycle $cycle: $(jq '.blocks|length' <<< "$rev") block(s), $nrep reproduced; install $(jq -c .install <<< "$ver"), checks $(jq -c '.checks | del(.test_files)' <<< "$ver")"
+  if [ "$nrep" -eq 0 ]; then gres=pass; return 0; fi
+  gfacts=$(jq -r '.[] | select(.class=="regression" or .class=="unmet") | "- \(.loc): \(.claim) [\(.class); exit \(.head_exit) at head, \(.base_exit) at base; repro: \(.repro)\(if (.clause|length) > 0 then "; Done when: " + .clause else "" end)]"' <<< "$rec")
+  # Progress: a repro that reproduced in an earlier cycle is the same finding again; the worker's fix did not take. Whole strings, as JSON.
+  [ "$(jq --argjson s "$gseen" 'any(.[] | select(.class=="regression" or .class=="unmet") | .repro; . as $r | any($s[]; . == $r))' <<< "$rec")" != true ] || gagain=1
+  gseen=$(jq -c --argjson s "$gseen" '$s + [.[] | select(.class=="regression" or .class=="unmet") | .repro]' <<< "$rec")
+  gres=blocks
+}
+gate_body() {  # the gate's record for the PR body, from the manifest, bounded
+  b=$(jq -r '.gate.cycles as $c | "## Verification gate, \($c|length) cycle(s), result \(.gate.result // "-")",
+    ($c | to_entries[] | .key as $i | .value |
+      "cycle \($i+1): review \(.reviews[0].lens) (\(.reviews[0].model)): \(.reviews[0].blocks // "no") block(s), \(.reviews[0].notes // [] | length) note(s)\(if .reviews[0].truncated then ", truncated" else "" end); verifier: \(.reproduced // "no record") reproduced",
+      (.verifier.blocks // [] | .[] | "- \(.class) \(.loc): \(.claim) (exit \(.head_exit) at head, \(.base_exit) at base; `\(.repro)`)"),
+      (.reviews[0].notes // [] | .[] | "- note: \(.)"),
+      (.verifier.checks // {} | if .base_tests_at_head != null and .base_tests_at_head != 0 then "- note: the base'"'"'s test files fail against this head (exit \(.base_tests_at_head)): a regression, or a test changed under the code" else empty end),
+      (.verifier.checks // {} | if .head_tests_at_base == 0 then "- note: the changed test files pass against the base'"'"'s code: they test nothing the change added" else empty end))' "$rundir/manifest.json")
+  printf '%s' "${b:0:20000}"   # bounded here, not by head: a closed pipe under pipefail would fail the body and kill the run after a passing gate
+}
+
 cmd_run() {
   task="${1:-}"; [ -n "$task" ] || usage
   [ -f "$task" ] || die "task file not found: $task"
@@ -282,7 +369,6 @@ cmd_run() {
   task_id=$(jq -r .task_id "$task"); instructions=$(jq -r .instructions "$task")
   [[ "$task_id" =~ $ID_RE ]] || die "task_id must match $ID_RE"
   [[ "$base_branch" =~ $BRANCH_RE ]] || die "base_branch has unexpected characters"
-  [[ "$BUDGET_USD" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "FACTORY_BUDGET_USD must be a number, got '$BUDGET_USD'"
   # Chain mode (set by batch): the branch is cut from the previous task's branch, but the PR still targets the task's own
   # base_branch. A PR whose base is factory/<prev> dies with 422 "base ref not found" once that branch is merged and auto-deleted.
   chain_base="${FACTORY_CHAIN_BASE:-}"; [ -z "$chain_base" ] || [[ "$chain_base" =~ $BRANCH_RE ]] || die "FACTORY_CHAIN_BASE has unexpected characters"
@@ -293,7 +379,7 @@ cmd_run() {
     https://github.com/*) ;;
     *) for t in github_token openai_key; do [ -s "$FACTORY_SECRETS_DIR/$t" ] || die "missing or empty token file: $FACTORY_SECRETS_DIR/$t"; done ;;
   esac
-  for f in worker-prompt.md judge-prompt.md; do [ -s "$FACTORY_DIR/$f" ] || die "missing $FACTORY_DIR/$f"; done
+  for f in worker-prompt.md judge-prompt.md review-prompt.md verify.js proxy.js; do [ -s "$FACTORY_DIR/$f" ] || die "missing $FACTORY_DIR/$f"; done
 
   image_digest=$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null) || die "image $IMAGE not built; run: docker build -t $IMAGE ."
   image_pinned=true
@@ -325,10 +411,10 @@ cmd_run() {
   jq -n --arg run_id "$run_id" --arg task_id "$task_id" --arg job "$(shasum -a 256 "$task" | cut -d' ' -f1)" \
         --arg repo "$repo" --arg base_branch "$base_branch" --arg cb "$chain_base" \
         --arg image "$image_digest" --argjson pinned "$image_pinned" --arg fc "$factory_commit" --arg started "$(now)" --arg kz "$KEYCARD_ZONE" --arg nb "$npm_before" \
-        --arg model "$FACTORY_MODEL" --arg jmodel "$JUDGE_MODEL" --argjson budget "$BUDGET_USD" \
+        --arg model "$FACTORY_MODEL" --arg jmodel "$JUDGE_MODEL" --arg rmodel "$REVIEW_MODEL" \
     '{run_id:$run_id, task_id:$task_id, job_sha256:$job, repo:$repo, base_branch:$base_branch, chain_base:(if $cb=="" then null else $cb end), base_sha:null,
       image_digest:$image, image_pinned:$pinned, factory_commit:(if $fc=="" then null else $fc end), keycard_zone:$kz, npm_policy:{ignore_scripts:true, before:$nb},
-      model:$model, judge_model:$jmodel, budget_usd:$budget, worker:{rounds:[]},
+      model:$model, judge_model:$jmodel, review_model:$rmodel, worker:{rounds:[]}, gate:{cycles:[], result:null},
       installation_id:null, git_identity:null, started_at:$started, ended_at:null, exit_status:null, final_sha:null, pr_url:null}' \
     > "$rundir/manifest.json"
   # Supply chain, before any credential is issued: a task whose text carries something shaped like a credential is refused outright.
@@ -389,12 +475,18 @@ cmd_run() {
   # Worker -> judge rounds. Each step is its own container with exactly one secret: the worker has the Claude credential,
   # the judge has the Codex key, the push has the GitHub token. The judge reviews a fresh clone of the worker's checkout and
   # ends with a VERDICT line; anything but VERIFIED sends its findings back to the worker for a revision round, up to MAX_ROUNDS.
-  # Nothing is pushed until the rounds are over, so no human sees the code before the judge has.
+  # Nothing is pushed until the rounds are over, so no human sees the code before the judge has. Then the push, the cheap gates and
+  # the verification gate (run_gate); a gate that reproduces a finding sends the branch round again for exactly one worker round and
+  # one judge round (a gate cycle), bounded by progress: the same repro reproducing twice, or MAX_GATES cycles, is dead.
   round=1 judged=0 verdict= findings= head= prev_head= jhead= status=0
+  cycle=0 gfacts= gseen='[]' ghead= clean=   # gate cycles so far; the reproduced findings as facts for the next round; their repros (JSON); the head the cycle started from
+  final_sha=null pr_url= pushed=false push_status=null   # what is on GitHub: set by a successful push and kept through every later cycle or failure
+  while :; do
   while :; do
     # Every worker round opens with the house rules (least code that satisfies "Done when"), read from this checkout like the judge prompt.
     prompt="$(cat "$FACTORY_DIR/worker-prompt.md")"$'\n\n'"## Task"$'\n'"task_id: $task_id (a blocked note is docs/BLOCKED-$task_id.md)"$'\n'"$instructions"
-    [ -n "$findings" ] && prompt="$prompt"$'\n\n'"## Review of your previous attempt (round $((round-1)) verdict: $verdict)"$'\n'"The reviewer refused the branch as it stands. Fix every finding below on the current branch, keep the task's scope, and commit. Findings:"$'\n'"$findings"
+    if [ -n "$gfacts" ]; then prompt="$prompt"$'\n\n'"## A verification gate reproduced these findings (gate cycle $cycle); the loop judge had passed the branch"$'\n'"Each one was reproduced by running its command at the pushed head and at the base. Fix every one on the current branch, keep the task's scope, and commit. Findings:"$'\n'"$gfacts"
+    elif [ -n "$findings" ]; then prompt="$prompt"$'\n\n'"## Review of your previous attempt (round $((round-1)) verdict: $verdict)"$'\n'"The reviewer refused the branch as it stands. Fix every finding below on the current branch, keep the task's scope, and commit. Findings:"$'\n'"$findings"; fi
     an_tok=$(anthropic_token) || an_tok=; [ -n "$an_tok" ] || die "Anthropic did not exchange the Keycard token (rule $ANTHROPIC_FEDERATION_RULE, workspace $ANTHROPIC_WORKSPACE)"
     log "round $round: anthropic_token issued (Keycard $KEYCARD_ZONE -> Anthropic WIF rule $ANTHROPIC_FEDERATION_RULE, workspace $ANTHROPIC_WORKSPACE); ttl ${TIMEOUT_SEC}s"
     run_container work "$an_tok" -v "$work":/work -- "$prompt"; an_tok=
@@ -414,10 +506,11 @@ cmd_run() {
     oa_key=$(openai_key) || oa_key=; [ -n "$oa_key" ] || die "no Codex key (Keycard $OPENAI_RESOURCE)"
     log "round $round: openai_key issued (Keycard $KEYCARD_ZONE resource $OPENAI_RESOURCE)"
     jwork=$(mktemp -d "${TMPDIR:-/tmp}/factory-judge.XXXXXX"); jout=$(mktemp -d "${TMPDIR:-/tmp}/factory-judge-out.XXXXXX")
-    jprompt="$(cat "$FACTORY_DIR/judge-prompt.md")"$'\n\n'"## Round"$'\n'"$round of $MAX_ROUNDS"$'\n\n'"## Commits"$'\n'"Base: $base_sha"$'\n'"Head: $head"$'\n\n'"## Task given to the agent"$'\n'"$instructions"
-    # A fresh judge session each round. What the orchestrator saw (which commit the last round judged, what the agent committed since) is
-    # one section; the previous round's findings are another, marked as another party's claims: REPEAT only when re-established at this head.
-    [ -z "$findings" ] || jprompt="$jprompt"$'\n\n'"## Facts observed by the orchestrator"$'\n'"Round $((round-1)) was judged at $jhead and ended $verdict. The agent then committed; this round's head is $head (\`git log $jhead..$head\`)."$'\n\n'"## Claims from the previous round's reviewer (round $((round-1)), verdict $verdict)"$'\n'"Another reviewer session wrote these about $jhead. They are claims, not facts: mark one REPEAT only after re-establishing it at $head."$'\n'"$findings"
+    jprompt="$(cat "$FACTORY_DIR/judge-prompt.md")"$'\n\n'"## Round"$'\n'"$([ "$cycle" -eq 0 ] && echo "$round of $MAX_ROUNDS" || echo "$round, the one round of gate cycle $cycle")"$'\n\n'"## Commits"$'\n'"Base: $base_sha"$'\n'"Head: $head"$'\n\n'"## Task given to the agent"$'\n'"$instructions"
+    # A fresh judge session each round. What the orchestrator saw (which commit the last round judged, what the agent committed since, what
+    # a verification gate reproduced) is one section; the previous round's findings are another, marked as another party's claims: REPEAT
+    # only when re-established at this head.
+    [ -z "$findings" ] || jprompt="$jprompt"$'\n\n'"## Facts observed by the orchestrator"$'\n'"Round $((round-1)) was judged at $jhead and ended $verdict.${gfacts:+ A verification gate then reproduced these findings at $jhead, each by running its command:$'\n'$gfacts$'\n'}The agent then committed; this round's head is $head (\`git log $jhead..$head\`)."$'\n\n'"## Claims from the previous round's reviewer (round $((round-1)), verdict $verdict)"$'\n'"Another reviewer session wrote these about $jhead. They are claims, not facts: mark one REPEAT only after re-establishing it at $head."$'\n'"$findings"
     run_container judge "$oa_key" -v "$work":/src:ro -v "$jwork":/work -v "$jout":/out -e HEAD_SHA="$head" -- "$jprompt"
     jstatus=$status; status=0   # the worker succeeded; a failed judge is a missing verdict (exit 6 below), not a failed run
     # The verdict counts only if the judge exited 0 and left a regular file in /out, a mount the repository cannot reach.
@@ -443,18 +536,20 @@ cmd_run() {
     manifest_set '. + {judge:{rounds:$n, verdict:(if $v=="" then null else $v end)}}' --argjson n "$judged" --arg v "$verdict"
     log "round $round: judge verdict ${verdict:-NONE}${oversize:+ (review over 200000 bytes)} (container status $jstatus, $(printf '%s' "$findings" | wc -c | tr -d ' ') bytes)"
     echo "  round $round: judge verdict ${verdict:-NONE}"
+    [ "$cycle" -eq 0 ] || break                # a gate cycle is one judged round, whatever the verdict: REFUTED is dead below, never more rounds
     [ -n "$verdict" ] || break                 # judge error: nothing to revise against; fail closed below
     [ "$verdict" = VERIFIED ] && break
     [ "$round" -ge "$MAX_ROUNDS" ] && break
     round=$((round+1))
   done
   wstatus=$status
+  # No new commits in a gate cycle: the reproduced findings stand, and the branch is already pushed. Refuted by the gate, exit 5.
+  if [ "$cycle" -gt 0 ] && [ "$wstatus" -eq 0 ] && [ "$head" = "$ghead" ]; then manifest_set '. + {outcome:"refuted", refuted_by:"gate"} | .gate.result="refuted"'; log "gate cycle $cycle: no new commits; the reproduced findings stand; no PR"; status=5; break; fi
 
   # Push the last commit whenever there is one (the judged commit, or a blocked note; evidence, and the human's starting point), even when a
-  # later revision round failed, with a fresh token the agents never held. A round-1 worker that fails leaves nothing to push. Then the PR: only when every worker round succeeded and
-  # the verdict is VERIFIED or CAVEATS. REFUTED exits 5 and NONE exits 6, both without a PR.
-  final_sha=${head:-null}; pr_url=; pushed=false; push_status=null
-  if [ "$final_sha" != null ]; then
+  # later revision round failed, with a fresh token the agents never held. A round-1 worker that fails leaves nothing to push. Then the PR: only when every worker round succeeded,
+  # the verdict is VERIFIED or CAVEATS, the cheap gates pass and the verification gate reproduced nothing. REFUTED exits 5 and NONE exits 6, both without a PR.
+  [ -n "$head" ] || break
     case "$gh_src" in
       file) gh_tok=$(cat "$FACTORY_SECRETS_DIR/github_token") ;;
       *) app_key=$(keycard_token "$GITHUB_APP_KEY_RESOURCE" | openssl base64 -d -A 2>/dev/null) || app_key=
@@ -463,20 +558,23 @@ cmd_run() {
     [ -n "$gh_tok" ] || die "GitHub did not issue a push token for $repo"
     manifest_set '. + {push_attempted:true}'   # from here the branch may exist on GitHub whatever happens next (END_JQ: pushed null, not false)
     run_container push "$gh_tok" -v "$work":/src:ro -e REPO_URL="$repo_url" -e HEAD_SHA="$head" --   # read-only mount; pushes the judged commit by SHA
-    # Pushed means pushed: a failed push leaves final_sha null, so nothing downstream (the batch's retry, a human) treats the judged
-    # commit as being on GitHub. The judged sha is in the log and judge-<n>.md either way.
-    [ "$status" -ne 0 ] || pushed=true
-    if [ "$status" -ne 0 ]; then push_status=$status; final_sha=null; manifest_set '. + {outcome:"push_failed"}'; log "push of factory/$task_id failed (status $status); nothing is on GitHub"; [ "$wstatus" -eq 0 ] || status=$wstatus
-    elif [ "$wstatus" -ne 0 ]; then log "worker failed in round $round (status $wstatus); branch pushed, no PR"; status=$wstatus
-    else
+    # Pushed means pushed: a failed push leaves final_sha as it was (null, or the previous cycle's commit, which is still on GitHub), so
+    # nothing downstream (the batch's retry, a human) treats the judged commit as being there. The judged sha is in the log and judge-<n>.md
+    # either way. A successful push is persisted at once, so a later die (a gate step refused by HALT) keeps it.
+    if [ "$status" -ne 0 ]; then push_status=$status; manifest_set '. + {outcome:"push_failed", push_status:$s}' --argjson s "$status"; prev=; [ "$pushed" != true ] || prev=" (the previous cycle's commit $final_sha is)"; log "push of factory/$task_id failed (status $status); $head is not on GitHub$prev"; [ "$wstatus" -eq 0 ] || status=$wstatus; gh_tok=; break
+    fi
+    pushed=true; final_sha=$head; push_status=0; manifest_set '. + {pushed:true, final_sha:$h, push_status:0}' --arg h "$head"
+    if [ "$wstatus" -ne 0 ]; then log "worker failed in round $round (status $wstatus); branch pushed, no PR"; status=$wstatus; gh_tok=; break; fi
       # The gates run in a fresh bare repo on the host, filled from the remote by explicit URL: the PR target as it is now (the clone is
       # hours old) and the branch the push container just put there. Never git with a token inside $work, whose .git/config the worker
       # wrote; and the worker's objects are read through GitHub, not from its checkout.
-      gate=$(mktemp -d "${TMPDIR:-/tmp}/factory-gate.XXXXXX"); git init -q --bare "$gate"
+      [ -z "$gate" ] || rm -rf "$gate"; gate=$(mktemp -d "${TMPDIR:-/tmp}/factory-gate.XXXXXX"); git init -q --bare "$gate"
       gt=0; gto=$(git -C "$gate" -c credential.helper= -c credential.helper="$GIT_CRED" fetch -q "$repo_url" "refs/heads/$base_branch:refs/heads/base" "refs/heads/factory/$task_id:refs/heads/head" 3< <(printf '%s' "$gh_tok") 2>&1) || gt=$?
+      gh_tok=
       [ "$gt" -ne 0 ] || [ "$(git -C "$gate" rev-parse refs/heads/head 2>/dev/null)" = "$head" ] || { gt=1; gto="remote factory/$task_id is not the pushed commit $head"; }
       # The diff can fail too: a worker that rewrote the branch's ancestry leaves base_sha unreachable from either fetched ref.
       files=; [ "$gt" -ne 0 ] || files=$(git -C "$gate" diff --name-only "$base_sha" "$head" 2>&1) || { gt=1; gto="diff $base_sha..$head: $files"; }
+      clean=
       if [ "$gt" -ne 0 ]; then manifest_set '. + {outcome:"gate_error"}'; log "gate fetch or diff of $base_branch and factory/$task_id failed (git exit $gt); no PR. ${gto:0:2000}"; status=12
       # A dependency manifest changed without permission: the task's Scope section naming package.json is the permission (Out of scope
       # and findings appended by requeue do not count). A PR gate on the committed tree, after the package already ran in the containers;
@@ -506,19 +604,33 @@ cmd_run() {
           if [ "$head" != "$jhead" ]; then manifest_set '. + {outcome:"gate_error"}'; log "pushed head $head was not judged (round $judged judged ${jhead:-nothing}); no PR"; status=12
           elif [ "$mt" -eq 1 ]; then manifest_set '. + {outcome:"conflict"}'; log "factory/$task_id conflicts with $base_branch; no PR. ${mto:0:2000}"; status=11
           elif [ "$mt" -ne 0 ]; then manifest_set '. + {outcome:"gate_error"}'; log "merge-tree against $base_branch failed (git exit $mt); no PR. ${mto:0:2000}"; status=12
-          elif [ "$gh_src" != file ]; then
-            # The PR is opened here, not by an agent: a separate token (pull_requests:write + contents:read, so it can read refs but not push) that no container ever held.
-            body="$instructions"$'\n\n'"## Judge (Codex), $round round(s), verdict $verdict"$'\n\n'"$findings"
-            pr_url=$(open_pr "$repo" "$task_id" "$base_branch" "$body") || pr_url=
-            if [ -n "$pr_url" ]; then log "opened $pr_url"; else manifest_set '. + {outcome:"pr_failed"}'; log "branch factory/$task_id pushed but opening the PR failed; open it by hand"; status=4; fi
-          fi ;;
-        REFUTED) manifest_set '. + {outcome:"refuted"}'; log "refuted after $round round(s); branch pushed, no PR"; status=5 ;;
+          else clean=1; fi ;;
+        # REFUTED in a gate cycle is dead: the loop judge refused the fix of a reproduced finding, and the round loop never resumes from a cycle.
+        REFUTED) manifest_set '. + {outcome:"refuted"} | if $c > 0 then .refuted_by="gate" | .gate.result="refuted" else . end' --argjson c "$cycle"; log "refuted after $judged judged round(s)$([ "$cycle" -eq 0 ] || echo ", gate cycle $cycle"); branch pushed, no PR"; status=5 ;;
         *)       log "judge gave no verdict; branch pushed, no PR"; status=6 ;;
       esac
       fi
+    [ -n "$clean" ] || break
+    # The verification gate, after the push and the cheap gates: fresh reviewers that never saw the loop judge's findings, and a machine
+    # that reproduces every BLOCK before it counts. Nothing reproduced: the PR. Something reproduced: one more worker round and one more
+    # judge round with the facts, then the gate again. No progress is dead: a repro that reproduced in an earlier cycle, or MAX_GATES cycles.
+    run_gate
+    case "$gres" in
+      error)  manifest_set '. + {outcome:"gate_pending", reason:$r} | .gate.result="gate_pending"' --arg r "$greason"; log "gate cycle $cycle: $greason; outcome gate_pending (re-gate factory/$task_id at $head); no PR"; status=12; break ;;
+      blocks) if [ -n "$gagain" ] || [ "$((cycle+1))" -ge "$MAX_GATES" ]; then
+                manifest_set '. + {outcome:"refuted", refuted_by:"gate"} | .gate.result="refuted"'; log "gate cycle $cycle: ${gagain:+a finding reproduced again}${gagain:-the gate ceiling ($MAX_GATES) is reached}; dead, no PR"; status=5; break
+              fi
+              cycle=$((cycle+1)); ghead=$head; round=$((round+1)); log "gate cycle $cycle: $(printf '%s\n' "$gfacts" | grep -c .) reproduced finding(s) go back to the worker"; continue ;;
+    esac
+    manifest_set '.gate.result="pass"'
+    if [ "$gh_src" != file ]; then
+      # The PR is opened here, not by an agent: a separate token (pull_requests:write + contents:read, so it can read refs but not push) that no container ever held.
+      body="$instructions"$'\n\n'"## Judge (Codex), $judged round(s), verdict $verdict"$'\n\n'"$findings"$'\n\n'"$(gate_body)"
+      pr_url=$(open_pr "$repo" "$task_id" "$base_branch" "$body") || pr_url=
+      if [ -n "$pr_url" ]; then log "opened $pr_url"; else manifest_set '. + {outcome:"pr_failed"}'; log "branch factory/$task_id pushed but opening the PR failed; open it by hand"; status=4; fi
     fi
-    gh_tok=
-  fi
+    break
+  done
   manifest_set '. + {ended_at:$ended, exit_status:$status, final_sha:(if $final=="null" then null else $final end), pushed:$pushed, push_status:$ps, pr_url:(if $pr=="" then null else $pr end),
                      judge:{rounds:$rounds, verdict:(if $v=="" then null else $v end)}} | '"$END_JQ" \
      --arg ended "$(now)" --argjson status "$status" --arg final "$final_sha" --argjson pushed "$pushed" --argjson ps "$push_status" --arg pr "$pr_url" --argjson rounds "$judged" --arg v "$verdict"
