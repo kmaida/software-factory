@@ -222,6 +222,24 @@ Status is Implemented, Partial, or Planned. Each has a check that proves it. (re
   cases cover the first and third. Its speculative item, services on the Docker host's bridge address being
   reachable from an internal network, is the "no route to the internet except the proxy" wording already in the
   plan; the demo script says that now too.
+- **Supply chain, 2026-11-01** (plan items 3, 4, 5; PR `supply-chain`). Credential screening by shape (`CRED_RE` in
+  `factory`: GitHub, Anthropic, OpenAI, AWS, Slack, Google token shapes and PEM private keys, each with a minimum
+  length so the regex's own source and prose mentions don't match): the task text right after the manifest is
+  written and before any credential is minted, the base tree (`git grep -I -l` over `origin/$from_branch`, so a
+  chained base is what's scanned; names only) after the clone and before the Anthropic token; outcome
+  `credential_in_input`, exit 13, `reason` the file or `instructions`; a `git grep` error is `gate_error` exit 12.
+  `lint` runs the same regex over task text. The dependency-manifest gate sits between blocked and the verdict
+  switch: any `package.json` or lockfile at any depth in the branch's diff, with no `package.json` in the task's Scope
+  section (`scope_of`, awk between `Scope:` and `Done when:`), is `dependency_change`, exit 14, branch pushed, no
+  PR; `requeue` carries both refusals into the next attempt. npm policy on the fixed `docker run` line:
+  `NPM_CONFIG_IGNORE_SCRIPTS=true` and `NPM_CONFIG_BEFORE` = run start minus 7 days, recorded in the manifest as
+  `npm_policy`. The factory's own tree passes its own scan (checked, so a factory task against this repo still
+  runs). Stub cases for all of it. Codex reviewed the diff, four findings, all confirmed and fixed with a stub case
+  each: `git grep -I` skipped a file that `.gitattributes` marked `-diff` (now `-a`); `scope_of` reopened on every
+  `Scope:` line, so a judge finding containing one, appended by requeue, could grant the dependency permission (now
+  the first section only); `git diff --name-only` quotes paths with non-ASCII or control characters and the closing
+  quote defeated the `$` anchor (now `"?$`); and the README promised "no credential issued" for the tree screen,
+  which runs after the clone token is minted (reworded: no agent credential, no container).
 
 ## TODO (Kim)
 
