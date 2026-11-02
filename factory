@@ -9,6 +9,7 @@
 #   factory stop <run_id>     kill the container, block new dispatch, record the incident
 # Compatible with the macOS /bin/bash (3.2). Needs: docker, git, jq.
 set -euo pipefail
+export LC_ALL=C   # task-id order is the batch's schedule and must not depend on the operator's locale
 # Docker Desktop keeps its CLI inside the app bundle unless the /usr/local/bin symlinks were installed.
 command -v docker >/dev/null || PATH="/Applications/Docker.app/Contents/Resources/bin:$PATH"
 
@@ -63,8 +64,27 @@ GIT_CRED='!f() { h=; while IFS= read -r l; do case "$l" in host=*) h=${l#host=};
 
 die()   { echo "factory: $*" >&2; exit 1; }
 usage() { echo "usage: factory run <task-file> | factory lint [dir] | factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--no-chain] [--continue] | factory report [n] | factory requeue <queue/failed/file.json> | factory stop <run_id>" >&2; exit 2; }
-# Job schema: exactly these four keys, all non-empty strings. Everything else is derived by the orchestrator.
-JOB_SCHEMA='type=="object" and (keys|sort)==["base_branch","instructions","repo","task_id"] and all(.[]; type=="string" and length>0)'
+# Job schema: these four keys, all non-empty strings, plus an optional depends_on (task ids, non-empty strings). Everything else is derived by the orchestrator.
+JOB_SCHEMA='type=="object" and ((keys|sort)==["base_branch","instructions","repo","task_id"] or (keys|sort)==["base_branch","depends_on","instructions","repo","task_id"]) and (to_entries | all(if .key=="depends_on" then (.value|type=="array" and all(.[]; type=="string" and length>0)) else (.value|type=="string" and length>0) end))'
+base_id() { b=$1; while [[ "$b" =~ ^(.*)-[ri][0-9]+$ ]]; do b=${BASH_REMATCH[1]}; done; printf '%s' "$b"; }   # every -r<N> (requeue) and -i<N> (infra retry) suffix off: 010-x-r1-i1 is 010-x
+repo_norm() {  # repo_norm <repo>: sets repo (owner/name, or the URL or path as given) and repo_url. 1 when the form is unknown.
+  repo=$1; repo_url=
+  case "$repo" in
+    https://github.com/*) repo="${repo#https://github.com/}"; repo="${repo%/}"; repo="${repo%.git}" ;;   # normalise to owner/name
+    https://*|/*) repo_url="$repo" ;;                                   # other URL or local path (dry runs)
+  esac
+  case "$repo_url" in
+    "") [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1; repo_url="https://github.com/$repo.git" ;;
+  esac
+}
+# Class of a failed run, from the manifest and never from the number alone (a worker container's own exit code passes through as the
+# run's status): "task" when the task itself cannot pass as specified, "infra" when something around it failed (a token, a proxy, no
+# verdict, a conflict with a moved target, a gate that could not fetch, a kill). The batch retries infra and never retries task.
+CLASS_JQ='if .exit_status == 0 then null elif ((.outcome // "") | IN("blocked","dependency_change","credential_in_input","branch_exists","refuted","stopped")) then "task" elif (((.worker.rounds // []) | last // {}) | .status) == 3 then "task" else "infra" end'
+# Applied to every manifest at its end, however the run ended (finalisation, cleanup after a die, the batch after a kill): the class, and
+# `pushed` settled to true, false or null. null means the push step started and its result is unknown (the record was lost, the run died
+# mid-step); the batch treats null as pushed, since the branch may be on GitHub and the id would then be refused.
+END_JQ='.class = ('"$CLASS_JQ"') | .pushed = (if .pushed == null then (if .push_attempted == true then null else false end) else .pushed end)'
 ID_RE='^[A-Za-z0-9._-]+$'; BRANCH_RE='^[A-Za-z0-9._/-]+$'
 now()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
 redact() { sed -l -E "s/$CRED_RE/[REDACTED]/g"; }   # by shape, for text that leaves the run: a token the orchestrator never held is caught too; a split token is not
@@ -72,7 +92,7 @@ scope_of() { printf '%s\n' "$1" | awk '/^Scope:/ && !d {f=1} /^Done when:/{f=0; 
 notify() {  # notify <line>: POST "<batch_id>: <line>" to FACTORY_NOTIFY_URL when set. URL and body via curl config on stdin, not argv (the URL may carry a token).
   [ -n "${FACTORY_NOTIFY_URL:-}" ] || return 0
   b="$batch_id: $(printf '%s' "$1" | redact)"; b=${b//\\/\\\\}; b=${b//\"/\\\"}   # the body may quote a BLOCKED note; a bare " or \ would end or alter the config line
-  printf 'url = "%s"\ndata = "%s"\n' "$FACTORY_NOTIFY_URL" "$b" | curl -s -m 10 -o /dev/null -K - || true   # best effort: a dead webhook never stops the batch
+  printf 'url = "%s"\ndata = "%s"\n' "$FACTORY_NOTIFY_URL" "$b" | curl -sf -m 10 -o /dev/null -K - || echo "notify: POST failed (curl exit $?)" >&2   # -f: an HTTP error is a failure too (exit 22). Best effort, but visible: a dead webhook never stops the batch, and never hides either
 }
 
 # ---------------------------------------------------------------- run
@@ -89,7 +109,7 @@ cleanup() {
   for d in "$work" "$jwork" "$jout" "$gate"; do [ -z "$d" ] || rm -rf "$d" 2>/dev/null || true; done   # never let a failed rm change the exit status
   # A run that died before finalizing still gets a terminal state, so no manifest is left open-ended.
   if [ -n "${rundir:-}" ] && [ -f "$rundir/manifest.json" ] && [ "$(jq -r .ended_at "$rundir/manifest.json")" = null ]; then
-    manifest_set '. + {ended_at:$ended, exit_status:$rc}' --arg ended "$(now)" --argjson rc "$rc"
+    manifest_set '. + {ended_at:$ended, exit_status:$rc} | '"$END_JQ" --arg ended "$(now)" --argjson rc "$rc"
   fi
   [ -n "$borrowed" ] || rm -rf "$LOCK"   # a borrowed lock belongs to the batch loop, which resets it when this run returns
 }
@@ -249,8 +269,8 @@ cmd_run() {
     [ -s "$FACTORY_SECRETS_DIR/$t" ] || die "missing or empty token file: $FACTORY_SECRETS_DIR/$t"
   done
 
-  jq -e "$JOB_SCHEMA" "$task" >/dev/null 2>&1 || die "invalid task file: need exactly {repo, base_branch, task_id, instructions}, all non-empty strings"
-  repo=$(jq -r .repo "$task"); base_branch=$(jq -r .base_branch "$task")
+  jq -e "$JOB_SCHEMA" "$task" >/dev/null 2>&1 || die "invalid task file: need {repo, base_branch, task_id, instructions}, all non-empty strings, and optionally depends_on, a list of task ids"
+  base_branch=$(jq -r .base_branch "$task")
   task_id=$(jq -r .task_id "$task"); instructions=$(jq -r .instructions "$task")
   [[ "$task_id" =~ $ID_RE ]] || die "task_id must match $ID_RE"
   [[ "$base_branch" =~ $BRANCH_RE ]] || die "base_branch has unexpected characters"
@@ -259,14 +279,7 @@ cmd_run() {
   # base_branch. A PR whose base is factory/<prev> dies with 422 "base ref not found" once that branch is merged and auto-deleted.
   chain_base="${FACTORY_CHAIN_BASE:-}"; [ -z "$chain_base" ] || [[ "$chain_base" =~ $BRANCH_RE ]] || die "FACTORY_CHAIN_BASE has unexpected characters"
   from_branch="${chain_base:-$base_branch}"
-  case "$repo" in
-    https://github.com/*) repo="${repo#https://github.com/}"; repo="${repo%/}"; repo="${repo%.git}" ;;   # normalise to owner/name
-    https://*|/*) repo_url="$repo" ;;                                   # other URL or local path (dry runs)
-  esac
-  case "$repo_url" in
-    "") [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "repo must be owner/name, a GitHub URL, another https URL, or a local path"
-        repo_url="https://github.com/$repo.git" ;;
-  esac
+  repo_norm "$(jq -r .repo "$task")" || die "repo must be owner/name, a GitHub URL, another https URL, or a local path"
   # GitHub repos get a per-run installation token minted from the App key (fetched from Keycard Vault); anything else (dry runs) needs a github_token file.
   case "$repo_url" in
     https://github.com/*) ;;
@@ -347,6 +360,7 @@ cmd_run() {
   log "cloned $repo_url at $base_sha"
   manifest_set '. + {base_sha:$sha}' --arg sha "$base_sha"
   if git -C "$work" rev-parse --verify -q "origin/factory/$task_id" >/dev/null; then
+    manifest_set '. + {outcome:"branch_exists"}'   # the task's own problem (class task), not the night's: a rerun under this id can never pass
     die "branch factory/$task_id already exists on $repo; delete it or use a new task_id (a rerun would diverge from it and fail to push)"
   fi
 
@@ -426,7 +440,7 @@ cmd_run() {
   # Push the last judged commit whenever there is one (evidence, and the human's starting point if they want it), even when a
   # later revision round failed, with a fresh token the agents never held. A round-1 worker that fails leaves nothing to push. Then the PR: only when every worker round succeeded and
   # the verdict is VERIFIED or CAVEATS. REFUTED exits 5 and NONE exits 6, both without a PR.
-  final_sha=${head:-null}; pr_url=
+  final_sha=${head:-null}; pr_url=; pushed=false; push_status=null
   if [ "$final_sha" != null ]; then
     case "$gh_src" in
       file) gh_tok=$(cat "$FACTORY_SECRETS_DIR/github_token") ;;
@@ -434,8 +448,12 @@ cmd_run() {
          gh_tok=$(mint_github_token "$repo" "$app_key" '{"contents":"write"}') || gh_tok=; app_key= ;;
     esac
     [ -n "$gh_tok" ] || die "GitHub did not issue a push token for $repo"
+    manifest_set '. + {push_attempted:true}'   # from here the branch may exist on GitHub whatever happens next (END_JQ: pushed null, not false)
     run_container push "$gh_tok" -v "$work":/src:ro -e REPO_URL="$repo_url" -e HEAD_SHA="$head" --   # read-only mount; pushes the judged commit by SHA
-    if [ "$status" -ne 0 ]; then log "push of factory/$task_id failed"; [ "$wstatus" -eq 0 ] || status=$wstatus
+    # Pushed means pushed: a failed push leaves final_sha null, so nothing downstream (the batch's retry, a human) treats the judged
+    # commit as being on GitHub. The judged sha is in the log and judge-<n>.md either way.
+    [ "$status" -ne 0 ] || pushed=true
+    if [ "$status" -ne 0 ]; then push_status=$status; final_sha=null; manifest_set '. + {outcome:"push_failed"}'; log "push of factory/$task_id failed (status $status); nothing is on GitHub"; [ "$wstatus" -eq 0 ] || status=$wstatus
     elif [ "$wstatus" -ne 0 ]; then log "worker failed in round $round (status $wstatus); branch pushed, no PR"; status=$wstatus
     else
       # The gates run in a fresh bare repo on the host, filled from the remote by explicit URL: the PR target as it is now (the clone is
@@ -474,31 +492,50 @@ cmd_run() {
             # The PR is opened here, not by an agent: a separate token (pull_requests:write + contents:read, so it can read refs but not push) that no container ever held.
             body="$instructions"$'\n\n'"## Judge (Codex), $round round(s), verdict $verdict"$'\n\n'"$findings"
             pr_url=$(open_pr "$repo" "$task_id" "$base_branch" "$body") || pr_url=
-            if [ -n "$pr_url" ]; then log "opened $pr_url"; else log "branch factory/$task_id pushed but opening the PR failed; open it by hand"; status=4; fi
+            if [ -n "$pr_url" ]; then log "opened $pr_url"; else manifest_set '. + {outcome:"pr_failed"}'; log "branch factory/$task_id pushed but opening the PR failed; open it by hand"; status=4; fi
           fi ;;
-        REFUTED) log "refuted after $round round(s); branch pushed, no PR"; status=5 ;;
+        REFUTED) manifest_set '. + {outcome:"refuted"}'; log "refuted after $round round(s); branch pushed, no PR"; status=5 ;;
         *)       log "judge gave no verdict; branch pushed, no PR"; status=6 ;;
       esac
       fi
     fi
     gh_tok=
   fi
-  manifest_set '. + {ended_at:$ended, exit_status:$status, final_sha:(if $final=="null" then null else $final end), pr_url:(if $pr=="" then null else $pr end),
-                     judge:{rounds:$rounds, verdict:(if $v=="" then null else $v end)}}' \
-     --arg ended "$(now)" --argjson status "$status" --arg final "$final_sha" --arg pr "$pr_url" --argjson rounds "$judged" --arg v "$verdict"
+  manifest_set '. + {ended_at:$ended, exit_status:$status, final_sha:(if $final=="null" then null else $final end), pushed:$pushed, push_status:$ps, pr_url:(if $pr=="" then null else $pr end),
+                     judge:{rounds:$rounds, verdict:(if $v=="" then null else $v end)}} | '"$END_JQ" \
+     --arg ended "$(now)" --argjson status "$status" --arg final "$final_sha" --argjson pushed "$pushed" --argjson ps "$push_status" --arg pr "$pr_url" --argjson rounds "$judged" --arg v "$verdict"
   echo "  exit status: $status"
   exit "$status"
 }
 
 # ---------------------------------------------------------------- lint
 cmd_lint() {  # factory lint [dir]: the task rules in README.md ("Writing tasks") that a sleeping operator cannot enforce. Exit 1 on any problem.
-  dir="${1:-$QUEUE}"; bad=0; n=0; seen=" "
+  dir="${1:-$QUEUE}"; bad=0; n=0; seen=" "; seenb=" "
+  # For depends_on: the base ids in the queue (any position), and "<base id>=<normalised repo>" for everything archived under this queue.
+  # The queue's own entries join `known` as the loop goes, so a dependency on a later task is caught (filename order is the schedule:
+  # reorder, do not wait a night). Archived files may be anything (the batch archives a malformed mid-night file too): never fatal here.
+  qb=" "; known=" "
+  for g in "$dir"/*.json; do [ -e "$g" ] || break; qb="$qb$(base_id "$(jq -r '.task_id // empty' "$g" 2>/dev/null || true)") "; done
+  for g in "$dir"/done/*.json "$dir"/failed/*.json; do [ -e "$g" ] || continue
+    known="$known$(base_id "$(jq -r '.task_id // empty' "$g" 2>/dev/null || true)")=$(repo_norm "$(jq -r '.repo // empty' "$g" 2>/dev/null || true)" 2>/dev/null && printf '%s' "$repo" || true) "; done
   for f in "$dir"/*.json; do
     [ -e "$f" ] || { echo "no task files in $dir"; return 0; }
     name=$(basename "$f" .json); p=
-    if ! jq -e "$JOB_SCHEMA" "$f" >/dev/null 2>&1; then p="$p; not {repo, base_branch, task_id, instructions}, all non-empty strings"
+    if ! jq -e "$JOB_SCHEMA" "$f" >/dev/null 2>&1; then p="$p; not {repo, base_branch, task_id, instructions}, all non-empty strings (plus an optional depends_on list of task ids)"
     else
-      id=$(jq -r .task_id "$f"); base=$(jq -r .base_branch "$f")
+      id=$(jq -r .task_id "$f"); base=$(jq -r .base_branch "$f"); rn=$(repo_norm "$(jq -r .repo "$f")" && printf '%s' "$repo") || rn=
+      g=; jq -r '.depends_on // [] | .[]' "$f" | while IFS= read -r d; do   # one id per line: a dependency with a space or a glob in it is one bad id, not two
+        [[ "$d" =~ $ID_RE ]] || { echo "bad $d"; continue; }; echo "ok $d"; done > "$f.deps.$$"
+      while read -r k d; do
+        [ "$k" = ok ] || { p="$p; depends_on '$d' is not a task id"; continue; }
+        db=$(base_id "$d")
+        if [ "$db" = "$(base_id "$id")" ]; then p="$p; depends_on $d is the task itself"
+        elif case " $qb " in *" $db "*) case " $seenb " in *" $db "*) false ;; esac ;; *) false ;; esac; then p="$p; depends_on $d is a later task in the queue; reorder (filename order is the schedule)"   # in the queue, not seen yet
+        else case "$known" in *" $db="*) case "$known" in *" $db=$rn "*) ;; *) p="$p; depends_on $d is a task of another repo" ;; esac ;; *) p="$p; depends_on $d is not a task in this queue, done/ or failed/" ;; esac
+        fi
+        g="$g $db"
+      done < "$f.deps.$$"; rm -f "$f.deps.$$"
+      [ -z "$g" ] || echo "graph: $(base_id "$id") <-$g"
       [ "$id" = "$name" ] || p="$p; task_id '$id' is not the filename"
       [[ "$id" =~ $ID_RE && "$id" =~ ^[0-9]+[a-z]?- ]] || p="$p; task_id must be <number>-<name> (or <number><letter>-<name> for a split task: 019a-x, 019b-y) matching $ID_RE"
       [[ "$base" =~ $BRANCH_RE ]] || p="$p; base_branch has unexpected characters"
@@ -512,7 +549,7 @@ cmd_lint() {  # factory lint [dir]: the task rules in README.md ("Writing tasks"
                      *) if [ -e "$dir/$dep.json" ]; then p="$p; base_branch $base is a later task in the queue"; else echo "$name: base_branch $base is not in the queue; it must already exist on the repo"; fi ;;
                    esac ;;
       esac
-      seen="$seen$id "
+      seen="$seen$id "; seenb="$seenb$(base_id "$id") "; known="$known$(base_id "$id")=$rn "   # seen: literal ids, for base_branch; seenb: base ids, for depends_on
     fi
     n=$((n+1))
     [ -z "$p" ] || { echo "$name:${p#;}"; bad=1; }
@@ -520,17 +557,91 @@ cmd_lint() {  # factory lint [dir]: the task rules in README.md ("Writing tasks"
   [ "$bad" -eq 0 ] && echo "lint ok: $n task(s)"
   return "$bad"
 }
+# What a dependency is to the task about to run, from the queue dir and GitHub, printed as "<state> [reason]":
+#   merged    a merged PR from factory/<id> (or a -r<N>/-i<N> head of it) into the dependent's base branch, and no merged PR titled
+#             `Revert "factory: <id>"` (the revert button's exact title). Dry runs (a local repo) have no PRs: the run's final_sha is an
+#             ancestor of the base branch.
+#   queued    a run of it is still in the queue (a retry, a requeue, an infra failure left for tomorrow)
+#   open      a PR exists, or (dry run) the branch is pushed and not merged
+#   unknown   GitHub or the run record could not be asked (HTTP error, no token, a pruned runs/ dir, a base that cannot be fetched):
+#             a wait, said as such, never a verdict either way
+#   reverted  merged, then reverted
+#   dead      none of the above: failed with nothing queued, closed unmerged, or merged into another branch than the base
+# Candidates are the done/ files whose id normalises to the base id and whose repo is the dependent's. Precedence: merged as soon as one
+# candidate is, else queued, open, unknown, reverted, dead. GitHub is the truth for merged; done/ only says a PR was opened.
+dep_state() {  # dep_state <queue-dir> <base id> <repo as in the task> <base_branch>
+  d=$1 bid=$2 bb=$4; repo_norm "$3" || { echo "unknown the task's repo has an unknown form"; return; }; drepo=$repo durl=$repo_url
+  anyq= anyopen= anyrev= unk= elsewhere=
+  for g in "$d"/*.json; do [ -e "$g" ] || break
+    [ "$(base_id "$(jq -r '.task_id // empty' "$g" 2>/dev/null || true)")" = "$bid" ] || continue
+    [ "$(repo_norm "$(jq -r '.repo // empty' "$g" 2>/dev/null || true)" 2>/dev/null && printf '%s' "$repo" || true)" = "$drepo" ] || continue
+    anyq=1
+  done
+  for g in "$d"/done/*.json; do [ -e "$g" ] || break
+    cid=$(jq -r '.task_id // empty' "$g" 2>/dev/null || true); [ "$(base_id "$cid")" = "$bid" ] || continue
+    [ "$(repo_norm "$(jq -r '.repo // empty' "$g" 2>/dev/null || true)" 2>/dev/null && printf '%s' "$repo" || true)" = "$drepo" ] || continue
+    case "$durl" in
+      https://github.com/*)
+        tok=$(dep_token "$drepo" "$durl") || tok=; [ -n "$tok" ] || { unk="no GitHub token for $drepo"; continue; }
+        resp=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" | curl -sS -m 30 -K - -w '\n%{http_code}' -H "Accept: application/vnd.github+json" \
+                 "https://api.github.com/repos/$drepo/pulls?state=all&head=${drepo%%/*}:factory/$cid") || resp=$'\n000'
+        code=${resp##*$'\n'}; body=${resp%$'\n'*}
+        st=$(printf '%s' "$body" | jq -r --arg bb "$bb" 'if type!="array" then "ERR" elif any(.[]; .merged_at!=null and .base.ref==$bb) then "merged"
+              elif any(.[]; .state=="open") then "open" elif any(.[]; .merged_at!=null) then "elsewhere:" + ([.[]|select(.merged_at!=null)|.base.ref]|first) else "none" end' 2>/dev/null) || st=ERR
+        [ "$code" = 200 ] && [ "$st" != ERR ] || { unk="GitHub answered HTTP $code on the PRs of factory/$cid"; continue; }
+        case "$st" in
+          merged)   # merged into the base: unless a merged revert of exactly this PR exists (the search narrows, the title decides)
+            q=$(jq -rn --arg q "repo:$drepo is:pr is:merged in:title \"Revert \\\"factory: $cid\\\"\"" '$q|@uri')
+            resp=$(printf 'header = "Authorization: Bearer %s"\n' "$tok" | curl -sS -m 30 -K - -w '\n%{http_code}' -H "Accept: application/vnd.github+json" "https://api.github.com/search/issues?q=$q") || resp=$'\n000'
+            code=${resp##*$'\n'}; body=${resp%$'\n'*}
+            rv=$(printf '%s' "$body" | jq -r --arg t "Revert \"factory: $cid\"" 'if has("items") then ([.items[]|select(.title==$t)]|length) else "ERR" end' 2>/dev/null) || rv=ERR
+            [ "$code" = 200 ] && [ "$rv" != ERR ] || { unk="GitHub answered HTTP $code on the revert search for factory/$cid"; continue; }
+            if [ "$rv" -eq 0 ]; then echo merged; return; else anyrev=1; fi ;;
+          open) anyopen=1 ;;
+          elsewhere:*) elsewhere=${st#elsewhere:} ;;
+        esac ;;
+      *) sha=$(jq -r '.final_sha // empty' "$RUNS/$(basename "$g" .json)/manifest.json" 2>/dev/null || true)
+         [ -n "$sha" ] || { unk="no run record for $cid under $RUNS"; continue; }
+         dg=$(mktemp -d "${TMPDIR:-/tmp}/factory-dep.XXXXXX"); git init -q --bare "$dg"
+         if ! git -C "$dg" fetch -q "$durl" "refs/heads/$bb:refs/heads/base" 2>/dev/null; then rm -rf "$dg"; unk="cannot fetch $bb from $durl"; continue; fi
+         if git -C "$dg" merge-base --is-ancestor "$sha" refs/heads/base 2>/dev/null; then rm -rf "$dg"; echo merged; return; fi
+         rm -rf "$dg"; anyopen=1 ;;   # judged and pushed, not on the base: what an open PR is on GitHub
+    esac
+  done
+  [ -z "$anyq" ] || { echo queued; return; }
+  [ -z "$anyopen" ] || { echo open; return; }
+  [ -z "$unk" ] || { echo "unknown $unk"; return; }
+  [ -z "$anyrev" ] || { echo "reverted its merge was reverted"; return; }
+  [ -z "$elsewhere" ] || { echo "dead merged into $elsewhere, not $bb"; return; }
+  echo "dead nothing queued, no PR open or merged"
+}
+dep_token() {  # dep_token <owner/name or path> <repo_url>: the read-only token for the dependency check, cached in the lock dir for this batch
+  # (a token lives 1h; refreshed after 50 min). GitHub: pull_requests:read, contents:read, minted with rundir unset so no run's manifest gets
+  # that installation id. A dry run uses the file token.
+  case "$2" in https://github.com/*) ;; *) cat "$FACTORY_SECRETS_DIR/github_token"; return ;; esac
+  f="$LOCK/dep_tok"
+  if [ -s "$f" ] && [ "$(head -1 "$f")" = "$1" ] && [ -z "$(find "$f" -mmin +50 2>/dev/null)" ]; then tail -1 "$f"; return; fi
+  key=$(keycard_token "$GITHUB_APP_KEY_RESOURCE" | openssl base64 -d -A 2>/dev/null) || return 1; [ -n "$key" ] || return 1
+  t=$( rundir=; mint_github_token "$1" "$key" '{"pull_requests":"read","contents":"read"}' ) || return 1; key=; [ -n "$t" ] || return 1
+  ( umask 077; printf '%s\n%s\n' "$1" "$t" > "$f" ); printf '%s' "$t"
+}
 
 # ---------------------------------------------------------------- batch
 cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--no-chain] [--continue]: the overnight loop.
-  # Tasks run in filename order under one lock. Chain mode (default): every task after a successful one cuts its branch from
-  # factory/<previous task_id> (passed to run as FACTORY_CHAIN_BASE; the task file is never changed), while its PR still targets the
-  # task's own base_branch, so a merged-and-deleted chain head cannot break a later PR. Any exit but 0 stops the batch: that task goes to
-  # <queue-dir>/failed/, every later one stays in the queue untouched. With --continue the batch goes on instead: a failed run still
-  # pushes its branch (evidence), so every later task whose base names a task that failed tonight is moved to failed/ unrun, and the
-  # chain goes on from the last task that passed (never from the failed branch, and never back to main, which lacks every unmerged
-  # predecessor). HALT between tasks stops the batch either way. Exit 0 moves a task to
-  # <queue-dir>/done/<run_id>.json (run_id is <timestamp>-<task_id>, and lint makes task_id the filename), so a rerun never repeats it.
+  # Tasks run in task-id order under one lock: the queue is listed afresh before every run and the first id after the last one taken
+  # runs next, so a file the loop itself writes (an infra retry) runs next. Chain mode (default): every task after a successful one
+  # cuts its branch from factory/<previous task_id> (passed to run as FACTORY_CHAIN_BASE; the task file is never changed), while its
+  # PR still targets the task's own base_branch, so a merged-and-deleted chain head cannot break a later PR.
+  # Every failed run is class task or infra (CLASS_JQ). Task: the task goes to <queue-dir>/failed/ and, without --continue, the batch
+  # stops; with --continue every later task whose declared base names a task that failed tonight is moved to failed/ unrun, and the
+  # chain goes on from the last task that passed (never from a failed branch, never back to main, which lacks every unmerged
+  # predecessor). Infra never stops the batch by itself: with nothing pushed the file stays in the queue under its own id (nothing is
+  # on GitHub, so the id is reusable tomorrow); with a branch pushed the task is retried once tonight as <id>-i1 from the same chain
+  # base (an exit-11 conflict retries from the branch it conflicted with), and a retry that fails the same way is a task failure. Two
+  # infra failures in a row from different tasks stop the batch with the queue as it is (the circuit breaker). HALT between tasks
+  # stops it either way. Exit 0, or exit 4 (judged, pushed, only the PR missing), moves a task to <queue-dir>/done/<run_id>.json
+  # (run_id is <timestamp>-<task_id>, and lint makes task_id the filename), so a rerun never repeats it. The batch's exit status is
+  # the last run of a task that did not pass tonight, 0 when every task ran passed or was recovered by its retry.
   dir= max= stop_at= deadline= chain=on cont=
   while [ $# -gt 0 ]; do case "$1" in
     --max-tasks) max="${2:-}"; shift 2 ;; --stop-at) stop_at="${2:-}"; shift 2 ;; --no-chain) chain=; shift ;; --continue) cont=1; shift ;;
@@ -545,19 +656,71 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
   batch_id="batch-$(date -u +%Y%m%dT%H%M%SZ)"; report="$RUNS/$batch_id.md"; mkdir -p "$RUNS"
   take_lock; echo "$batch_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"
   trap 'rm -rf "$LOCK"' EXIT; trap 'exit 130' INT TERM
-  rows= prev= why= failed=" " n=0 fail=0 prs=0 nfail=0 nblk=0
-  for task in "$dir"/*.json; do
-    [ -e "$task" ] || { why="queue is empty"; break; }
+  # Where notifications go, host only (a token in the URL never reaches the log): a silent night must say whether it could have spoken.
+  nhost=off; if [ -n "${FACTORY_NOTIFY_URL:-}" ]; then nhost=${FACTORY_NOTIFY_URL#*://}; nhost=${nhost%%[/?#]*}; nhost=${nhost##*@}; fi
+  echo "notify: $nhost$([ "$nhost" != off ] || echo ' (FACTORY_NOTIFY_URL not set)')"
+  # passed/failed: base ids (an -i<N> retry counts for its task); prev: the literal chain head; outcomes: "<base id>=<rc>" per run, for the
+  # exit status; retried: "<retry id>=<rc>/<outcome>" of the attempt a retry stands for; plain: retries cut from the task's own base.
+  # failed: ids and base ids (an -i<N> retry counts for its task); prev: the literal chain head; outcomes: "<base id>=<rc>" per run
+  # in order, 0 for a pass, for the exit status; retried: "<retry id>=<rc>/<outcome>" of the attempt a retry stands for; plain: retries
+  # cut from the task's own base; next_id: a retry the loop wrote, run before anything else.
+  rows= prev= why= cursor= next_id= failed=" " passed=" " waited=" " retried=" " plain=" " outcomes= n=0 prs=0 nfail=0 nblk=0 ninfra=0 nwait=0 ndead=0 streak=0 lastinfra= streakids=
+  while :; do
     [ -e "$HALT" ] && { why="halted by $HALT ($(cat "$HALT"))"; break; }
     [ -z "$max" ] || [ "$n" -lt "$max" ] || { why="--max-tasks $max reached"; break; }
     [ -z "$deadline" ] || [ "$(date +%s)" -lt "$deadline" ] || { why="--stop-at $stop_at passed"; break; }
-    name=$(basename "$task" .json); id=$(jq -r .task_id "$task"); base=$(jq -r .base_branch "$task"); cb=
+    # The next task: the retry the last run left, else the smallest id after the cursor in a fresh listing. Ids, not filenames:
+    # "<id>-i1.json" sorts before "<id>.json" ('-' < '.'). A retry is taken by name and leaves the cursor where it was, so an id that
+    # sorts between "<id>" and "<id>-i1" (such as "<id>-foo") is neither skipped nor run before the retry.
+    task= tid=
+    if [ -n "$next_id" ] && [ -e "$dir/$next_id.json" ]; then task="$dir/$next_id.json"; tid=$next_id
+    else for f in "$dir"/*.json; do [ -e "$f" ] || break; i=$(basename "$f" .json)
+      if { [ -z "$cursor" ] || [[ "$i" > "$cursor" ]]; } && { [ -z "$tid" ] || [[ "$i" < "$tid" ]]; }; then task=$f; tid=$i; fi; done; fi
+    next_id=
+    [ -n "$task" ] || { [ "$n" -gt 0 ] || [ "$nwait" -gt 0 ] || why="queue is empty"; break; }   # nothing after the cursor: the queue ran out, or was empty to begin with
+    name=$(basename "$task" .json); cb=
+    # A file that appeared after lint ran at the start (hand-added mid-night) may be malformed: a row and failed/, never a dead batch.
+    if ! jq -e "$JOB_SCHEMA" "$task" >/dev/null 2>&1; then
+      echo "== $name: skipped, not a task file"; rows="$rows| - | skipped | - | - | - | - | - | not a task file |"$'\n'
+      mkdir -p "$dir/failed"; mv "$task" "$dir/failed/$batch_id-$name.json"; cursor=$name; continue
+    fi
+    id=$(jq -r .task_id "$task"); base=$(jq -r .base_branch "$task")
+    case "$retried" in *" $id="*) ;; *) cursor=$name ;; esac   # a retry does not move the cursor
+    bid=$(base_id "$id"); isretry=; [[ ! "$id" =~ -i[0-9]+$ ]] || isretry=1   # the task this run stands for; whether it is already an infra retry
     [ -z "$chain" ] || [ -z "$prev" ] || cb="factory/$prev"
+    case "$plain" in *" $id "*) cb= ;; esac
     # --continue: a base that failed tonight (declared in the file, or the chain head) was pushed as evidence only; do not build on it.
-    skip=; for d in "$base" "$cb"; do case "$d" in factory/*) case "$failed" in *" ${d#factory/} "*) skip=$d ;; esac ;; esac; done
+    skip= skipw=; for d in "$base" "$cb"; do case "$d" in factory/*) case "$failed" in *" ${d#factory/} "*) skip=$d ;; esac; case "$waited" in *" ${d#factory/} "*) skipw=$d ;; esac ;; esac; done
     if [ -n "$skip" ]; then
-      echo "== $name: skipped, its base $skip failed in this batch"; rows="$rows| - | skipped | - | - | - | $skip | - |"$'\n'
+      echo "== $name: skipped, its base $skip failed in this batch"; rows="$rows| - | skipped | - | - | - | $skip | - | base failed tonight |"$'\n'
       failed="$failed$id "; mkdir -p "$dir/failed"; mv "$task" "$dir/failed/$batch_id-$name.json"; continue
+    fi
+    if [ -n "$skipw" ]; then   # a declared base that is itself waiting tonight does not exist yet: wait with it, do not build on nothing
+      nwait=$((nwait+1)); w="waiting on ${skipw#factory/} (waiting itself)"; waited="$waited$id $bid "
+      echo "== $name: $w"; rows="$rows| - | waiting | - | - | - | $skipw | - | $w |"$'\n'; continue
+    fi
+    # depends_on: each dependency must be on the branch this task is cut from, which means passed tonight (chain mode: the linear chain
+    # holds every passed task) or merged into the base branch as GitHub says. Otherwise the task waits: untouched, visited once per night,
+    # released the night after its dependency lands. A wait on something dead (nothing queued, no PR open or merged) is said so, counted
+    # as dead for the exit status, and notified, so a night where everything waits on one dead root is never a quiet exit 0.
+    # Every dependency is asked (a live wait must not hide a dead one behind it); the worst answer is reported: dead or reverted first,
+    # then unknown (GitHub could not be asked: a wait, notified, never a verdict), then the first live wait (open, queued).
+    waiting= wdead= wunk=
+    for d in $(jq -r --arg re "$ID_RE" '.depends_on // [] | .[] | select(test($re))' "$task"); do   # the id grammar: lint enforced it at the start, a mid-night file was not linted
+      db=$(base_id "$d"); if [ -n "$chain" ]; then case " $passed " in *" $db "*) continue ;; esac; fi
+      r=$(dep_state "$dir" "$db" "$(jq -r .repo "$task")" "$base"); st=${r%% *}; [ "$st" != merged ] || continue
+      case "$st" in
+        dead|reverted) [ -n "$wdead" ] || { waiting="$db ($st): ${r#* }"; wdead=1; } ;;
+        unknown) [ -n "$wdead" ] || [ -n "$wunk" ] || { waiting="$db ($st): ${r#* }"; wunk=1; } ;;
+        *) [ -n "$waiting" ] || waiting="$db ($st)" ;;
+      esac
+    done
+    if [ -n "$waiting" ]; then
+      nwait=$((nwait+1)); w="waiting on $waiting"; waited="$waited$id $bid "
+      echo "== $name: $w"; rows="$rows| - | waiting | - | - | - | - | - | $w |"$'\n'
+      [ -z "$wdead" ] || { ndead=$((ndead+1)); outcomes="$outcomes$bid=1 "; }
+      [ -z "$wdead$wunk" ] || notify "$name $w"
+      continue
     fi
     echo "== $name ($(now))${cb:+, base $cb}"
     t0=$(date +%s); rc=0; FACTORY_BATCH=$$ FACTORY_CHAIN_BASE="$cb" "$0" run "$task" || rc=$?
@@ -565,26 +728,63 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
     # and a run that dies before it takes the lock (docker down) cannot be mistaken for the previous one.
     run_id=$(cat "$LOCK/run_id"); echo "$batch_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"; m="$RUNS/$run_id/manifest.json"
     if [ "$run_id" != "$batch_id" ] && [ -f "$m" ]; then
-      # A run killed before its cleanup (SIGKILL, power) has no exit_status; the loop saw it and writes it, so no row says "running".
-      [ "$(jq -r .exit_status "$m")" != null ] || { rundir="$RUNS/$run_id"; manifest_set '. + {ended_at:(.ended_at // $e), exit_status:$rc}' --arg e "$(now)" --argjson rc "$rc"; }
+      # A run killed before its cleanup (SIGKILL, power) has no exit_status; the loop saw it and writes it, with the class, so no row says "running".
+      [ "$(jq -r .exit_status "$m")" != null ] || { rundir="$RUNS/$run_id"; manifest_set '. + {ended_at:(.ended_at // $e), exit_status:$rc} | '"$END_JQ" --arg e "$(now)" --argjson rc "$rc"; }
       cells=$(jq -r '[(.exit_status // "running" | tostring), (.judge.rounds // "-" | tostring), (.judge.verdict // "-"), (.pr_url // "-")] | join(" | ")' "$m")
       outcome=$(jq -r '.outcome // empty' "$m"); reason=$(jq -r '.reason // empty' "$m")
-    else run_id="$batch_id-$name"; cells="$rc | - | - | -"; outcome= reason=; fi   # died before it was a run (bad task file, docker down)
-    rows="$rows| $run_id | $cells | ${cb:--} | $(( $(date +%s) - t0 ))s |"$'\n'; n=$((n+1))
-    [ "$rc" -eq 0 ] || notify "$name exited $rc (${outcome:-$(awk -F' [|] ' '{print $3}' <<< "$cells")}, $([ -n "$cont" ] && echo continuing || echo stopped))${reason:+: $reason}"
+      cls=$(jq -r '.class // ('"$CLASS_JQ"') // empty' "$m"); pushed=$(jq -r '.pushed != false' "$m")   # the same rule when the run left no class; null pushed (unknown) counts as pushed
+    else run_id="$batch_id-$name"; cells="$rc | - | - | -"; outcome= reason= cls=infra pushed=false; fi   # died before it was a run (bad task file, docker down)
+    [ "$rc" -eq 0 ] || [ -n "$cls" ] || cls=infra
+    note=   # A retry that fails the way its original did has proved the failure reproducible: that is the task's, not the night's. Persisted.
+    case "$retried" in *" $id=$rc/$outcome "*) cls=task; note="retry failed the same way"; rundir="$RUNS/$run_id"; manifest_set '. + {class:"task", class_note:"retry failed the same way as its original"}' ;; esac
+    # The word on the phone: the verdict for a refusal, the outcome when there is one, else the number (an earlier round's verdict would
+    # read as the reason for a worker that crashed later).
+    case "$outcome" in refuted) what=$(awk -F' [|] ' '{print $3}' <<< "$cells") ;; "") what="exit $rc" ;; pr_failed) what="PR open failed, open it by hand" ;; *) what=$outcome ;; esac; new=
+    eff=$rc   # the run's standing for the exit status: 0 when it passed for the chain
+    # pr_failed (4) is a pass for the chain: judged passing, pushed, every gate clean, only the PR missing (pr_error in the manifest). Decided
+    # from the outcome, never from the number: a worker's own exit 4 passes through as the run's status and is nothing of the kind.
+    if [ "$rc" -eq 0 ] || [ "$outcome" = pr_failed ]; then
+      dest=done; prev=$id; passed="$passed$bid "; streak=0 lastinfra= streakids=; next=continuing; eff=0
+      [ "$rc" -eq 0 ] || note="PR open failed; branch judged and pushed, open it by hand"
+    elif [ "$cls" = infra ]; then
+      ninfra=$((ninfra+1)); what="infra: $what"; failed="$failed$id "; [ "$id" = "$bid" ] || failed="$failed$bid "   # a declared base on this task is not built on, retry or not
+      if [ "$lastinfra" != "$bid" ]; then streak=$((streak+1)); streakids="$streakids$id "; lastinfra=$bid; fi
+      if [ "$pushed" != true ]; then dest=; note="nothing pushed; left in queue"; next="left in queue"
+      elif [ "$outcome" = conflict ] && [ -n "$prev" ]; then dest=failed; note="conflicts with $base mid-chain; not retried (a retry from $base would drop the chain's work, one from the chain would conflict again)"; next=continuing
+      elif [ -z "$isretry" ] && [ ! -e "$dir/$id-i1.json" ]; then new="$id-i1"; dest=failed; note="retrying as $new"; next="retrying as $new"
+      elif [ -z "$isretry" ]; then dest=failed; note="$id-i1 is already queued; not retried again"; next=continuing
+      else dest=failed; note="retry failed too; no second retry"; next=continuing; fi
+    else
+      dest=failed; failed="$failed$id "; [ "$id" = "$bid" ] || failed="$failed$bid "; streak=0 lastinfra= streakids=; next=$([ -n "$cont" ] && echo continuing || echo stopped)
+      if [ "$outcome" = blocked ]; then nblk=$((nblk+1)); else nfail=$((nfail+1)); fi
+    fi
+    rows="$rows| $run_id | $cells | ${cb:--} | $(( $(date +%s) - t0 ))s | ${note:--} |"$'\n'; n=$((n+1)); outcomes="$outcomes$bid=$eff "
+    [ "$rc" -eq 0 ] || notify "$name exited $rc ($what, $next)${reason:+: $reason}"
     [ "${cells##* | }" = - ] || prs=$((prs+1))   # the row's last cell is the PR URL or -
-    # prev is the chain head: the last task that passed. A failed task's branch is evidence only, so prev is left as it is.
-    if [ "$rc" -eq 0 ]; then dest=done; prev=$id; else dest=failed; failed="$failed$id "; fail=$rc; if [ "$outcome" = blocked ]; then nblk=$((nblk+1)); else nfail=$((nfail+1)); fi; fi
-    mkdir -p "$dir/$dest"; mv "$task" "$dir/$dest/$run_id.json"
-    [ "$rc" -eq 0 ] || [ -n "$cont" ] || { why="$name exited $rc"; break; }   # 3 no changes, 4 PR failed, 5 REFUTED, 6 no verdict; the row has the verdict
+    if [ -n "$dest" ]; then mkdir -p "$dir/$dest"; mv "$task" "$dir/$dest/$run_id.json"; task="$dir/$dest/$run_id.json"; fi
+    # The retry file is written after the original is archived, so a kill between the two leaves nothing to run twice.
+    # ponytail: retried and plain live in this loop only. A retry left queued by HALT, --max-tasks or --stop-at runs tomorrow as an ordinary
+    # task: a same-way failure then reads as "retry failed too" (archived, no second retry), and a conflict retry is cut from the chain base.
+    if [ -n "$new" ]; then jq --arg id "$new" '.task_id=$id' "$task" > "$dir/$new.json"; retried="$retried$new=$rc/$outcome "; next_id=$new; [ "$outcome" != conflict ] || plain="$plain$new "; fi
+    [ "$streak" -lt 2 ] || { why="two infra failures in a row (${streakids% })"; break; }
+    [ "$eff" -eq 0 ] || [ "$cls" = infra ] || [ -n "$cont" ] || { why="$name exited $rc"; break; }   # 3 no changes, 5 REFUTED, 10 blocked, 14 manifest; the row has the verdict
   done
-  end="All tasks ran."; [ -z "$why" ] || end="Stopped: $why. $(ls "$dir"/*.json 2>/dev/null | wc -l | tr -d ' ' || true) task(s) left in queue."   # || true: an empty queue makes ls fail, and a failed substitution in an assignment is fatal under set -e
-  { echo "# $batch_id"; echo; echo "queue: $dir, chain: ${chain:-off}, tasks run: $n"; echo
-    echo "| RUN | EXIT | ROUNDS | VERDICT | PR | CHAIN BASE | DURATION |"; echo "|---|---|---|---|---|---|---|"; printf '%s' "$rows"
+  left=$(ls "$dir"/*.json 2>/dev/null | wc -l | tr -d ' ' || true)   # || true: an empty queue makes ls fail, and a failed substitution in an assignment is fatal under set -e
+  wsay=; [ "$nwait" -eq 0 ] || wsay=" ($nwait waiting on a dependency)"
+  if [ -n "$why" ]; then end="Stopped: $why. $left task(s) left in queue$wsay."
+  elif [ "$n" -eq 0 ] && [ "$nwait" -gt 0 ]; then end="Nothing ran. $left task(s) left in queue$wsay."
+  elif [ "$left" -gt 0 ]; then end="All tasks ran. $left task(s) left in queue$wsay."
+  else end="All tasks ran."; fi
+  { echo "# $batch_id"; echo; echo "queue: $dir, chain: ${chain:-off}, notify: $nhost, tasks run: $n"; echo
+    echo "| RUN | EXIT | ROUNDS | VERDICT | PR | CHAIN BASE | DURATION | NOTE |"; echo "|---|---|---|---|---|---|---|---|"; printf '%s' "$rows"
     echo; echo "$end"; } > "$report"
   cat "$report"; echo "report: $report"
-  notify "done: $n run, $prs PR(s), $nfail failed$([ "$nblk" -eq 0 ] || echo ", $nblk blocked"). $end"   # always, once the loop is over: a night with no message means the batch never reached its end
-  exit "$fail"   # the last failing run's status, 0 when every run passed
+  notify "done: $n run, $prs PR(s), $nfail failed$([ "$nblk" -eq 0 ] || echo ", $nblk blocked")$([ "$ninfra" -eq 0 ] || echo ", $ninfra infra")$([ "$nwait" -eq 0 ] || echo ", $nwait waiting")$([ "$ndead" -eq 0 ] || echo " ($ndead on a dead dependency)"). $end"   # always, once the loop is over: a night with no message means the batch never reached its end
+  # Exit: each task's standing is its last run tonight (a retry that passed clears its original; a later failure under the same base id
+  # counts). The status is the latest task whose last run did not pass, 0 when every task's last run passed.
+  fail=0 seen=" "; set -- $outcomes; i=$#
+  while [ "$i" -gt 0 ]; do e=${!i}; b=${e%=*}; case " $seen " in *" $b "*) ;; *) seen="$seen$b "; [ "${e##*=}" -eq 0 ] || [ "$fail" -ne 0 ] || fail=${e##*=} ;; esac; i=$((i-1)); done
+  exit "$fail"
 }
 
 # ---------------------------------------------------------------- report
@@ -648,11 +848,14 @@ cmd_stop() {
   fi
   # An orchestrator still preparing this run (tokens, clone) has not started a container yet: interrupt it so it never does.
   opid=0; [ "$(cat "$LOCK/run_id" 2>/dev/null)" = "$run_id" ] && opid=$(cat "$LOCK/pid" 2>/dev/null || echo 0)
+  # The outcome first, before the signal: a stopped task is the operator's decision (class task, failed/), never an infra failure the
+  # batch would leave in the queue and dispatch again once HALT is removed.
+  [ ! -f "$rundir/manifest.json" ] || manifest_set '.outcome //= "stopped"'
   alive=; if [ "$opid" -gt 0 ] 2>/dev/null && kill -0 "$opid" 2>/dev/null; then alive=1; kill -TERM "$opid" && echo "signalled orchestrator pid $opid"; fi
   log "factory stop by ${USER:-?}"   # append-only; safe beside the orchestrator's own writes
   # The manifest is written here only if no live orchestrator will finalize it (its cleanup records ended_at and exit_status).
   if [ -z "$alive" ] && [ -f "$rundir/manifest.json" ]; then
-    manifest_set '.incidents = ((.incidents // []) + [{ts:$ts, action:"factory stop", by:env.USER}]) | .ended_at //= $ts | .exit_status //= 137' --arg ts "$(now)"
+    manifest_set '.incidents = ((.incidents // []) + [{ts:$ts, action:"factory stop", by:env.USER}]) | .ended_at //= $ts | .exit_status //= 137 | '"$END_JQ" --arg ts "$(now)"
     echo "recorded incident in $rundir/manifest.json"
   fi
   cat <<EOF
