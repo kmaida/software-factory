@@ -121,6 +121,8 @@ Size tasks for an unattended run:
 - Nothing needs a decision. Make the decision yourself and state it under Context.
 - Nothing needs a secret, an account, or a network service the tests don't already have.
 - A task that relies on a table, column, export or dependency either lists it under Scope or follows the task that adds it. Otherwise the worker finds it missing and blocks.
+- A task that may add or change a dependency names `package.json` under Scope. Without that, a branch that changes a dependency manifest is pushed but gets no PR (exit 14).
+- Never put a token or key in a task. A task whose text looks like it carries one is refused before anything is minted (exit 13), and `lint` reports it.
 - The first task in a new repo is the scaffold, the test runner and CI. Merge it and watch the judge run its checks once before you stack anything on it.
 
 Keep "Done when" narrow. Anything beyond it is out of scope by default, and the judge returns CAVEATS for over-engineering, which costs the worker a revision round.
@@ -158,7 +160,7 @@ By default, the first failure (any exit other than 0) stops the batch, and the r
 
 With `FACTORY_NOTIFY_URL` set, `batch` posts plain-text lines to it:
 
-- For each task that fails: `<batch_id>: <task> exited <status> (<outcome or verdict>, continuing|stopped)`. The outcome is `blocked`, `conflict` or `gate_error` when a gate stopped the PR. A blocked task adds `: <reason>` from its note.
+- For each task that fails: `<batch_id>: <task> exited <status> (<outcome or verdict>, continuing|stopped)`. The outcome is `blocked`, `dependency_change`, `conflict` or `gate_error` when a gate stopped the PR, or `credential_in_input` when the run refused to start. A blocked task adds `: <reason>` from its note.
 - Once when the batch ends, whatever happened: `<batch_id>: done: <n> run, <k> PR(s), <f> failed, <b> blocked. All tasks ran.` (the blocked count appears only when it isn't zero) or `Stopped: <reason>. <m> task(s) left in queue.`
 
 Passing and skipped tasks send nothing of their own, and skipped tasks don't count as run or failed. Passing tasks are quiet because GitHub already notifies you of each PR. If no message arrives at all, the batch never reached its end (lint, `HALT` or the lock refused it, or it was killed), or the endpoint was unreachable. The batch's own output tells you which; a batch refused at startup writes no report. A single `factory run` sends nothing.
@@ -177,7 +179,7 @@ Each run leaves its evidence in `runs/<run_id>/`, where `run_id` is `<UTC timest
 
 | File | Contents |
 |---|---|
-| `manifest.json` | The task hash, repo, base commit, image ID, factory commit, Keycard zone, GitHub App installation, commit identity, judge rounds and verdict, final commit, PR URL (or `pr_error`), exit status, and, when a gate stopped the PR, `outcome` (`blocked`, `conflict` or `gate_error`) and the blocked `reason`. |
+| `manifest.json` | The task hash, repo, base commit, image ID, factory commit, Keycard zone, GitHub App installation, commit identity, judge rounds and verdict, final commit, PR URL (or `pr_error`), exit status, the npm policy supplied to the containers, and, when a gate stopped the PR or the run refused to start, `outcome` (`blocked`, `dependency_change`, `conflict`, `gate_error` or `credential_in_input`) and its `reason`. |
 | `log.jsonl` | Every line the containers wrote, with each container's credential redacted, plus the orchestrator's own events. |
 | `judge-<round>.md` | The judge's full review for each round. |
 
@@ -190,7 +192,9 @@ Each run leaves its evidence in `runs/<run_id>/`, where `run_id` is `<UTC timest
 | `6` | The judge gave no verdict. The branch was pushed with no PR. |
 | `10` | Blocked: the branch's only change is a `docs/BLOCKED-*` note. `reason` in the manifest has its first line. No PR. |
 | `11` | The branch conflicts with the current target branch. No PR. |
-| `12` | The gate couldn't fetch, diff or merge-check the branch. The end of `log.jsonl` has git's output. No PR. |
+| `12` | A gate couldn't run: the credential scan of the base tree, or the fetch, diff or merge-check of the branch. The end of `log.jsonl` has git's output. No PR. |
+| `13` | Refused to start: the task text or the base tree contains something shaped like a credential. `reason` names the file (or `instructions`), never the content. No container ran and no agent credential was issued; the task-text check runs before anything is minted, the tree check after the clone, so by then the one-hour clone token exists. |
+| `14` | The branch changes a dependency manifest (`package.json`, a lockfile) and the task's Scope doesn't name `package.json`. The branch was pushed with no PR; `reason` lists the files. |
 | Other | The orchestrator or a worker round failed. Check the end of `log.jsonl` and the factory's stderr. |
 
 In the morning, run `./factory report`, then review the stacked PRs from the bottom up. Merge the oldest first, and each later PR's diff shrinks to its own commits.
@@ -217,7 +221,8 @@ The table compares the factory to the controls in the reference architecture's a
 | Identity and access | Credentials attached at the proxy, never inside the sandbox | Each container holds one short-lived credential | Gap |
 | Identity and access | Its own identity per agent, short-lived task-scoped credentials, independent approval, fail-closed | One shared Application identity, `urn:factory:mini`, not one per agent, and a run ID per run in the manifest; one-hour Anthropic and GitHub tokens, the GitHub tokens scoped to one repo, but a long-lived Codex key; ruleset requires a human approval the App can't give; the run refuses to start on any token or schema failure | Partial |
 | Identity and access | Revoke any grant at any time | `factory stop` kills the run and blocks dispatch; tokens aren't revoked, they expire within an hour | Partial |
-| Supply chain | Packages admitted only through an approved registry or firewall | `npm ci` reaches the public registry directly | Gap |
+| Supply chain | Packages admitted only through an approved registry or firewall | Packages still come straight from the public registry (through the step's proxy). The containers get `npm` defaults that turn install scripts off and keep `npm install` from resolving anything published in the last seven days, recorded in the manifest as supplied policy (the agent could override them). A PR that changes a dependency manifest gets no PR unless the task's Scope names `package.json`; that gate runs after the package has already been installed and run in the containers | Partial |
+| Supply chain | No credentials in the inputs an agent receives | The task text and the tree the worker checks out are screened for common token shapes before any agent credential is issued or any container runs; the run refuses to start and names the file, not the content. Git history and other branches in the clone are not screened | Partial |
 | Supply chain | Approved, pinned components | Base image and Codex are pinned; Claude Code is installed at its latest version when the image is built | Partial |
 | Inference | Model gateway, approved models, per-task spend limits | Claude Code and Codex call their APIs directly, with no spend limit per task | Gap |
 | Execution | Start each agent only with granted access; stop on demand | Keycard policy grants each credential; `factory stop` | Meets |

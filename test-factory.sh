@@ -45,7 +45,7 @@ while [ $# -gt 0 ]; do case "$1" in
   -*) shift;; *) args+=("$1"); shift;; esac; done
 # The step's proxy (`run -d … --entrypoint node`): record its allowlist and pretend to start.
 [ -z "$detached" ] || { [ -z "${STUB_ALLOW:-}" ] || echo "${ALLOW:-}" >> "$STUB_ALLOW"; echo stub-proxy; exit 0; }
-IFS= read -r secret; echo "stub $mode secret=$secret net=$net proxy=${HTTPS_PROXY:-}"
+IFS= read -r secret; echo "stub $mode secret=$secret net=$net proxy=${HTTPS_PROXY:-} npm=${NPM_CONFIG_IGNORE_SCRIPTS:-}/${NPM_CONFIG_BEFORE:-}"
 case "$mode" in
   work) cd "$work"; git checkout -q "factory/$TASK_ID" 2>/dev/null || git checkout -qb "factory/$TASK_ID" "origin/$BASE_BRANCH"
         [ "${STUB_KILL_RUN:-}" = "$TASK_ID" ] && kill -9 "$(cat "$STUB_LOCK_PID")"   # the orchestrator dies mid-run, before its cleanup
@@ -53,7 +53,9 @@ case "$mode" in
         [ "${STUB_WORK_FAIL_ROUND:-0}" = "$(git rev-list --count "origin/$BASE_BRANCH..HEAD" | xargs -I{} expr {} + 1)" ] && exit 7
         if [ "${STUB_WORK_BLOCKED:-}" = "$TASK_ID" ]; then [ -e "docs/BLOCKED-$TASK_ID.md" ] && exit 0   # the note only; a revision round changes nothing
           mkdir -p docs; printf '# BLOCKED: %s\n\nno "url" column on sandboxes\nmore\n' "$TASK_ID" > "docs/BLOCKED-$TASK_ID.md"
-        elif [ -n "${STUB_CONFLICT:-}" ]; then echo worker > README.md; else echo "${args[0]}" >> work.log; fi
+        elif [ -n "${STUB_CONFLICT:-}" ]; then echo worker > README.md
+        elif [ -n "${STUB_WORK_DEP:-}" ]; then mkdir -p apps/wéb; echo x > apps/wéb/package-lock.json   # a nested manifest, in a path git quotes in --name-only output
+        else echo "${args[0]}" >> work.log; fi
         git add -A; git -c commit.gpgsign=false -c user.name=w -c user.email=w@w commit -qm "round";;
   judge) n=$(cat "$STUB_STATE" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_STATE"
          v=$(echo "$STUB_VERDICTS" | cut -d, -f$n)
@@ -76,8 +78,8 @@ case "$mode" in
 esac
 D
 chmod +x "$t/bin/"*
-run() {  # run <task_id> <verdicts> -> prints exit status; RUN_REPO overrides the local bare repo (a GitHub owner/name goes through the App path)
-  echo "{\"repo\":\"${RUN_REPO:-$t/remote.git}\",\"base_branch\":\"main\",\"task_id\":\"$1\",\"instructions\":\"do the thing\"}" > "$t/$1.json"
+run() {  # run <task_id> <verdicts> -> prints exit status; RUN_REPO overrides the local bare repo (a GitHub owner/name goes through the App path); RUN_INSTR the instructions (JSON-escaped)
+  echo "{\"repo\":\"${RUN_REPO:-$t/remote.git}\",\"base_branch\":\"main\",\"task_id\":\"$1\",\"instructions\":\"${RUN_INSTR:-do the thing}\"}" > "$t/$1.json"
   rm -f "$t/state" "$t/allow" "$t/logs"; set +e   # FACTORY_MAX_ROUNDS=3: the verdict fixtures below are written for three rounds; one case sets 5
   PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_ALLOW="$t/allow" STUB_LOGS="$t/logs" STUB_APP_KEY="$t/app-key.b64" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_MAX_ROUNDS="${FACTORY_MAX_ROUNDS:-3}" \
     "$here/factory" run "$t/$1.json" >"$t/$1.out" 2>&1; rc=$?; set -e
@@ -98,6 +100,8 @@ grep -q 'Review of your previous attempt (round 1 verdict: REFUTED)' "$m/log.jso
 grep -q 'stub work secret=\[REDACTED\] net=factory-[0-9TZ]*-t1 proxy=http://factory-[0-9TZ]*-t1-work-1-proxy:8888' "$m/log.jsonl" || { echo "FAIL: t1 worker not on the run network behind its proxy"; grep 'stub work' "$m/log.jsonl"; exit 1; }
 check "$(tr '\n' ' ' < "$t/allow")" 'api\.anthropic\.com|registry\.npmjs\.org api\.openai\.com|registry\.npmjs\.org api\.anthropic\.com|registry\.npmjs\.org api\.openai\.com|registry\.npmjs\.org github\.com ' "t1 allowlist per step"
 check "$(jq -r 'select(.event.type=="proxy") | .event.mode' "$m/log.jsonl" | tr '\n' ' ')" "work judge work judge push " "t1 proxy record per step"
+grep -q 'stub work secret=\[REDACTED\] net=[^ ]* proxy=[^ ]* npm=true/20[0-9][0-9]-' "$m/log.jsonl" || { echo "FAIL: t1 npm policy not on the docker run line"; grep 'stub work' "$m/log.jsonl"; exit 1; }
+check "$(jq -r '.npm_policy.ignore_scripts' "$m/manifest.json")" true "t1 npm policy in manifest"; check "$(jq -r '.npm_policy.before' "$m/manifest.json" | cut -c1-2)" 20 "t1 npm before date in manifest"
 # A proxy that never listens: the run fails (exit 1) before the step runs, with the proxy's output in the log. A step whose network
 # record cannot be collected (the 3rd `docker logs`: readiness poll, readiness check, collection) fails the run too; the step itself ran.
 rc=$(STUB_PROXY_DEAD=1 run t1p "VERIFIED"); m=$(ls -d "$runs"/*-t1p | tail -1)
@@ -115,16 +119,38 @@ grep -q 'REDACTED' "$m/log.jsonl" || { echo "FAIL: secret not redacted"; exit 1;
 rc=$(STUB_WORK_FAIL_ROUND=2 run t5 "REFUTED,VERIFIED"); m=$(ls -d "$runs"/*-t5 | tail -1)
 check "$rc" 7 "t5 exit is the failed worker's"; check "$(jq -r .final_sha "$m/manifest.json" | wc -c | tr -d ' ')" 41 "t5 branch still recorded (pushed)"; check "$(jq -r .pr_url "$m/manifest.json")" null "t5 no PR"
 check "$(jq -r .judge.rounds "$m/manifest.json")" 1 "t5 rounds counts judged rounds, not the failed worker round"
-# lint: a good stacked pair passes; a bad trio fails with one line per broken file (id != filename and base is a later task; missing headings).
+# Supply chain. A credential shape in the base tree: refused after the clone, before any container (exit 13, outcome credential_in_input,
+# reason the file name, never its content), even when a .gitattributes marks the file binary. In the task text: refused before anything is
+# minted. A changed dependency manifest (in a path git quotes) with no package.json under the task's own Scope: branch pushed, no PR, exit 14;
+# neither Out of scope nor a "Scope:" line inside appended findings counts. With it under Scope, exit 0.
+tok="ghp_$(printf 'a%.0s' $(seq 36))"   # built, not written: the factory's own tree must stay clean for this scan
+git init -q --bare "$t/cred.git"; git clone -q "$t/remote.git" "$t/cred" 2>/dev/null
+( cd "$t/cred" && printf 'GITHUB_TOKEN=%s\n' "$tok" > .env.example && echo '.env.example -diff' > .gitattributes && git add . && git -c commit.gpgsign=false -c user.name=t -c user.email=t@t commit -qm cred && git push -q "$t/cred.git" HEAD:main )
+rc=$(RUN_REPO="$t/cred.git" run s1 "VERIFIED"); m=$(ls -d "$runs"/*-s1 | tail -1)
+check "$rc" 13 "s1 credential in base tree exit"; check "$(jq -r '.outcome+" "+.reason+" "+(.exit_status|tostring)' "$m/manifest.json")" "credential_in_input .env.example 13" "s1 outcome"
+check "$(grep -c 'stub ' "$m/log.jsonl")" 0 "s1 no container ran"; ! grep -q "$tok" "$m/log.jsonl" "$m/manifest.json" || { echo "FAIL: s1 the gate leaked the token"; exit 1; }
+rc=$(RUN_INSTR="Goal: use $tok." run s2 "VERIFIED"); m=$(ls -d "$runs"/*-s2 | tail -1)
+check "$rc" 13 "s2 credential in task text exit"; check "$(jq -r '.outcome+" "+.reason' "$m/manifest.json")" "credential_in_input instructions" "s2 outcome"
+check "$(grep -c 'stub \|token issued\|key issued\|cloned' "$m/log.jsonl")" 0 "s2 nothing issued, nothing cloned, no container"
+rc=$(STUB_WORK_DEP=1 RUN_INSTR='Goal: g.\nScope: s.\nDone when: y.\nOut of scope: package.json\n\nPrevious attempt: judge REFUTED. Findings:\nScope: package.json should stay as it is' run s3 "VERIFIED"); m=$(ls -d "$runs"/*-s3 | tail -1)
+check "$rc" 14 "s3 dependency change exit"; check "$(jq -r '.outcome' "$m/manifest.json")" dependency_change "s3 outcome"; check "$(jq -r .reason "$m/manifest.json" | grep -c 'package-lock.json')" 1 "s3 reason names the manifest"
+check "$(jq -r .final_sha "$m/manifest.json" | wc -c | tr -d ' ')" 41 "s3 branch pushed"; check "$(jq -r .pr_url "$m/manifest.json")" null "s3 no PR"
+rc=$(STUB_WORK_DEP=1 RUN_INSTR='Goal: g.\nScope: the app package.json for deps named above.\nDone when: y.' run s4 "VERIFIED"); m=$(ls -d "$runs"/*-s4 | tail -1)
+check "$rc" 0 "s4 dependency change named in Scope ships"; check "$(jq -r '.outcome // "none"' "$m/manifest.json")" none "s4 no outcome"
+# requeue carries both refusals forward
+mkdir -p "$t/sq/failed"; cp "$t/s3.json" "$t/sq/failed/$(basename "$(ls -d "$runs"/*-s3 | tail -1)").json"; "$here/factory" requeue "$t/sq/failed/"*-s3.json >/dev/null
+grep -q 'changed a dependency manifest (.*package-lock.json.*) without Scope naming package.json' "$t/sq/s3-r1.json" || { echo "FAIL: requeue dependency_change note"; cat "$t/sq/s3-r1.json"; exit 1; }
+# lint: a good stacked pair passes; a bad trio fails with one line per broken file (id != filename and base is a later task; missing headings; a credential shape).
 body='Goal: g.\nContext: c.\nScope: s.\nDone when: tests pass.\nOut of scope: o.'
 task() { printf '{"repo":"%s","base_branch":"%s","task_id":"%s","instructions":"%s"}\n' "$1" "$2" "$3" "$4" > "$5/$3.json"; }
 mkdir -p "$t/lint-ok" "$t/lint-bad"
 task o/r main 010-a "$body" "$t/lint-ok"; task o/r factory/010-a 020-b "$body" "$t/lint-ok"; task o/r main 015a-c "$body" "$t/lint-ok"   # 015a: a split task
 printf '{"repo":"o/r","base_branch":"factory/030-c","task_id":"010-x","instructions":"%s"}\n' "$body" > "$t/lint-bad/010-a.json"
-task o/r main 020-b 'Goal: g.\nDone when: y.' "$t/lint-bad"; task o/r main 030-c "$body" "$t/lint-bad"
+task o/r main 020-b 'Goal: g.\nDone when: y.' "$t/lint-bad"; task o/r main 030-c "$body" "$t/lint-bad"; task o/r main 040-d "Goal: use $tok.\\nContext: c.\\nScope: s.\\nDone when: y.\\nOut of scope: o." "$t/lint-bad"
 check "$("$here/factory" lint "$t/lint-ok")" "lint ok: 3 task(s)" "lint ok (including a split-task id)"
 set +e; out=$("$here/factory" lint "$t/lint-bad"); rc=$?; set -e
-check "$rc" 1 "lint bad exit"; check "$(printf '%s\n' "$out" | grep -c '^0[12]0-[ab]:')" 2 "lint bad reports the two broken files"
+check "$rc" 1 "lint bad exit"; check "$(printf '%s\n' "$out" | grep -c '^0[124]0-[abd]:')" 3 "lint bad reports the three broken files"
+printf '%s\n' "$out" | grep -q "040-d: instructions contain something shaped like a credential" || { echo "FAIL: lint credential message: $out"; exit 1; }
 printf '%s\n' "$out" | grep -q "010-a: task_id '010-x' is not the filename; base_branch factory/030-c is a later task in the queue" || { echo "FAIL: lint messages: $out"; exit 1; }
 printf '%s\n' "$out" | grep -q "020-b: instructions need the headings" || { echo "FAIL: lint headings message: $out"; exit 1; }
 # batch: a three-task chain. 020 and 030 cut their branch from the previous task's branch (the files on disk are not touched: same
@@ -287,4 +313,4 @@ mkdir -p "$runs/stoptest"; echo '{"ended_at":null,"exit_status":null}' > "$runs/
 PATH="$t/bin:$PATH" STUB_DOCKER_PS_FAIL=1 "$here/factory" stop stoptest > "$t/stop.out" 2>&1 || { echo "FAIL: stop with docker down exited $?"; cat "$t/stop.out"; exit 1; }
 check "$(jq -r .exit_status "$runs/stoptest/manifest.json")" 137 "stop with docker down records the incident"; rm -f "$here/HALT"; rm -rf "$runs/stoptest"
 find "$runs" -maxdepth 1 -newer "$t/secrets" \( -name 'batch-*.md' -o -name '*-0[0-9]0-[a-z][a-z]-[a-d]' \) -exec rm -rf {} +   # the GitHub-path batch cases ran after the first sweep
-echo "ok: egress (per-step proxy, allowlists, network record, dead proxy, lost record), judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, five rounds, App bot commit identity and its failed lookup), gates (blocked note, conflict with the target), lint, batch (chain, refuted chain, chain after a failure, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run, blocked reason on the phone), requeue (blocked, refuted, skipped), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), stop with docker down"
+echo "ok: egress (per-step proxy, allowlists, network record, dead proxy, lost record), supply chain (credential in tree, in task, in lint; dependency manifest gate and its Scope permission; npm policy; requeue notes), judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, five rounds, App bot commit identity and its failed lookup), gates (blocked note, conflict with the target), lint, batch (chain, refuted chain, chain after a failure, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run, blocked reason on the phone), requeue (blocked, refuted, skipped), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), stop with docker down"

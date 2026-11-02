@@ -38,6 +38,14 @@ MAX_ROUNDS="${FACTORY_MAX_ROUNDS:-5}"          # worker -> judge rounds before t
 ALLOW_WORK='api\.anthropic\.com|registry\.npmjs\.org'   # Claude Code, and the repo's own installs
 ALLOW_JUDGE='api\.openai\.com|registry\.npmjs\.org'     # Codex (its chatgpt.com model-list refresh is denied; non-fatal), and the repo's checks
 ALLOW_PUSH='github\.com'
+# Supply chain. CRED_RE: common credential shapes (a heuristic: these shapes, not every provider's format), refused in the task text and
+# in the tree the worker will check out, before any credential is issued; the gate reports file names, never content. MANIFEST_RE:
+# dependency manifests at any depth; a PR that changes one needs the task's Scope section to name package.json. That is a gate on
+# the committed tree, not package admission: by then the worker and the judge have already installed and run the package.
+CRED_RE='ghp_[A-Za-z0-9]{36}|ghs_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,}|sk-ant-[A-Za-z0-9_-]{20,}|sk-proj-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|xox[bpa]-[0-9A-Za-z-]{10,}|AIza[0-9A-Za-z_-]{35}'
+MANIFEST_RE='(^|/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock)"?$'   # "?: git quotes a path with non-ASCII or control characters
+NPM_BEFORE_DAYS=7   # npm policy on the fixed docker run line: no install scripts, and `npm install` resolves nothing published in the last 7 days.
+                    # Defaults the worker can override from Bash, so the manifest records them as supplied policy, not verified behaviour.
 # Git credential helper for the clone and the base fetch: answers only for github.com and reads the token from fd 3, so it is in
 # neither argv nor the environment. `credential.helper=` first clears inherited helpers (the mini's system gitconfig sets osxkeychain,
 # which would store the token on success).
@@ -49,6 +57,7 @@ usage() { echo "usage: factory run <task-file> | factory lint [dir] | factory ba
 JOB_SCHEMA='type=="object" and (keys|sort)==["base_branch","instructions","repo","task_id"] and all(.[]; type=="string" and length>0)'
 ID_RE='^[A-Za-z0-9._-]+$'; BRANCH_RE='^[A-Za-z0-9._/-]+$'
 now()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
+scope_of() { printf '%s\n' "$1" | awk '/^Scope:/ && !d {f=1} /^Done when:/{f=0; d=1} f'; }   # the task's own Scope section, once: a "Scope:" line in findings that requeue appended is not one
 notify() {  # notify <line>: POST "<batch_id>: <line>" to FACTORY_NOTIFY_URL when set. URL and body via curl config on stdin, not argv (the URL may carry a token).
   [ -n "${FACTORY_NOTIFY_URL:-}" ] || return 0
   b="$batch_id: $1"; b=${b//\\/\\\\}; b=${b//\"/\\\"}   # the body may quote a BLOCKED note; a bare " or \ would end or alter the config line
@@ -183,6 +192,7 @@ run_container() {  # run_container <mode> <secret> [docker args...] -- [entrypoi
   | docker run -i --name "$cname" --label "factory.run=$run_id" --rm --read-only --tmpfs /tmp --tmpfs /run/secrets:size=64k \
     --memory 4g --cpus 2 --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges \
     --network "$net" -e HTTPS_PROXY="http://$pname:8888" -e https_proxy="http://$pname:8888" -e HTTP_PROXY="http://$pname:8888" -e http_proxy="http://$pname:8888" \
+    -e NPM_CONFIG_IGNORE_SCRIPTS=true -e NPM_CONFIG_BEFORE="$npm_before" \
     -e MODE="$mode" -e TASK_ID="$task_id" -e BASE_BRANCH="$from_branch" \
     -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
     "${dargs[@]}" "$image_digest" "$@" 2>&1 \
@@ -256,13 +266,18 @@ cmd_run() {
   logf="$rundir/log.jsonl"; : > "$logf"
   echo "run $run_id"; echo "  evidence: $rundir"
   # Manifest exists from the first moment there is a run, before any credential is issued; later steps fill it in.
+  npm_before=$(date -u -v-"${NPM_BEFORE_DAYS}"d +%Y-%m-%dT%H:%M:%SZ)
   jq -n --arg run_id "$run_id" --arg task_id "$task_id" --arg job "$(shasum -a 256 "$task" | cut -d' ' -f1)" \
         --arg repo "$repo" --arg base_branch "$base_branch" --arg cb "$chain_base" \
-        --arg image "$image_digest" --arg fc "$factory_commit" --arg started "$(now)" --arg kz "$KEYCARD_ZONE" \
+        --arg image "$image_digest" --arg fc "$factory_commit" --arg started "$(now)" --arg kz "$KEYCARD_ZONE" --arg nb "$npm_before" \
     '{run_id:$run_id, task_id:$task_id, job_sha256:$job, repo:$repo, base_branch:$base_branch, chain_base:(if $cb=="" then null else $cb end), base_sha:null,
-      image_digest:$image, factory_commit:(if $fc=="" then null else $fc end), keycard_zone:$kz,
+      image_digest:$image, factory_commit:(if $fc=="" then null else $fc end), keycard_zone:$kz, npm_policy:{ignore_scripts:true, before:$nb},
       installation_id:null, git_identity:null, started_at:$started, ended_at:null, exit_status:null, final_sha:null, pr_url:null}' \
     > "$rundir/manifest.json"
+  # Supply chain, before any credential is issued: a task whose text carries something shaped like a credential is refused outright.
+  if grep -E -q "$CRED_RE" <<< "$instructions"; then
+    manifest_set '. + {outcome:"credential_in_input", reason:"instructions"}'; log "refused: the task text contains something shaped like a credential; nothing was issued"; exit 13
+  fi
   # The run's network, after the manifest exists so a failure here is a recorded run (exit 1), not a vanished one. Orphan networks of
   # crashed runs go first (their containers went above; a network with members cannot be removed).
   orphans=$(docker network ls -q --filter label=factory.run); if [ -n "$orphans" ]; then docker network rm $orphans >/dev/null || die "cannot remove orphan network(s) $orphans"; fi
@@ -300,6 +315,18 @@ cmd_run() {
   fi
 
   gh_tok=   # the clone is done; the push mints its own token later, so none is held while the agents run
+
+  # The tree the worker will check out (origin/$from_branch, so a chained base is covered), screened by shape before the Anthropic token
+  # and any container. -l: file names only, never content, so the gate cannot leak what it found. -a: every blob as text, so a
+  # .gitattributes marking the file binary (-diff) cannot hide it. git grep exits 1 for no match; anything above 1 is an error, and an
+  # error is not a pass. Not covered: history and other branches, which the worker can read in its clone.
+  set +e; hit=$(git -C "$work" grep -a -l -E "$CRED_RE" "origin/$from_branch" -- 2>&1); g=$?; set -e
+  case "$g" in
+    1) ;;
+    0) hit=${hit%%$'\n'*}; hit=${hit#*:}
+       manifest_set '. + {outcome:"credential_in_input", reason:$r}' --arg r "$hit"; log "refused: $hit on $from_branch contains something shaped like a credential; no container ran"; exit 13 ;;
+    *) manifest_set '. + {outcome:"gate_error"}'; log "credential scan of origin/$from_branch failed (git grep exit $g); no container ran. ${hit:0:2000}"; exit 12 ;;
+  esac
 
   # Worker -> judge rounds. Each step is its own container with exactly one secret: the worker has the Claude credential,
   # the judge has the Codex key, the push has the GitHub token. The judge reviews a fresh clone of the worker's checkout and
@@ -387,6 +414,13 @@ cmd_run() {
         reason=$(git -C "$gate" show "$head:$note" 2>/dev/null | tr -d '\r' | awk '!/^[[:space:]]*#/ && NF && !f {print; f=1}' | cut -c1-200) || reason=
         manifest_set '. + {outcome:"blocked", reason:$r}' --arg r "$reason"
         log "blocked: the only change is $note; no PR. $reason"; status=10
+      # A dependency manifest changed without permission: the task's Scope section naming package.json is the permission (Out of scope
+      # and findings appended by requeue do not count). A PR gate on the committed tree, after the package already ran in the containers;
+      # a worker that installed with --no-save or restored the manifest before committing walks past it. Branch pushed, no PR.
+      elif printf '%s\n' "$files" | grep -E "$MANIFEST_RE" >/dev/null && ! scope_of "$instructions" | grep 'package\.json' >/dev/null; then
+        dep=$(printf '%s\n' "$files" | grep -E "$MANIFEST_RE" | tr '\n' ' '); dep=${dep:0:200}
+        manifest_set '. + {outcome:"dependency_change", reason:$r}' --arg r "$dep"
+        log "dependency manifest changed without permission: ${dep}(Scope does not name package.json); no PR"; status=14
       else
       case "$verdict" in
         VERIFIED|CAVEATS)
@@ -429,6 +463,7 @@ cmd_lint() {  # factory lint [dir]: the task rules in README.md ("Writing tasks"
       # The five headings (README.md, "Writing tasks"), each at the start of a line, in order, and something after "Done when:".
       jq -e '.instructions | test("(^|\n)Goal:[\\s\\S]*\nContext:[\\s\\S]*\nScope:[\\s\\S]*\nDone when:[ \t]*\\S[\\s\\S]*\nOut of scope:")' "$f" >/dev/null \
         || p="$p; instructions need the headings Goal, Context, Scope, Done when, Out of scope, in that order, each on its own line"
+      if grep -E -q "$CRED_RE" <<< "$(jq -r .instructions "$f")"; then p="$p; instructions contain something shaped like a credential (run would refuse it)"; fi
       case "$base" in
         factory/*) dep=${base#factory/}
                    case " $seen " in *" $dep "*) ;;   # an earlier task in this queue
@@ -539,6 +574,8 @@ cmd_requeue() {  # factory requeue <queue/failed/file.json>: the same task again
   if [ -f "$m" ]; then
     case "$(jq -r '.outcome // empty' "$m")" in
       blocked) add="Previous attempt ($id) was blocked: $(jq -r '.reason // empty' "$m")" ;;
+      credential_in_input) add="Previous attempt ($id) was refused before it ran: something shaped like a credential in $(jq -r '.reason // empty' "$m"). It will be refused again until that is removed." ;;
+      dependency_change) add="Previous attempt ($id) changed a dependency manifest ($(jq -r '.reason // empty' "$m")) without Scope naming package.json, so it got no PR. Either Scope names package.json or the manifest stays as it is." ;;
       *) rounds=$(jq -r '.judge.rounds // 0' "$m")
          [ "$rounds" -gt 0 ] && [ -f "$RUNS/$rid/judge-$rounds.md" ] \
            && add="Previous attempt ($id): judge $(jq -r '.judge.verdict // "no verdict"' "$m") after $rounds round(s). Findings:"$'\n'"$(head -c 20000 "$RUNS/$rid/judge-$rounds.md")" ;;
