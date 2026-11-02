@@ -1,5 +1,43 @@
 # Factory plan: verification, repair and flow, so the operator can walk away
 
+## Status (2026-11-02)
+
+Landed on `main`, one line each:
+
+- Parity 1, egress allowlist on a per-run internal network: PR #42.
+- Parity 2, target-repo rulesets so the push token reaches only `factory/**`: on `keycard-workshop-platform` since 2026-10-31.
+- Parity 3 to 5, credential screening, the dependency-manifest gate, npm policy: PR #43.
+- Parity 6 to 9, image pin, model pins, cost record, evidence fails closed, redaction by shape: PR #44. Still in the code
+  and to drop: the worker's `--max-budget-usd` (decided 2026-11-02: no spend ceiling; the cost record stays).
+- This plan; the judge's test-a-claim rule (31edc5f); loop 2 (task or infra, `pushed`, one `-i1` retry, circuit breaker,
+  `stopped` is class task, notify state); loop 3 (`depends_on`, lint graph rules, `dep_state`, waits in place, dead waits
+  notified and non-zero): PR #45.
+- Of the 2026-11-01 handoff, items 1, 2, 8 and 9 are closed by the above; items 4 to 7 are task-file fixes in the workshop
+  repo (two patches on the laptop), not factory code.
+
+Next, in order, one branch and one PR each, merged before the next starts:
+
+1. Loop 4: the worker's BLOCKED note ends the run before the judge; the note-at-head gate; gate order (`gt`, manifest,
+   blocked); the fact-separated judge prompt (orchestrator facts apart from prior claims, REPEAT re-established at head).
+2. Loop 0 in PR-only mode: the `review` and `verify` entrypoint arms, the gate after the push and the cheap gates, JSON
+   findings, regression-or-unmet, gate cycles with their own counter, `gate_pending` as infra, an image rebuild.
+3. Loop 7's canary queue and the negative ruleset tests; then the merge into `next` with chain taint, `scope_widened` and
+   the accumulation cap. **Before this step is enabled, with the operator: the `next` ruleset on the target repo and a
+   separate merger App with its Keycard resource (parity, not yet started). Until they exist the gate stays in PR-only
+   mode.**
+4. Loop 1 (deep lint: additions and holds only, `held/`, `unhold`) and loop 6 (`factory status`, the `main` ⊆ `next`
+   invariant, the revert procedure).
+5. Loop 5 (triage with attribution, the revision file, host requeue with locked Goal and Done when and the Scope refusal
+   list, one revision ever, the audit paragraph).
+6. Loop 7's replay (`factory rejudge`) against last night's branches; then fix cycles may send work back.
+7. Parity 10 to 12 (provenance block, hash ledger, harness deny rules): nothing in the loops needs them; after the loops.
+8. Parity 13 and the Keycard client secret (the Secure Enclave signer, private_key_jwt, `docs/jwks.json`): last; nothing
+   in the loops needs them.
+
+The mini still runs the PR 40 commit. Before the next real night: `git -C ~/software-factory pull --ff-only`, an image
+rebuild (the Dockerfile changed in #42; the two-step `IMAGE_ID` rollout in its header), then a smoke batch (`--max-tasks 2`
+against the throwaway repo) and a read of the manifests' `class` and `pushed` fields and the `notify:` line.
+
 Goal: the operator leaves the factory running and comes back to finished, verified work. Every failure is repaired by
 the line or routed around; every change that ships was checked by reviewers that did not write it and did not review it
 before, and every blocking finding was reproduced by a machine; the human is the outermost loop, reached asynchronously,
