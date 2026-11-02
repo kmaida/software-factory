@@ -22,7 +22,7 @@ FROM node:24-bookworm-slim@sha256:c86ecead9e55a5210ac1727de38a4ca840bf03dcaf34dc
 # Codex is the judge; pinned, bump deliberately.
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl \
  && rm -rf /var/lib/apt/lists/* \
- && npm install -g @anthropic-ai/claude-code @openai/codex@0.164.0 \
+ && npm install -g @anthropic-ai/claude-code@2.1.316 @openai/codex@0.164.0 \
  && userdel -r node && useradd -m -u 1000 agent
 
 # The one secret arrives on stdin and is written as a 0400 file on the /run/secrets tmpfs,
@@ -45,7 +45,8 @@ work)
   git checkout -q "factory/${TASK_ID}" 2>/dev/null || git checkout -qb "factory/${TASK_ID}" "origin/${BASE_BRANCH}"
   # Stream tool calls as JSON; the orchestrator on the host writes them to runs/<id>/log.jsonl.
   # Capability profile: these tools run without prompts (there is nobody to answer one); everything else is denied.
-  claude -p "$*" --output-format stream-json --verbose \
+  # Model and spend cap come from the orchestrator (a full model id is the pin; the cap is Claude Code's own estimate, so it can overshoot). Both required.
+  claude -p "$*" --output-format stream-json --verbose --model "${FACTORY_MODEL:?}" --max-budget-usd "${FACTORY_BUDGET_USD:?}" \
     --allowedTools "Bash,Read,Edit,MultiEdit,Write,Glob,Grep,NotebookEdit,TodoWrite,Agent" < /dev/null
   # Safety net: commit anything the agent left uncommitted so the work reaches the judge and the PR. A commit that fails for a
   # real reason (index lock, hook) is a failed round (exit 2), never "no changes".
@@ -73,7 +74,7 @@ judge)
   rm -rf AGENTS.md AGENTS.override.md .codex .claude CLAUDE.md .cursor .mcp.json
   # Codex's own sandbox cannot start inside this capability-dropped container; the container is the sandbox.
   # The verdict goes to /out, a mount the repository content cannot reach (a committed symlink at the output path would otherwise be followed on the host).
-  codex exec --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check -c project_doc_max_bytes=0 \
+  codex exec --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check -c project_doc_max_bytes=0 -m "${JUDGE_MODEL:?}" \
     --dangerously-bypass-approvals-and-sandbox -C /work -o /out/verdict.md "$*" < /dev/null
   ;;
 push)

@@ -240,6 +240,28 @@ Status is Implemented, Partial, or Planned. Each has a check that proves it. (re
   the first section only); `git diff --name-only` quotes paths with non-ASCII or control characters and the closing
   quote defeated the `$` anchor (now `"?$`); and the README promised "no credential issued" for the tree screen,
   which runs after the clone token is minted (reworded: no agent credential, no container).
+- **Pins, budget, evidence, redaction, 2026-11-02** (plan items 6 to 9; PR `pins-budget-log`). Claude Code pinned
+  to 2.1.316 in the `Dockerfile` (the version the proxy check ran with); `IMAGE_ID` in `factory` is the local image
+  config ID the run must match (`FACTORY_ALLOW_DIRTY=1` runs anyway and the manifest says `image_pinned:false`);
+  the laptop's ID is committed, so the mini's first pull refuses until the bump PR, which is the two-step rollout in
+  the README. Model pins and the worker's `--max-budget-usd` go in as `-e` on the fixed line and the entrypoint
+  requires them (`${VAR:?}`); `model`, `judge_model`, `budget_usd` and `worker.rounds[]` (status, reported cost,
+  turns, duration per round, null when the round left no `result` event) are in the manifest and `report` has a
+  COST column. Every log line now carries `mode` and `round`. `run_container` reads the whole `PIPESTATUS` array;
+  a failed redaction loop, `redact` or `jq` is `outcome:"evidence_error"`, exit 12, nothing further runs, nothing
+  pushed. `umask 077`, `chmod -R go-rwx runs/` at every start, `-m 30` on every host-side curl. `redact()` is
+  `sed -l -E` over `CRED_RE`, applied to the stream, the judge's findings (so the next prompt, `judge-<n>.md` and the
+  PR body), a blocked reason and notifications; the stream loop also strips the base64 and URL-encoded forms of the
+  step's token. Split tokens stay uncaught. Backstops still to set by hand: hard spend limits on the Anthropic
+  `factory` workspace and the OpenAI project. Stub cases for all of it; the rebuilt image accepts the new flags
+  (bogus-token rounds on the laptop). Codex reviewed the diff, six findings, all confirmed and fixed: the
+  evidence path logged before checking the pipeline, so an unwritable log exited 1 without the outcome (manifest
+  first, log best effort); an evidence failure during the push lost `final_sha` though the branch was pushed (kept,
+  README says the branch may exist); a non-object JSON line from a hook (`42`) made the cost extraction fatal
+  (type-checked); the blocked reason was cut to 200 bytes before redaction, which can split a token (redact, then
+  cut); an evidence failure dropped the worker round from `worker.rounds`, so `report` showed "-" instead of "?"
+  (recorded with null cost); and the judge's key encoded in its own review, plus `log()` and `pr_error`, were
+  outside the redaction the README claimed (now covered). Stub cases for the first, second, fifth and sixth.
 
 ## TODO (Kim)
 

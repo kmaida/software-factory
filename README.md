@@ -69,11 +69,14 @@ These two files are the only credentials stored on the machine. The factory gets
 | `FACTORY_NOTIFY_URL` | No | Where `batch` posts notifications, for example `https://ntfy.sh/<topic>`. The topic name acts as the secret. |
 | `FACTORY_QUEUE` | No | A queue directory other than `queue/`. |
 | `FACTORY_MAX_ROUNDS` | No | Worker and judge rounds per task. Defaults to 5. |
+| `FACTORY_BUDGET_USD` | No | The worker's spend cap per round, passed to Claude Code as `--max-budget-usd`. Defaults to 10. |
 | `FACTORY_ALLOW_DIRTY` | No | Set to `1` to run from a checkout with uncommitted changes. For development only; the manifest marks the commit `-dirty`. |
 
 The Keycard zone URL, the Anthropic federation IDs and the GitHub App ID are constants at the top of `factory`. None of them is a secret.
 
 The factory refuses to run from a checkout with uncommitted changes, and it records its own commit in every manifest. Change the factory by pull request, then `git pull` on the Mac.
+
+It also refuses to run on any image but the one named by `IMAGE_ID` at the top of `factory` (the local image ID, `docker image inspect --format '{{.Id}}' factory-sandbox`). A change to the `Dockerfile` lands in two steps: merge it and `git pull`, `docker build`, read the new ID, merge a one-line PR that sets `IMAGE_ID` to it, and `git pull` again. In between, `FACTORY_ALLOW_DIRTY=1` runs on the new image and the manifest records `image_pinned: false`.
 
 ## Prepare a target repo
 
@@ -139,7 +142,7 @@ export FACTORY_NOTIFY_URL='https://ntfy.sh/YOUR_TOPIC'   # optional
 | `./factory run <task-file>` | Runs one task. The task file stays where it is. |
 | `./factory lint [dir]` | Checks a queue (default `queue/`) against the task rules: schema, `<number>-<name>` or `<number><letter>-<name>` IDs, filename matches `task_id`, the five headings in order, and `base_branch` order. |
 | `./factory batch [dir] [flags]` | Runs a queue unattended, in filename order. Runs `lint` first and refuses to start if it finds problems. |
-| `./factory report [n]` | Shows the last `n` runs (default 20): run ID, exit status, judge rounds, verdict and PR URL. |
+| `./factory report [n]` | Shows the last `n` runs (default 20): run ID, exit status, judge rounds, verdict, the worker rounds' reported cost (`?` when a round left none) and PR URL. |
 | `./factory requeue <queue/failed/file.json>` | Copies a failed task back into the queue as `<task_id>-r<N>`, with the last attempt's judge findings or blocked reason added to its instructions. |
 | `./factory stop <run_id>` | Stops the run's container, blocks new runs, and records the stop in the run's log. |
 
@@ -179,7 +182,7 @@ Each run leaves its evidence in `runs/<run_id>/`, where `run_id` is `<UTC timest
 
 | File | Contents |
 |---|---|
-| `manifest.json` | The task hash, repo, base commit, image ID, factory commit, Keycard zone, GitHub App installation, commit identity, judge rounds and verdict, final commit, PR URL (or `pr_error`), exit status, the npm policy supplied to the containers, and, when a gate stopped the PR or the run refused to start, `outcome` (`blocked`, `dependency_change`, `conflict`, `gate_error` or `credential_in_input`) and its `reason`. |
+| `manifest.json` | The task hash, repo, base commit, image ID and whether it is the pinned one, factory commit, Keycard zone, model, judge model and budget, GitHub App installation, commit identity, each worker round's status and reported cost, judge rounds and verdict, final commit, PR URL (or `pr_error`), exit status, the npm policy supplied to the containers, and, when a gate stopped the PR or the run stopped itself, `outcome` (`blocked`, `dependency_change`, `conflict`, `gate_error`, `credential_in_input` or `evidence_error`) and its `reason`. |
 | `log.jsonl` | Every line the containers wrote, with each container's credential redacted, plus the orchestrator's own events. |
 | `judge-<round>.md` | The judge's full review for each round. |
 
@@ -192,7 +195,7 @@ Each run leaves its evidence in `runs/<run_id>/`, where `run_id` is `<UTC timest
 | `6` | The judge gave no verdict. The branch was pushed with no PR. |
 | `10` | Blocked: the branch's only change is a `docs/BLOCKED-*` note. `reason` in the manifest has its first line. No PR. |
 | `11` | The branch conflicts with the current target branch. No PR. |
-| `12` | A gate couldn't run: the credential scan of the base tree, or the fetch, diff or merge-check of the branch. The end of `log.jsonl` has git's output. No PR. |
+| `12` | A gate couldn't run (the credential scan of the base tree, or the fetch, diff or merge-check of the branch; the end of `log.jsonl` has git's output), or the log pipeline failed during a step (`outcome: evidence_error`): the run stopped there. No PR. If that step was the push, the branch may already be on GitHub and `final_sha` says which commit. |
 | `13` | Refused to start: the task text or the base tree contains something shaped like a credential. `reason` names the file (or `instructions`), never the content. No container ran and no agent credential was issued; the task-text check runs before anything is minted, the tree check after the clone, so by then the one-hour clone token exists. |
 | `14` | The branch changes a dependency manifest (`package.json`, a lockfile) and the task's Scope doesn't name `package.json`. The branch was pushed with no PR; `reason` lists the files. |
 | Other | The orchestrator or a worker round failed. Check the end of `log.jsonl` and the factory's stderr. |
@@ -223,10 +226,10 @@ The table compares the factory to the controls in the reference architecture's a
 | Identity and access | Revoke any grant at any time | `factory stop` kills the run and blocks dispatch; tokens aren't revoked, they expire within an hour | Partial |
 | Supply chain | Packages admitted only through an approved registry or firewall | Packages still come straight from the public registry (through the step's proxy). The containers get `npm` defaults that turn install scripts off and keep `npm install` from resolving anything published in the last seven days, recorded in the manifest as supplied policy (the agent could override them). A PR that changes a dependency manifest gets no PR unless the task's Scope names `package.json`; that gate runs after the package has already been installed and run in the containers | Partial |
 | Supply chain | No credentials in the inputs an agent receives | The task text and the tree the worker checks out are screened for common token shapes before any agent credential is issued or any container runs; the run refuses to start and names the file, not the content. Git history and other branches in the clone are not screened | Partial |
-| Supply chain | Approved, pinned components | Base image and Codex are pinned; Claude Code is installed at its latest version when the image is built | Partial |
-| Inference | Model gateway, approved models, per-task spend limits | Claude Code and Codex call their APIs directly, with no spend limit per task | Gap |
+| Supply chain | Approved, pinned components | Base image, Claude Code and Codex are pinned in the `Dockerfile`, and `factory` refuses to run on any image but the one whose ID it carries (`IMAGE_ID`), so the image changes only by reviewed PR | Meets |
+| Inference | Model gateway, approved models, per-task spend limits | Claude Code and Codex still call their APIs directly, through the step's proxy. Each is pinned to one full model ID, the worker runs under a per-round spend cap (Claude Code's own estimate, so it can overshoot; a worker calling the API itself is outside it), and each worker round's reported cost is in the manifest and `report`. Codex has no cap; the consoles' hard spend limits are the backstop | Partial |
 | Execution | Start each agent only with granted access; stop on demand | Keycard policy grants each credential; `factory stop` | Meets |
-| Observability | Records linked by run ID, tamper-evident, outside the agent's reach; versioned factory configuration | Manifest, log and judge reviews keyed by run ID and written by the orchestrator, not the agent; factory commit and image ID recorded; Keycard audits every grant; the files aren't tamper-evident | Partial |
+| Observability | Records linked by run ID, tamper-evident, outside the agent's reach; versioned factory configuration | Manifest, log and judge reviews keyed by run ID and written by the orchestrator, not the agent, owner-readable only; factory commit and image ID recorded; Keycard audits every grant; a run whose log pipeline fails stops there with `outcome: evidence_error` rather than continue unrecorded; the files aren't tamper-evident | Partial |
 | Validation | Verify every output before it advances | Independent judge on a fresh clone, plus required CI and a human review | Meets |
 
 Known limits:
@@ -234,7 +237,7 @@ Known limits:
 - Egress is limited to each step's hosts, but a key read inside a container can still leave through an allowed host (npm and OpenAI both accept uploads) or through the judge's findings, which become the next prompt and the PR body. The judge runs the repo's tests as the same user as Codex, so a test the worker wrote can read the judge's key.
 - GitHub can't scope an installation token to one branch, so the push token can push to any branch of the target repo that no rule protects.
 - The Keycard client secret is a long-lived static secret on the Mac. It never enters a container.
-- Log redaction catches the literal tokens and their Basic-auth form, but not an encoded or split token.
+- Redaction catches each container's token literally, base64- and URL-encoded (in that container's output, and the judge's key in its review), and anything shaped like a common token wherever text leaves the run (the log, the judge's review and so the next prompt and PR body, a blocked reason, `pr_error`, notifications), but not a token split across lines or otherwise transformed.
 
 ## Repo layout
 
