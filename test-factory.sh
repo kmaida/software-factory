@@ -25,6 +25,14 @@ for a in "$@"; do case "$a" in
   */access_tokens) [ -z "${STUB_MINTS:-}" ] || printf '%s\n' "$d" >> "$STUB_MINTS"
      if [ -n "${STUB_MINT_FAIL_AFTER:-}" ] && [ "$(wc -l < "$STUB_MINTS")" -gt "$STUB_MINT_FAIL_AFTER" ]; then printf '{"message":"Bad credentials"}'; code 401; fi
      printf '{"token":"stub-installation-token"}'; code 201;;
+  */pulls\?state=all\&head=*) h=${a##*head=}; h=${h#*:factory/}   # the dependency check: STUB_MERGED / STUB_OPEN list ids (merged into STUB_MERGED_BASE, default main); anything else has no PR; STUB_PULLS_FAIL: HTTP 502
+     [ "${STUB_PULLS_FAIL:-}" != 1 ] || { printf '{"message":"Server Error"}'; code 502; }
+     case " ${STUB_MERGED:-} " in *" $h "*) printf '[{"state":"closed","merged_at":"2026-11-02T01:00:00Z","base":{"ref":"%s"},"html_url":"https://github.com/o/r/pull/7"}]' "${STUB_MERGED_BASE:-main}"; code 200;; esac
+     case " ${STUB_OPEN:-} " in *" $h "*) printf '[{"state":"open","merged_at":null,"base":{"ref":"main"},"html_url":"https://github.com/o/r/pull/8"}]'; code 200;; esac
+     printf '[]'; code 200;;
+  */search/issues\?*) [ "${STUB_SEARCH_FAIL:-}" != 1 ] || { printf '{"message":"API rate limit exceeded"}'; code 403; }   # STUB_REVERTED lists ids whose exact `Revert "factory: <id>"` PR is merged; the phrase search also returns prefix matches, as GitHub does
+     items=; for i in ${STUB_REVERTED:-}; do case "$a" in *"$i"*) items="$items{\"title\":\"Revert \\\"factory: $i\\\"\"},";; esac; done
+     printf '{"total_count":%d,"items":[%s]}' "$(printf '%s' "$items" | tr -cd '{' | wc -c)" "${items%,}"; code 200;;
   */pulls\?*) if [ "${STUB_PR_LIST:-}" = 1 ]; then printf '[{"html_url":"https://github.com/o/r/pull/9"}]'; else printf '[]'; fi; code 200;;   # GET: the open PR from this head, if any
   */pulls) [ -z "${STUB_PRS:-}" ] || printf '%s\n' "$d" >> "$STUB_PRS"; if [ "${STUB_PR_EMPTY:-}" = 1 ]; then printf '{}'; code 201; elif [ "${STUB_PR_FAIL:-}" = 1 ]; then printf '{"message":"Validation Failed","errors":[{"message":"A pull request already exists for o:factory/gh3."}]}'; code 422; else printf '{"html_url":"https://github.com/o/r/pull/1","body":"%s"}' "$(printf 'x%.0s' $(seq 2500))"; code 201; fi;;   # >2000 bytes, like a real one: the URL must still be parsed
 esac; done
@@ -176,6 +184,7 @@ grep -q 'changed a dependency manifest (.*package-lock.json.*) without Scope nam
 # lint: a good stacked pair passes; a bad trio fails with one line per broken file (id != filename and base is a later task; missing headings; a credential shape).
 body='Goal: g.\nContext: c.\nScope: s.\nDone when: tests pass.\nOut of scope: o.'
 task() { printf '{"repo":"%s","base_branch":"%s","task_id":"%s","instructions":"%s"}\n' "$1" "$2" "$3" "$4" > "$5/$3.json"; }
+taskd() { printf '{"repo":"%s","base_branch":"%s","task_id":"%s","instructions":"%s","depends_on":%s}\n' "$1" "$2" "$3" "$4" "$6" > "$5/$3.json"; }   # with depends_on (a JSON list)
 mkdir -p "$t/lint-ok" "$t/lint-bad"
 task o/r main 010-a "$body" "$t/lint-ok"; task o/r factory/010-a 020-b "$body" "$t/lint-ok"; task o/r main 015a-c "$body" "$t/lint-ok"   # 015a: a split task
 printf '{"repo":"o/r","base_branch":"factory/030-c","task_id":"010-x","instructions":"%s"}\n' "$body" > "$t/lint-bad/010-a.json"
@@ -186,6 +195,26 @@ check "$rc" 1 "lint bad exit"; check "$(printf '%s\n' "$out" | grep -c '^0[124]0
 printf '%s\n' "$out" | grep -q "040-d: instructions contain something shaped like a credential" || { echo "FAIL: lint credential message: $out"; exit 1; }
 printf '%s\n' "$out" | grep -q "010-a: task_id '010-x' is not the filename; base_branch factory/030-c is a later task in the queue" || { echo "FAIL: lint messages: $out"; exit 1; }
 printf '%s\n' "$out" | grep -q "020-b: instructions need the headings" || { echo "FAIL: lint headings message: $out"; exit 1; }
+# depends_on: an earlier task, or one in done/ or failed/, passes and the graph is printed; a later task ("reorder"), the task itself, an
+# unknown id and a task of another repo are refused. Ids are compared as base ids (-r<N>, -i<N> stripped), so a dependency on 010-f is
+# satisfied by failed/010-f-r1.json being known.
+mkdir -p "$t/lint-dep/failed" "$t/lint-dep2"; task o/r main 010-f-r1 "$body" "$t/lint-dep/failed"; task o/r main 010-a "$body" "$t/lint-dep"
+echo 'not json' > "$t/lint-dep/failed/batch-x-junk.json"   # the batch archives a malformed mid-night file here; lint must not die on it
+taskd o/r main 020-b "$body" "$t/lint-dep" '["010-a","010-f"]'; taskd o/r main 030-c "$body" "$t/lint-dep" '["020-b-r1"]'
+check "$("$here/factory" lint "$t/lint-dep")" "graph: 020-b <- 010-a 010-f
+graph: 030-c <- 020-b
+lint ok: 3 task(s)" "lint depends_on ok, graph printed"
+taskd o/r main 010-a "$body" "$t/lint-dep2" '["020-b"]'; task o/r main 020-b "$body" "$t/lint-dep2"; taskd o/r main 030-c "$body" "$t/lint-dep2" '["030-c"]'
+taskd o/r main 040-d "$body" "$t/lint-dep2" '["999-z"]'; task o/x main 050-e "$body" "$t/lint-dep2"; taskd o/r main 060-f "$body" "$t/lint-dep2" '["050-e"]'
+set +e; out=$("$here/factory" lint "$t/lint-dep2"); rc=$?; set -e; check "$rc" 1 "lint depends_on bad exit"
+printf '%s\n' "$out" | grep -q "010-a: depends_on 020-b is a later task in the queue; reorder" || { echo "FAIL: lint later dep: $out"; exit 1; }
+printf '%s\n' "$out" | grep -q "030-c: depends_on 030-c is the task itself" || { echo "FAIL: lint self dep: $out"; exit 1; }
+printf '%s\n' "$out" | grep -q "040-d: depends_on 999-z is not a task in this queue, done/ or failed/" || { echo "FAIL: lint unknown dep: $out"; exit 1; }
+printf '%s\n' "$out" | grep -q "060-f: depends_on 050-e is a task of another repo" || { echo "FAIL: lint cross-repo dep: $out"; exit 1; }
+printf '{"repo":"o/r","base_branch":"main","task_id":"070-g","instructions":"%s","depends_on":["", 1]}\n' "$body" > "$t/lint-dep2/070-g.json"
+printf '{"repo":"o/r","base_branch":"main","task_id":"080-h","instructions":"%s","depends_on":["010-a 020-b","*"]}\n' "$body" > "$t/lint-dep2/080-h.json"
+set +e; out=$("$here/factory" lint "$t/lint-dep2"); set -e; printf '%s\n' "$out" | grep -q "070-g: not {repo" || { echo "FAIL: lint depends_on schema: $out"; exit 1; }
+printf '%s\n' "$out" | grep -q "080-h: depends_on '010-a 020-b' is not a task id; depends_on '\*' is not a task id" || { echo "FAIL: lint depends_on id grammar: $out"; exit 1; }
 # batch: a three-task chain. 020 and 030 cut their branch from the previous task's branch (the files on disk are not touched: same
 # bytes after the move to done/), base_branch stays the task's own and chain_base is in the manifest, and the report has one row per task.
 batch() {  # batch <queue-dir> <verdicts> [flags...] -> exit status; output in $t/batch.out
@@ -281,6 +310,40 @@ queue cf 010-cf-a; rc=$(STUB_CONFLICT="$t/remote.git" batch "$t/cf" "VERIFIED,VE
 check "$rc" 0 "conflict retry: recovered"; check "$(moved cf/done)" "010-cf-a-i1.json " "conflict retry: the retry passed"; m=$(ls -d "$runs"/*-010-cf-a | tail -1)
 check "$(jq -r '"\(.outcome) \(.class)"' "$m/manifest.json")" "conflict infra" "conflict retry: original outcome"; m=$(ls -d "$runs"/*-010-cf-a-i1 | tail -1); check "$(jq -r .chain_base "$m/manifest.json")" null "conflict retry: cut from its own base"
 ( cd "$t/seed" && git pull -q origin main && echo hi > README.md && git -c commit.gpgsign=false -c user.name=t -c user.email=t@t commit -qam reset && git push -q origin HEAD:main )   # put main back
+# depends_on in a batch (local repo, so "merged" is an ancestor test). Night 1: 020 depends on 010, which passed tonight in the chain: runs.
+# Night 2: 030 depends on 010, done/ but not merged into main: waits, untouched, exit 0, counted. Merge 010 into main: night 3 runs it.
+queue dq 010-dq-a; taskd "$t/remote.git" main 020-dq-b "$body" "$t/dq" '["010-dq-a"]'
+rc=$(batch "$t/dq" "VERIFIED,VERIFIED"); check "$rc" 0 "deps night 1: exit"; check "$(moved dq/done)" "010-dq-a.json 020-dq-b.json " "deps night 1: a dependency that passed tonight is satisfied"
+taskd "$t/remote.git" main 030-dq-c "$body" "$t/dq" '["010-dq-a"]'; rc=$(FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/dq" "VERIFIED")
+check "$rc" 0 "deps night 2: a wait is not a failure"; check "$(moved dq)" "030-dq-c.json done " "deps night 2: the waiting file is untouched"; check "$(find "$runs" -maxdepth 1 -name '*-030-dq-c' -newer "$t/secrets" | wc -l | tr -d ' ')" 0 "deps night 2: never ran"
+grep -q '^| - | waiting | - | - | - | - | - | waiting on 010-dq-a (open) |' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: deps waiting row"; cat "$t/batch.out"; exit 1; }
+check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" "done: 0 run, 0 PR(s), 0 failed, 1 waiting. Nothing ran. 1 task(s) left in queue (1 waiting on a dependency)." "deps night 2: summary counts the wait, says nothing ran"; rm -f "$t/notify"
+# A pruned run record (no runs/<run_id>/) makes the dependency "unknown": a wait, notified, never a verdict.
+rd=$(ls -d "$runs"/*-010-dq-a | tail -1); mv "$rd" "$t/dq-a-run"; rc=$(FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/dq" "VERIFIED"); mv "$t/dq-a-run" "$rd"
+check "$rc" 0 "deps unknown (pruned record): a wait"; grep -q 'waiting on 010-dq-a (unknown): no run record for 010-dq-a under' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: deps unknown row"; cat "$t/batch.out"; exit 1; }
+grep -q '030-dq-c waiting on 010-dq-a (unknown): no run record' "$t/notify" || { echo "FAIL: deps unknown notify"; cat "$t/notify"; exit 1; }; rm -f "$t/notify"
+( cd "$t/seed" && git fetch -q origin && git merge -q --no-edit origin/factory/010-dq-a && git push -q origin HEAD:main )
+rc=$(batch "$t/dq" "VERIFIED"); check "$rc" 0 "deps night 3: exit"; check "$(moved dq/done)" "010-dq-a.json 020-dq-b.json 030-dq-c.json " "deps night 3: merged into main, the dependant runs"
+( cd "$t/seed" && git reset -q --hard "$(git rev-list --max-parents=0 HEAD)" && echo hi > README.md && git add -A && git -c commit.gpgsign=false -c user.name=t -c user.email=t@t commit -qm reset --allow-empty && git push -qf origin HEAD:main )   # put main back
+# --no-chain: passed tonight is not on the next task's base, so 020 waits even though 010 just passed. A dependency whose task is still in
+# the queue (an infra failure left for tomorrow) is "queued": a wait, not dead. A dependency that failed with nothing queued is dead: said so,
+# notified, and the batch exit is non-zero although nothing else failed after it.
+queue nd 010-nd-a; taskd "$t/remote.git" main 020-nd-b "$body" "$t/nd" '["010-nd-a"]'; rc=$(batch "$t/nd" "VERIFIED" --no-chain)
+check "$rc" 0 "deps no-chain: exit"; check "$(moved nd)" "020-nd-b.json done " "deps no-chain: 020 waits (010 passed but is not on main)"
+queue dk 010-dk-a; taskd "$t/remote.git" main 020-dk-b "$body" "$t/dk" '["010-dk-a"]'; rc=$(STUB_WORK_FAIL_ROUND=1 batch "$t/dk" "VERIFIED,VERIFIED")
+check "$rc" 7 "deps queued: exit is the infra failure's"; check "$(moved dk)" "010-dk-a.json 020-dk-b.json " "deps queued: both still in the queue"
+grep -q 'waiting on 010-dk-a (queued) |' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: deps queued row"; cat "$t/batch.out"; exit 1; }
+queue dz 010-dz-a; taskd "$t/remote.git" main 020-dz-b "$body" "$t/dz" '["010-dz-a"]'
+rc=$(FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/dz" "REFUTED,REFUTED,REFUTED" --continue)
+check "$rc" 1 "deps dead: a wait on a dead dependency is a dead task"; check "$(moved dz)" "020-dz-b.json failed " "deps dead: the file stays (a human requeues the root)"
+check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" "010-dz-a exited 5 (REFUTED, continuing)
+020-dz-b waiting on 010-dz-a (dead): nothing queued, no PR open or merged
+done: 1 run, 0 PR(s), 1 failed, 1 waiting (1 on a dead dependency). All tasks ran. 1 task(s) left in queue (1 waiting on a dependency)." "deps dead: notified, counted"; rm -f "$t/notify"
+# Every dependency is asked: a live wait on the first does not hide a dead second. A task whose declared base is a waiting task waits too.
+queue dy 010-dy-a 015-dy-b; taskd "$t/remote.git" main 020-dy-c "$body" "$t/dy" '["015-dy-b","010-dy-a"]'; task "$t/remote.git" factory/020-dy-c 030-dy-d "$body" "$t/dy"
+rc=$(batch "$t/dy" "REFUTED,REFUTED,REFUTED,VERIFIED" --continue); check "$rc" 1 "deps worst-first: dead behind an open dependency decides"
+grep -q 'waiting on 010-dy-a (dead): nothing queued' "$(ls "$runs"/batch-*.md | tail -1)" && grep -q 'waiting on 020-dy-c (waiting itself)' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: deps worst-first rows"; cat "$t/batch.out"; exit 1; }
+check "$(moved dy)" "020-dy-c.json 030-dy-d.json done failed " "deps worst-first: both waiters untouched"
 queue cg 005-cg-z 010-cg-a; rc=$(STUB_CONFLICT="$t/remote.git" STUB_CONFLICT_TASK=010-cg-a batch "$t/cg" "VERIFIED,VERIFIED" --continue)
 check "$rc" 11 "conflict mid-chain: exit"; check "$(moved cg/done)" "005-cg-z.json " "conflict mid-chain: the chain head stays"; check "$(moved cg/failed)" "010-cg-a.json " "conflict mid-chain: archived, no retry"
 check "$(ls "$t/cg"/*.json 2>/dev/null | wc -l | tr -d ' ')" 0 "conflict mid-chain: no retry file"; grep -q '010-cg-a | 11 |.*| conflicts with main mid-chain; not retried' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: conflict mid-chain row"; cat "$t/batch.out"; exit 1; }
@@ -385,6 +448,28 @@ check "$(grep -c 'saw key \[REDACTED\]' "$t/prs")" 2 "gh chain PR bodies carry t
 m=$(ls -d "$runs"/*-020-gc-b | tail -1); check "$(jq -r '"\(.base_branch) \(.chain_base)"' "$m/manifest.json")" "main factory/010-gc-a" "gh chain 020 manifest"
 git -C "$t/remote.git" merge-base --is-ancestor refs/heads/factory/010-gc-a refs/heads/factory/020-gc-b || { echo "FAIL: gh chain 020 not cut from 010"; exit 1; }
 # An ambiguous POST /pulls (422 "already exists", or a 201 whose body has no URL) is reconciled against the open PR from this head: exit 0, URL recorded.
+# depends_on against GitHub: merged means a merged PR from the head factory/<id> (any of its -r<N>/-i<N> heads) and no merged
+# `Revert "factory: <id>"` PR; an open PR is a wait; reverted is dead. The check mints a read-only token (pull_requests:read, contents:read).
+mkdir -p "$t/gd"; task o/r main 010-gd-a "$body" "$t/gd"; rc=$(STUB_APP_KEY="$t/app-key.b64" batch "$t/gd" VERIFIED); check "$rc" 0 "gd night 1"
+taskd o/r main 020-gd-b "$body" "$t/gd" '["010-gd-a"]'; taskd o/r main 025-gd-b2 "$body" "$t/gd" '["010-gd-a"]'
+rc=$(STUB_APP_KEY="$t/app-key.b64" STUB_MINTS="$t/mints-gd" STUB_MERGED="010-gd-a" batch "$t/gd" "VERIFIED,VERIFIED")
+check "$rc" 0 "gd merged: exit"; check "$(moved gd/done)" "010-gd-a.json 020-gd-b.json 025-gd-b2.json " "gd merged: both dependants ran"
+check "$(grep -c '"pull_requests":"read"' "$t/mints-gd")" 1 "gd merged: one read-only token for the night, cached in the lock dir, not one per check"
+check "$(head -1 "$t/mints-gd" | jq -c '.permissions')" '{"pull_requests":"read","contents":"read"}' "gd merged: the dependency check's token is read-only"
+taskd o/r main 030-gd-c "$body" "$t/gd" '["010-gd-a"]'; rc=$(STUB_APP_KEY="$t/app-key.b64" STUB_OPEN="010-gd-a" batch "$t/gd" VERIFIED)
+check "$rc" 0 "gd open: exit"; check "$(moved gd)" "030-gd-c.json done " "gd open: waits"; grep -q 'waiting on 010-gd-a (open) |' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: gd open row"; exit 1; }
+rc=$(STUB_APP_KEY="$t/app-key.b64" STUB_MERGED="010-gd-a" STUB_REVERTED="010-gd-a" batch "$t/gd" VERIFIED)
+check "$rc" 1 "gd reverted: dead"; grep -q 'waiting on 010-gd-a (reverted): its merge was reverted |' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: gd reverted row"; cat "$t/batch.out"; exit 1; }
+# A revert of a different PR whose id shares the prefix (the phrase search returns it) is not this one's revert: still merged.
+rc=$(STUB_APP_KEY="$t/app-key.b64" STUB_MERGED="010-gd-a" STUB_REVERTED="010-gd-a-r1" batch "$t/gd" VERIFIED); check "$rc" 0 "gd revert of another PR: merged (exact title)"; check "$(moved gd)" "done " "gd revert of another PR: the dependant ran"
+# GitHub errors are never a verdict: a 502 on the PR list or a 403 on the revert search is "unknown": a wait, notified, exit 0. A PR merged
+# into another branch than the task's base is not on the base: dead, with the branch named.
+taskd o/r main 040-gd-d "$body" "$t/gd" '["010-gd-a"]'; rc=$(STUB_APP_KEY="$t/app-key.b64" STUB_PULLS_FAIL=1 FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/gd" VERIFIED)
+check "$rc" 0 "gd 502: a wait"; grep -q '040-gd-d waiting on 010-gd-a (unknown): GitHub answered HTTP 502 on the PRs of factory/010-gd-a' "$t/notify" || { echo "FAIL: gd 502 notify"; cat "$t/notify"; exit 1; }; rm -f "$t/notify"
+rc=$(STUB_APP_KEY="$t/app-key.b64" STUB_MERGED="010-gd-a" STUB_SEARCH_FAIL=1 batch "$t/gd" VERIFIED); check "$rc" 0 "gd search 403: a wait, not merged"
+grep -q 'waiting on 010-gd-a (unknown): GitHub answered HTTP 403 on the revert search' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: gd search 403 row"; cat "$t/batch.out"; exit 1; }
+rc=$(STUB_APP_KEY="$t/app-key.b64" STUB_MERGED="010-gd-a" STUB_MERGED_BASE=release batch "$t/gd" VERIFIED); check "$rc" 1 "gd merged elsewhere: dead"
+grep -q 'waiting on 010-gd-a (dead): merged into release, not main' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: gd elsewhere row"; cat "$t/batch.out"; exit 1; }
 rc=$(RUN_REPO=o/r STUB_PR_FAIL=1 STUB_PR_LIST=1 run gh4 VERIFIED); m=$(ls -d "$runs"/*-gh4 | tail -1)
 check "$rc" 0 "gh4 exit (422 but the PR exists)"; check "$(jq -r .pr_url "$m/manifest.json")" https://github.com/o/r/pull/9 "gh4 existing PR recorded"
 jq -r 'select(.event.type=="factory") | .event.text' "$m/log.jsonl" | grep -q 'HTTP 422 but an open PR from factory/gh4 exists' || { echo "FAIL: gh4 reconciliation not logged"; exit 1; }
@@ -400,5 +485,5 @@ unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; rm -rf "$runs"/*-gh[
 mkdir -p "$runs/stoptest"; echo '{"ended_at":null,"exit_status":null}' > "$runs/stoptest/manifest.json"; : > "$runs/stoptest/log.jsonl"
 PATH="$t/bin:$PATH" STUB_DOCKER_PS_FAIL=1 "$here/factory" stop stoptest > "$t/stop.out" 2>&1 || { echo "FAIL: stop with docker down exited $?"; cat "$t/stop.out"; exit 1; }
 check "$(jq -r '"\(.exit_status) \(.outcome) \(.class)"' "$runs/stoptest/manifest.json")" "137 stopped task" "stop with docker down records the incident; a stopped task is class task (never re-dispatched by the batch)"; rm -f "$here/HALT"; rm -rf "$runs/stoptest"
-find "$runs" -maxdepth 1 -newer "$t/secrets" \( -name 'batch-*.md' -o -name '*-0[0-9][0-9]-[a-z][a-z]-[a-z]' -o -name '*-0[0-9][0-9]-[a-z][a-z]-[a-z]-i1' \) -exec rm -rf {} +   # the GitHub-path batch cases ran after the first sweep
-echo "ok: egress (per-step proxy, allowlists, network record, dead proxy, lost record), pins (image id, model, budget), cost per round and report, evidence error (worker, judge), redaction (encoded, by shape: log, judge file, PR body), supply chain (credential in tree, in task, in lint; dependency manifest gate and its Scope permission; npm policy; requeue notes), judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, five rounds, App bot commit identity and its failed lookup), gates (blocked note, conflict with the target), lint, batch (chain, refuted chain, chain after a failure, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run left in queue, blocked reason on the phone, notify host and off state, failed POST visible, infra retry recovered / failed the same way / conflict cut from its own base / conflict mid-chain not retried, hand-queued -i1 after a pass, circuit breaker, pr_failed chains, a stopped run is class task), class and pushed in the manifest, requeue (blocked, refuted, skipped), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), stop with docker down"
+find "$runs" -mindepth 1 -maxdepth 1 -newer "$t/secrets" -exec rm -rf {} +   # everything the run tree gained since this test began is the test's (the lock keeps a real run out)
+echo "ok: egress (per-step proxy, allowlists, network record, dead proxy, lost record), pins (image id, model, budget), cost per round and report, evidence error (worker, judge), redaction (encoded, by shape: log, judge file, PR body), supply chain (credential in tree, in task, in lint; dependency manifest gate and its Scope permission; npm policy; requeue notes), judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, five rounds, App bot commit identity and its failed lookup), gates (blocked note, conflict with the target), lint, batch (chain, refuted chain, chain after a failure, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run left in queue, blocked reason on the phone, notify host and off state, failed POST visible, infra retry recovered / failed the same way / conflict cut from its own base / conflict mid-chain not retried, hand-queued -i1 after a pass, circuit breaker, pr_failed chains, a stopped run is class task, depends_on: passed tonight / not merged waits / merged runs / no-chain waits / queued waits / dead notified and non-zero / pruned record unknown / worst dependency decides / declared base waiting / GitHub merged, open, reverted by exact title, 502 and 403 unknown, merged elsewhere dead / one cached read-only token), class and pushed in the manifest, lint depends_on (graph, later, self, unknown, other repo, schema, id grammar, malformed archive), requeue (blocked, refuted, skipped), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), stop with docker down"
