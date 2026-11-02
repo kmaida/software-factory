@@ -52,6 +52,15 @@ Commits are attributed to the GitHub App's bot user (`kmaida-software-factory[bo
 - The branch is pushed after the loop whatever the verdict (evidence). The PR opens only on VERIFIED or CAVEATS, with the verdict and findings in the body. REFUTED exits 5 and a missing verdict exits 6, both without a PR. Each round's full review is kept as `runs/<run_id>/judge-<round>.md`.
 - The judge is a model and can be wrong both ways; it narrows what reaches the human, it does not replace them.
 
+### 5b. Verification gate (loop 0, 2026-11-02)
+
+- Today's loop judge carries its own findings across rounds; the gate is the context-free check before anything reaches a human. After the push and the cheap gates, in the VERIFIED or CAVEATS arm: a `review` container (a fresh Claude Code session on a fresh clone at the judged head, `review-prompt.md` with the break-it lens, `--safe-mode --setting-sources "" --strict-mcp-config --disable-slash-commands --no-session-persistence`, agent config files stripped at every depth, `--json-schema` for the findings, the stream to the run log and the last result event's structured output to `/out/review.json` by a `node -e` line) then a `verify` container (`verify.js` mounted from this checkout, no model, no credential, egress to the npm registry only: clones `/src`, `npm ci` once per checkout when there is a `package.json`, runs each BLOCK's repro with `bash -o pipefail -c` under a 300 s timeout at the head and at the base, with `checkout -f` and `clean -fdx -e node_modules` between, and the two differential test checks: the base's changed test files against the head's code, the head's against the base's). Findings are JSON (`{"blocks":[{"loc","claim","clause","repro"}],"notes":[…]}`), at most `MAX_BLOCKS` (10) blocks per review.
+- Execution is the verdict: the host classifies each BLOCK from the two exit codes. Invalid (head exit 0, 124, 126, 127 or ≥128), regression (head fails, base passes), unmet (both fail, a Done when clause named), pre-existing (both fail, no clause: a note). Only regression and unmet count. The differential checks are notes for the PR body in PR-only mode.
+- Cycles: nothing reproduced opens the PR with the gate's record in the body. Otherwise the reproduced findings go to one worker round as orchestrator facts ("a verification gate reproduced these; the loop judge had passed the branch"), one judge round with the same facts in its facts section, the push, and the gate again; `judge.rounds` counts the cycle's round, and cycles run past `MAX_ROUNDS`. Dead, on no progress: no new commits in a cycle, a repro that reproduced in an earlier cycle, REFUTED from the loop judge in a cycle, or `MAX_GATES` (4) cycles: `outcome: refuted`, `refuted_by: gate`, exit 5, no PR.
+- Missing verification is not approval: a review or verifier that crashed, left no file, an invalid file, or a failed install is `outcome: gate_pending`, exit 12, class infra (the batch retries the task once as `-i1`; re-gating the pushed head in place without a new worker run is loop 7's replay, not yet built). A stop (`HALT`) landing after the push is `gate_pending` too, with `halted: true` in the cycle.
+- The manifest records `gate: {cycles: [{reviews: [{lens, arm, model, status, valid, blocks, notes, truncated}], verifier: {status, valid, install, checks, blocks: [{loc, claim, clause, repro, head_exit, base_exit, class}]}, reproduced}], result}` after every cycle; the evidence files are `gate-<cycle>-breakit.json` and `gate-<cycle>-verify.json`. Blocked, dependency-change and conflict branches never reach the gate.
+- Not in this step: the Codex integrity lens (scope, weakened tests, mocked-away behaviour as NOTEs; its mechanically checkable parts are the differential checks here and the host gates) and the merge into `next` (the gate opens PRs; option (b) of the plan until the canary and the negative ruleset tests pass).
+
 ### 6. Human gate on merge
 
 - The host opens the PR after a passing verdict. CI runs. I merge.
@@ -74,7 +83,10 @@ task file in queue/
   -> worker container: agent works and commits; orchestrator streams tool calls to log.jsonl
   -> judge container: Codex reviews a fresh clone, writes findings + VERDICT
   -> not VERIFIED and rounds left: worker container again with the findings; else continue
-  -> push container pushes the branch; host opens the PR only on VERIFIED or CAVEATS
+  -> push container pushes the branch
+  -> verification gate (VERIFIED or CAVEATS, cheap gates clean): review container (fresh Claude, break-it lens, JSON BLOCKs with repro commands)
+     -> verify container (no model, no credential: each repro at head and at base, the differential test checks)
+     -> a reproduced BLOCK: one worker round and one judge round with the facts, push, gate again; else the host opens the PR
   -> containers removed, manifest finalized (judge rounds and verdict recorded)
   -> human reviews and merges
 ```
@@ -112,6 +124,8 @@ Status is Implemented, Partial, or Planned. Each has a check that proves it. (re
 - `README.md` ("Writing tasks"): task-writing conventions for unattended runs; `factory lint` checks a queue against them and `batch` refuses to start on problems.
 - `factory`: orchestrator script (`run`, `lint`, `batch`, `report`, `stop`). `batch` is the overnight loop (section below). `run` exits with the worker's status, or 3 when the agent produced no commits (nothing pushed), 4 when the branch was pushed but opening the PR failed, 5 when the judge refuted the final round (pushed, no PR), 6 when the judge gave no verdict (pushed, no PR).
 - `test-factory.sh`: runs the orchestrator against stubbed `docker` and `curl` and checks the revise / refuted / no-verdict / caveats paths, CRLF, doubled and oversize verdict files, the judged-round count, log redaction, lint and batch (chain, refuted chain, `--max-tasks`, `--stop-at`, HALT between tasks, `--no-chain`, `--continue`, a declared dependency on a failed task, a run killed before its cleanup, task files byte-identical after the move), the GitHub App path (installation lookup, 404, refused mint, PR open, PR reconciliation, chained PRs targeting `base_branch`) and `stop` with docker down. Every fix for a misreported outcome lands with a case here that fails against the previous script.
+- `review-prompt.md`: the verification gate's reviewer, the break-it lens, JSON findings with a repro command per BLOCK; read from this checkout.
+- `verify.js`: the verifier, mounted read-only into the `verify` container like `proxy.js`; runs the repro commands and the differential test checks, records exit codes only.
 - `queue/`, `runs/`: task intake and per-run evidence. Not in the image.
 
 ## Batch and overnight runs
@@ -247,7 +261,8 @@ Status is Implemented, Partial, or Planned. Each has a check that proves it. (re
   config ID the run must match (`FACTORY_ALLOW_DIRTY=1` runs anyway and the manifest says `image_pinned:false`);
   the laptop's ID is committed, so the mini's first pull refuses until the bump PR, which is the two-step rollout in
   the README. Model pins and the worker's `--max-budget-usd` go in as `-e` on the fixed line and the entrypoint
-  requires them (`${VAR:?}`); `model`, `judge_model`, `budget_usd` and `worker.rounds[]` (status, reported cost,
+  requires them (`${VAR:?}`) (the spend cap was dropped with loop 0 on 2026-11-02: no spend ceiling, the cost record stays; an unknown
+  mode in `run_container` now dies instead of getting the push allowlist); `model`, `judge_model`, `budget_usd` and `worker.rounds[]` (status, reported cost,
   turns, duration per round, null when the round left no `result` event) are in the manifest and `report` has a
   COST column. Every log line now carries `mode` and `round`. `run_container` reads the whole `PIPESTATUS` array;
   a failed redaction loop, `redact` or `jq` is `outcome:"evidence_error"`, exit 12, nothing further runs, nothing
