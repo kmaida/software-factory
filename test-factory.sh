@@ -55,15 +55,20 @@ while [ $# -gt 0 ]; do case "$1" in
 # The step's proxy (`run -d … --entrypoint node`): record its allowlist and pretend to start.
 [ -z "$detached" ] || { [ -z "${STUB_ALLOW:-}" ] || echo "${ALLOW:-}" >> "$STUB_ALLOW"; echo stub-proxy; exit 0; }
 IFS= read -r secret; echo "stub $mode secret=$secret net=$net proxy=${HTTPS_PROXY:-} npm=${NPM_CONFIG_IGNORE_SCRIPTS:-}/${NPM_CONFIG_BEFORE:-} model=${FACTORY_MODEL:-}/${FACTORY_BUDGET_USD:-}/${JUDGE_MODEL:-}"
-# The worker leaks its secret encoded and a token by shape, and ends with Claude Code's cost event.
-[ "$mode" != work ] || { echo "b64=$(printf '%s' "$secret" | base64) shape=sk-ant-$(printf 'x%.0s' $(seq 24))"; echo '{"type":"result","total_cost_usd":0.12,"num_turns":3,"duration_ms":100}'; }
+# The worker leaks its secret encoded and a token by shape, and ends with Claude Code's cost event. STUB_PROMPT: the prompt's task_id line is kept there.
+[ "$mode" != work ] || { [ -z "${STUB_PROMPT:-}" ] || printf '%s\n' "${args[$((${#args[@]}-1))]}" | grep -m1 '^task_id:' > "$STUB_PROMPT" || true; echo "b64=$(printf '%s' "$secret" | base64) shape=sk-ant-$(printf 'x%.0s' $(seq 24))"; echo '{"type":"result","total_cost_usd":0.12,"num_turns":3,"duration_ms":100}'; }
 case "$mode" in
   work) cd "$work"; git checkout -q "factory/$TASK_ID" 2>/dev/null || git checkout -qb "factory/$TASK_ID" "origin/$BASE_BRANCH"
         [ "${STUB_KILL_RUN:-}" = "$TASK_ID" ] && kill -9 "$(cat "$STUB_LOCK_PID")"   # the orchestrator dies mid-run, before its cleanup
         [ "${STUB_WORK_IDLE_ROUND:-0}" = "$(git rev-list --count "origin/$BASE_BRANCH..HEAD" | xargs -I{} expr {} + 1)" ] && exit 0
         [ "${STUB_WORK_FAIL_ROUND:-0}" = "$(git rev-list --count "origin/$BASE_BRANCH..HEAD" | xargs -I{} expr {} + 1)" ] && exit 7
-        if [ "${STUB_WORK_BLOCKED:-}" = "$TASK_ID" ]; then [ -e "docs/BLOCKED-$TASK_ID.md" ] && exit 0   # the note only; a revision round changes nothing
+        if [ "${STUB_WORK_BLOCKED:-}" = "$TASK_ID" ]; then   # the note; STUB_NOTE: code (on top of a change), dep (beside a manifest change), deleted (written, committed, removed), dir (a directory at the note's path: not a note), replace (round 2: code, plus a replace ref that makes the real head read as a note commit), round2 (code in round 1, the note in round 2)
+          r=$(git rev-list --count "origin/$BASE_BRANCH..HEAD"); case "${STUB_NOTE:-}" in code|deleted) echo x >> work.log;; replace) [ "$r" -ge 1 ] || { echo x >> work.log; git add -A; git -c commit.gpgsign=false -c user.name=w -c user.email=w@w commit -qm round; exit 0; }
+            echo y >> work.log; git add -A; git -c commit.gpgsign=false -c user.name=w -c user.email=w@w commit -qm code; real=$(git rev-parse HEAD)
+            mkdir -p docs; echo '# BLOCKED' > "docs/BLOCKED-$TASK_ID.md"; git add -A; git -c commit.gpgsign=false -c user.name=w -c user.email=w@w commit -qm note; git replace -f "$real" "$(git rev-parse HEAD)"; git reset -q --hard "$real"; exit 0;;   # the real head reads as the note commit through refs/replace
+          dir) mkdir -p "docs/BLOCKED-$TASK_ID.md"; echo x > "docs/BLOCKED-$TASK_ID.md/x"; echo x >> work.log; git add -A; git -c commit.gpgsign=false -c user.name=w -c user.email=w@w commit -qm round; exit 0;; dep) echo x > package-lock.json;; round2) [ "$r" -ge 1 ] || { echo x >> work.log; git add -A; git -c commit.gpgsign=false -c user.name=w -c user.email=w@w commit -qm round; exit 0; };; esac
           mkdir -p docs; printf '# BLOCKED: %s\n\nno "url" column on sandboxes\nmore\n' "$TASK_ID" > "docs/BLOCKED-$TASK_ID.md"
+          [ "${STUB_NOTE:-}" != deleted ] || { git add -A; git -c commit.gpgsign=false -c user.name=w -c user.email=w@w commit -qm note; git rm -q "docs/BLOCKED-$TASK_ID.md"; }
         elif [ -n "${STUB_CONFLICT:-}" ] && [ "${STUB_CONFLICT_TASK:-$TASK_ID}" = "$TASK_ID" ]; then echo worker > README.md   # STUB_CONFLICT_TASK: only that task conflicts
         elif [ -n "${STUB_WORK_DEP:-}" ]; then mkdir -p apps/wéb; echo x > apps/wéb/package-lock.json   # a nested manifest, in a path git quotes in --name-only output
         else echo "${args[0]}" >> work.log; fi
@@ -74,7 +79,7 @@ case "$mode" in
          [ -z "${STUB_CONFLICT:-}" ] || [ "${STUB_CONFLICT_TASK:-$TASK_ID}" != "$TASK_ID" ] || ( git clone -q "$STUB_CONFLICT" "$out/c" && cd "$out/c" && echo moved > README.md && git -c commit.gpgsign=false -c user.name=m -c user.email=m@m commit -qam moved && git push -q origin HEAD:main ) || true   # already moved on a retry's round
          [ -z "${STUB_DROP_BASE:-}" ] || git -C "$STUB_DROP_BASE" update-ref -d refs/heads/main   # STUB_DROP_BASE=<remote>: the PR target vanishes, so the base fetch fails
          [ "$HEAD_SHA" = "$(git -C "$src" rev-parse "refs/heads/factory/$TASK_ID")" ] || { echo "stub: HEAD_SHA mismatch" >&2; exit 9; }
-         case "${args[$((${#args[@]}-1))]}" in *"## Your findings on the previous round (round $((n-1)), verdict REFUTED)"*"finding 1: fix it"*) echo "stub judge: saw previous findings";; esac
+         p=$(git -C "$src" rev-parse "refs/heads/factory/$TASK_ID~1"); case "${args[$((${#args[@]}-1))]}" in *"## Facts observed by the orchestrator"*"judged at $p and ended REFUTED"*"## Claims from the previous round's reviewer (round $((n-1)), verdict REFUTED)"*"about $p."*"finding 1: fix it"*) echo "stub judge: saw previous findings";; esac
          # NONE: a judge that fails after something (the worker, say) preseeded a passing verdict; it must not count.
          [ "$v" = NONE ] && { echo 'VERDICT: VERIFIED' > "$out/verdict.md"; exit 1; }
          case "$v" in
@@ -99,7 +104,7 @@ chmod +x "$t/bin/"*
 run() {  # run <task_id> <verdicts> -> prints exit status; RUN_REPO overrides the local bare repo (a GitHub owner/name goes through the App path); RUN_INSTR the instructions (JSON-escaped)
   echo "{\"repo\":\"${RUN_REPO:-$t/remote.git}\",\"base_branch\":\"main\",\"task_id\":\"$1\",\"instructions\":\"${RUN_INSTR:-do the thing}\"}" > "$t/$1.json"
   rm -f "$t/state" "$t/allow" "$t/logs"; set +e   # FACTORY_MAX_ROUNDS=3: the verdict fixtures below are written for three rounds; one case sets 5
-  PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_ALLOW="$t/allow" STUB_LOGS="$t/logs" STUB_APP_KEY="$t/app-key.b64" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_MAX_ROUNDS="${FACTORY_MAX_ROUNDS:-3}" \
+  PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_ALLOW="$t/allow" STUB_LOGS="$t/logs" STUB_PROMPT="$t/prompt" STUB_APP_KEY="$t/app-key.b64" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_MAX_ROUNDS="${FACTORY_MAX_ROUNDS:-3}" \
     "$here/factory" run "$t/$1.json" >"$t/$1.out" 2>&1; rc=$?; set -e
   echo "$rc"
 }
@@ -107,7 +112,7 @@ check() { [ "$1" = "$2" ] || { echo "FAIL: $3: got '$1' want '$2'"; cat "$t/"*.o
 runs="$here/runs"
 rc=$(run t1 "REFUTED,VERIFIED"); m=$(ls -d "$runs"/*-t1 | tail -1)
 check "$rc" 0 "t1 exit"; check "$(jq -r .judge.verdict "$m/manifest.json")" VERIFIED "t1 verdict"; check "$(jq -r .judge.rounds "$m/manifest.json")" 2 "t1 rounds"
-check "$(grep -c 'stub judge: saw previous findings' "$m/log.jsonl")" 1 "t1 round 2 judge got round 1's findings, round 1 got none"
+check "$(grep -c 'stub judge: saw previous findings' "$m/log.jsonl")" 1 "t1 round 2 judge got round 1's findings as claims, with the judged sha as a fact; round 1 got none"
 check "$(ls "$m" | grep -c judge-)" 2 "t1 judge files"; check "$(git -C "$t/remote.git" rev-parse refs/heads/factory/t1)" "$(jq -r .final_sha "$m/manifest.json")" "t1 pushed the judged commit"
 # The App bot identity reached `docker run` as git env: the stub commits with -c user.name=w, and env wins, so the pushed commit carries it.
 bot='kmaida-software-factory[bot] <424243+kmaida-software-factory[bot]@users.noreply.github.com>'
@@ -282,12 +287,12 @@ grep -q '^notify: off (FACTORY_NOTIFY_URL not set)$' "$t/batch.out" && grep -q '
 # that passes recovers the task (exit 0, the chain goes on from the retry's branch). A retry that fails the same way is the task's own
 # failure (exit 6 stands, no second retry, counted as failed). Nothing pushed (a run killed in round 1): the file stays in the queue
 # under its own id. Two infra failures in a row from different tasks (a proxy that never listens) stop the batch with the queue intact.
-queue ir 005-ir-z 010-ir-a 020-ir-b; rc=$(FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/ir" "VERIFIED,NONE,VERIFIED,VERIFIED")
+queue ir 005-ir-z 020-ir-b; task "$t/remote.git" main 010-ir-a 'Goal: g.\nContext: c.\nScope: s.\nDone when: tests pass.\nOut of scope: o. If stuck commit docs/BLOCKED-010-ir-a.md.' "$t/ir"; rc=$(FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/ir" "VERIFIED,NONE,VERIFIED,VERIFIED")
 check "$rc" 0 "infra retry: recovered, exit 0"; check "$(moved ir/failed)" "010-ir-a.json " "infra retry: the attempt is archived"; check "$(moved ir/done)" "005-ir-z.json 010-ir-a-i1.json 020-ir-b.json " "infra retry: the retry ran next and passed"
 m=$(ls -d "$runs"/*-010-ir-a | tail -1); check "$(jq -r '"\(.class) \(.pushed) \(.exit_status)"' "$m/manifest.json")" "infra true 6" "infra retry: original classed infra, pushed"
 m=$(ls -d "$runs"/*-010-ir-a-i1 | tail -1); check "$(jq -r .chain_base "$m/manifest.json")" "factory/005-ir-z" "infra retry: the retry is cut from the same chain base"
 m=$(ls -d "$runs"/*-020-ir-b | tail -1); check "$(jq -r .chain_base "$m/manifest.json")" "factory/010-ir-a-i1" "infra retry: the chain goes on from the retry's branch"
-check "$(jq -r .task_id "$t/ir/done/"*-010-ir-a-i1.json)" 010-ir-a-i1 "infra retry: task_id in the retry file"
+check "$(jq -r '"\(.task_id) \(.instructions | split("docs/BLOCKED-010-ir-a-i1.md") | length)"' "$t/ir/done/"*-010-ir-a-i1.json)" "010-ir-a-i1 2" "infra retry: task_id in the retry file, and the note path in its text follows it"
 check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" "010-ir-a exited 6 (infra: exit 6, retrying as 010-ir-a-i1)
 done: 4 run, 0 PR(s), 0 failed, 1 infra. All tasks ran." "infra retry: notify names the retry; the summary counts infra apart"; rm -f "$t/notify"
 # A hand-queued <id>-i1 after its base passed: the base id's standing is its last run, so the batch exits with the -i1's failure.
@@ -360,13 +365,14 @@ check "$rc" 137 "killed run: batch exit"; check "$(jq -r .exit_status "$m/manife
 check "$(moved kl)" "010-kl-a.json " "killed run: infra with nothing pushed stays in the queue under its own id"
 rep=$(ls "$runs"/batch-*.md | tail -1); grep -q '010-kl-a | 137 |.*| nothing pushed; left in queue |' "$rep" || { echo "FAIL: killed run row"; cat "$rep"; exit 1; }
 rc=$(batch "$t/lint-bad" VERIFIED); check "$rc" 1 "batch refuses bad queue"; grep -q 'fix the queue before batching' "$t/batch.out" || { echo "FAIL: refusal message"; exit 1; }
-# Blocked: 010's only change is docs/BLOCKED-010-bk-a.md, so even a REFUTED verdict ends as exit 10, outcome blocked, no PR, and the
-# note's first body line reaches the notification (its quotes escaped, so the curl config line survives) and the summary counts it apart.
-# 020 then runs on main (no task has passed yet) and passes. requeue copies 010 back as 010-bk-a-r1 with the reason appended, then -r2.
+# Blocked: 010 writes docs/BLOCKED-010-bk-a.md in round 1, so the run ends before any judge round (rounds 0, verdict null), pushed, exit 10,
+# outcome blocked, no PR; the note's first body line reaches the notification (its quotes escaped, so the curl config line survives) and the
+# summary counts it apart. 020 then runs on main (no task has passed yet) and passes. requeue copies 010 back as 010-bk-a-r1 with the reason appended, then -r2.
 queue bk 010-bk-a 020-bk-b
-rc=$(STUB_WORK_BLOCKED=010-bk-a FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/bk" "REFUTED,VERIFIED" --continue)
+rc=$(STUB_WORK_BLOCKED=010-bk-a FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/bk" "VERIFIED" --continue)
 check "$rc" 10 "blocked batch exit"; m=$(ls -d "$runs"/*-010-bk-a | tail -1)
-check "$(jq -r '"\(.outcome) \(.reason) \(.pr_url) \(.judge.verdict)"' "$m/manifest.json")" 'blocked no "url" column on sandboxes null REFUTED' "blocked manifest: outcome, reason, no PR, verdict kept"
+check "$(jq -r '"\(.outcome) \(.reason) \(.pr_url) \(.judge.rounds) \(.judge.verdict) \(.pushed) \(.class)"' "$m/manifest.json")" 'blocked no "url" column on sandboxes null 0 null true task' "blocked manifest: outcome, reason, no PR, no judge round, pushed, task"
+check "$(grep -c 'stub judge' "$m/log.jsonl")" 0 "blocked: no judge container ran"; check "$(ls "$m" | grep -c judge-)" 0 "blocked: no judge file"
 check "$(moved bk/failed)" "010-bk-a.json " "blocked -> failed/"; check "$(moved bk/done)" "020-bk-b.json " "blocked: the next task still ran"
 check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" '010-bk-a exited 10 (blocked, continuing): no \"url\" column on sandboxes
 done: 2 run, 0 PR(s), 0 failed, 1 blocked. All tasks ran.' "notify: reason on the phone, blocked counted apart from failed"; rm -f "$t/notify"
@@ -382,6 +388,26 @@ case "$i" in *"Previous attempt (020-rf-b): judge REFUTED after 3 round(s). Find
 find "$runs" -maxdepth 1 -newer "$t/secrets" \( -name 'batch-*.md' -o -name '*-0[0-9][0-9]-[a-z][a-z]-[a-z]' -o -name '*-0[0-9][0-9]-[a-z][a-z]-[a-z]-i1' \) -exec rm -rf {} +   # only what this test made
 rc=$(STUB_WORK_IDLE_ROUND=2 run t6 "CAVEATS"); m=$(ls -d "$runs"/*-t6 | tail -1)
 check "$rc" 0 "t6 exit (caveats, idle revision ships)"; check "$(jq -r .judge.rounds "$m/manifest.json")" 1 "t6 rounds counts judged rounds only"
+# The note at the pushed head decides blocked, not "the only change": a note on top of code is blocked (no judge, exit 10, never a PR); a note
+# written in round 2 after a REFUTED round 1 ends the run with round 1's record; a note committed then deleted is not at head and ships; a note
+# beside a manifest change is the manifest refusal (exit 14), which sits ahead of blocked.
+rc=$(STUB_WORK_BLOCKED=t15 STUB_NOTE=code run t15 VERIFIED); m=$(ls -d "$runs"/*-t15 | tail -1)
+check "$rc" 10 "t15 exit (note on top of code is blocked)"; check "$(jq -r '"\(.outcome) \(.judge.rounds) \(.judge.verdict) \(.pr_url)"' "$m/manifest.json")" "blocked 0 null null" "t15 no judge round, no PR"; check "$(grep -c 'stub judge' "$m/log.jsonl")" 0 "t15 no judge container"
+rc=$(STUB_WORK_BLOCKED=t16 STUB_NOTE=round2 run t16 REFUTED); m=$(ls -d "$runs"/*-t16 | tail -1)
+check "$rc" 10 "t16 exit (note in round 2)"; check "$(jq -r '"\(.outcome) \(.judge.rounds) \(.judge.verdict) \(.class)"' "$m/manifest.json")" "blocked 1 REFUTED task" "t16 round 1's record kept, blocked wins over refuted"; check "$(ls "$m" | grep -c judge-)" 1 "t16 one judge file"
+rc=$(STUB_WORK_BLOCKED=t17 STUB_NOTE=deleted run t17 VERIFIED); m=$(ls -d "$runs"/*-t17 | tail -1)
+check "$rc" 0 "t17 exit (a deleted note is not at head)"; check "$(jq -r '"\(.outcome // "none") \(.judge.rounds)"' "$m/manifest.json")" "none 1" "t17 judged and shipped"
+rc=$(STUB_WORK_BLOCKED=t18 STUB_NOTE=dep run t18 VERIFIED); m=$(ls -d "$runs"/*-t18 | tail -1)
+check "$rc" 14 "t18 exit (manifest gate ahead of blocked)"; check "$(jq -r .outcome "$m/manifest.json")" dependency_change "t18 outcome"
+rc=$(STUB_WORK_BLOCKED=t19 STUB_NOTE=dir run t19 VERIFIED); m=$(ls -d "$runs"/*-t19 | tail -1)
+check "$rc" 0 "t19 exit (a directory at the note's path is not a note: judged, shipped)"; check "$(jq -r '"\(.outcome // "none") \(.judge.rounds) \(.judge.verdict)"' "$m/manifest.json")" "none 1 VERIFIED" "t19 judged normally"
+# The loop's note check reads the worker's checkout, which can carry a refs/replace entry that makes the real head read as a note commit. The
+# check ignores replacements (--no-replace-objects), so the judge still runs on the real head and the verdict is about the head that is pushed.
+rc=$(STUB_WORK_BLOCKED=t20 STUB_NOTE=replace run t20 "CAVEATS,VERIFIED"); m=$(ls -d "$runs"/*-t20 | tail -1)
+check "$rc" 0 "t20 exit (a replace ref does not skip the judge)"; check "$(jq -r '"\(.outcome // "none") \(.judge.rounds) \(.judge.verdict)"' "$m/manifest.json")" "none 2 VERIFIED" "t20 round 2 was judged"; check "$(grep -c 'stub judge' "$m/log.jsonl")" 2 "t20 two judge rounds ran"
+rc=$(STUB_WORK_BLOCKED=t21 STUB_NOTE=round2 run t21 CAVEATS); m=$(ls -d "$runs"/*-t21 | tail -1)
+check "$rc" 10 "t21 exit (note in round 2 after CAVEATS does not ship)"; check "$(jq -r '"\(.outcome) \(.judge.rounds) \(.judge.verdict) \(.pr_url)"' "$m/manifest.json")" "blocked 1 CAVEATS null" "t21 blocked wins over caveats"
+check "$(cat "$t/prompt")" 'task_id: t21 (a blocked note is docs/BLOCKED-t21.md)' "t21 worker prompt names the task_id and note path"
 # Verdict parsing fails closed: CRLF is normalised (else VERIFIED\r equals no verdict); two VERDICT lines, or a review the bounded
 # read cut (its first 200000 bytes end in a clean VERDICT line), are no verdict. A worker that fails in round 1 has zero judged rounds.
 rc=$(run t7 CRLF); m=$(ls -d "$runs"/*-t7 | tail -1); check "$rc" 0 "t7 exit (CRLF verdict)"; check "$(jq -r '"\(.judge.verdict) \(.judge.rounds)"' "$m/manifest.json")" "VERIFIED 1" "t7 verdict without \\r"
@@ -398,8 +424,10 @@ rc=$(STUB_DROP_BASE="$t/remote.git" run t14 VERIFIED); m=$(ls -d "$runs"/*-t14 |
 check "$rc" 12 "t14 exit (base fetch failed)"; check "$(jq -r '"\(.outcome) \(.pr_url)"' "$m/manifest.json")" "gate_error null" "t14 outcome gate_error, no PR"
 ( cd "$t/seed" && git push -q origin HEAD:main )   # put main back
 # requeue numbering reads task_id literally: 010-x.y-r2 (zero-padded r08 also counted as 8) -> next is -r9; 020-010-x.y-r5 is another task.
-mkdir -p "$t/rq/failed"; task o/r main 010-x.y "$body" "$t/rq/failed"; task o/r main 010-x.y-r08 "$body" "$t/rq"; task o/r main 020-010-x.y-r5 "$body" "$t/rq"
+mkdir -p "$t/rq/failed"; task o/r main 010-x.y 'Goal: g. If stuck commit docs/BLOCKED-010-x.y.md (not docs/BLOCKED-010-xzy.md).\nDone when: y.' "$t/rq/failed"; task o/r main 010-x.y-r08 "$body" "$t/rq"; task o/r main 020-010-x.y-r5 "$body" "$t/rq"
 "$here/factory" requeue "$t/rq/failed/010-x.y.json" > /dev/null; check "$(ls "$t/rq"/*.json | xargs -n1 basename | tr '\n' ' ')" "010-x.y-r08.json 010-x.y-r9.json 020-010-x.y-r5.json " "requeue numbering"
+check "$(jq -r .instructions "$t/rq/010-x.y-r9.json")" 'Goal: g. If stuck commit docs/BLOCKED-010-x.y-r9.md (not docs/BLOCKED-010-xzy.md).
+Done when: y.' "requeue rewrites the note path in the task text to the new id (literally: the dot is not a wildcard)"
 # The default round limit is five: four refusals then VERIFIED ships with rounds 5.
 rc=$(FACTORY_MAX_ROUNDS=5 run t13 "REFUTED,REFUTED,REFUTED,REFUTED,VERIFIED"); m=$(ls -d "$runs"/*-t13 | tail -1)
 check "$rc" 0 "t13 exit (five rounds)"; check "$(jq -r '"\(.judge.rounds) \(.judge.verdict)"' "$m/manifest.json")" "5 VERIFIED" "t13 rounds"
@@ -486,4 +514,4 @@ mkdir -p "$runs/stoptest"; echo '{"ended_at":null,"exit_status":null}' > "$runs/
 PATH="$t/bin:$PATH" STUB_DOCKER_PS_FAIL=1 "$here/factory" stop stoptest > "$t/stop.out" 2>&1 || { echo "FAIL: stop with docker down exited $?"; cat "$t/stop.out"; exit 1; }
 check "$(jq -r '"\(.exit_status) \(.outcome) \(.class)"' "$runs/stoptest/manifest.json")" "137 stopped task" "stop with docker down records the incident; a stopped task is class task (never re-dispatched by the batch)"; rm -f "$here/HALT"; rm -rf "$runs/stoptest"
 find "$runs" -mindepth 1 -maxdepth 1 -newer "$t/secrets" -exec rm -rf {} +   # everything the run tree gained since this test began is the test's (the lock keeps a real run out)
-echo "ok: egress (per-step proxy, allowlists, network record, dead proxy, lost record), pins (image id, model, budget), cost per round and report, evidence error (worker, judge), redaction (encoded, by shape: log, judge file, PR body), supply chain (credential in tree, in task, in lint; dependency manifest gate and its Scope permission; npm policy; requeue notes), judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, five rounds, App bot commit identity and its failed lookup), gates (blocked note, conflict with the target), lint, batch (chain, refuted chain, chain after a failure, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run left in queue, blocked reason on the phone, notify host and off state, failed POST visible, infra retry recovered / failed the same way / conflict cut from its own base / conflict mid-chain not retried, hand-queued -i1 after a pass, circuit breaker, pr_failed chains, a stopped run is class task, depends_on: passed tonight / not merged waits / merged runs / no-chain waits / queued waits / dead notified and non-zero / pruned record unknown / worst dependency decides / declared base waiting / GitHub merged, open, reverted by exact title, 502 and 403 unknown, merged elsewhere dead / one cached read-only token), class and pushed in the manifest, lint depends_on (graph, later, self, unknown, other repo, schema, id grammar, malformed archive), requeue (blocked, refuted, skipped), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), stop with docker down"
+echo "ok: egress (per-step proxy, allowlists, network record, dead proxy, lost record), pins (image id, model, budget), cost per round and report, evidence error (worker, judge), redaction (encoded, by shape: log, judge file, PR body), supply chain (credential in tree, in task, in lint; dependency manifest gate and its Scope permission; npm policy; requeue notes), judge loop (revise with facts and claims apart, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, five rounds, App bot commit identity and its failed lookup), gates (blocked: round-1 note skips the judge, note on code, note in round 2 after REFUTED and after CAVEATS, deleted note, a directory is not a note, a replace ref does not skip the judge, manifest ahead of blocked; the worker prompt names the note path; conflict with the target), lint, batch (chain, refuted chain, chain after a failure, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run left in queue, blocked reason on the phone, notify host and off state, failed POST visible, infra retry recovered / failed the same way / conflict cut from its own base / conflict mid-chain not retried, hand-queued -i1 after a pass, circuit breaker, pr_failed chains, a stopped run is class task, depends_on: passed tonight / not merged waits / merged runs / no-chain waits / queued waits / dead notified and non-zero / pruned record unknown / worst dependency decides / declared base waiting / GitHub merged, open, reverted by exact title, 502 and 403 unknown, merged elsewhere dead / one cached read-only token), class and pushed in the manifest, lint depends_on (graph, later, self, unknown, other repo, schema, id grammar, malformed archive), requeue (blocked, refuted, skipped), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), stop with docker down"

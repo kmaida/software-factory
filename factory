@@ -88,6 +88,14 @@ END_JQ='.class = ('"$CLASS_JQ"') | .pushed = (if .pushed == null then (if .push_
 ID_RE='^[A-Za-z0-9._-]+$'; BRANCH_RE='^[A-Za-z0-9._/-]+$'
 now()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
 redact() { sed -l -E "s/$CRED_RE/[REDACTED]/g"; }   # by shape, for text that leaves the run: a token the orchestrator never held is caught too; a split token is not
+note_at() {  # note_at <git dir> <sha>: 0 when docs/BLOCKED-$task_id.md is a regular file at <sha>, 1 when it is not there (or is a directory or
+  # symlink, which is not a note), 2 when git could not say. ls-tree, not cat-file -e: a missing path and a broken repo both exit 128 there,
+  # and "could not say" must never read as "no note" (a round-1 note would then end as "no verdict"). --no-replace-objects: the worker's
+  # checkout can carry refs/replace/* that make the real head read as another commit.
+  # stderr apart from stdout: a warning on a successful listing (the worker can plant an ambiguous ref name in its checkout) must not read as "no note".
+  m=$(git --no-replace-objects -C "$1" ls-tree "$2" -- "docs/BLOCKED-$task_id.md" 2>"$rundir/.lstree") || { log "ls-tree $2 in $1 failed: $(head -c 500 "$rundir/.lstree")"; rm -f "$rundir/.lstree"; return 2; }
+  rm -f "$rundir/.lstree"; case "$m" in 100644*|100755*) return 0 ;; *) return 1 ;; esac
+}
 scope_of() { printf '%s\n' "$1" | awk '/^Scope:/ && !d {f=1} /^Done when:/{f=0; d=1} f'; }   # the task's own Scope section, once: a "Scope:" line in findings that requeue appended is not one
 notify() {  # notify <line>: POST "<batch_id>: <line>" to FACTORY_NOTIFY_URL when set. URL and body via curl config on stdin, not argv (the URL may carry a token).
   [ -n "${FACTORY_NOTIFY_URL:-}" ] || return 0
@@ -382,10 +390,10 @@ cmd_run() {
   # the judge has the Codex key, the push has the GitHub token. The judge reviews a fresh clone of the worker's checkout and
   # ends with a VERDICT line; anything but VERIFIED sends its findings back to the worker for a revision round, up to MAX_ROUNDS.
   # Nothing is pushed until the rounds are over, so no human sees the code before the judge has.
-  round=1 judged=0 verdict= findings= head= prev_head= status=0
+  round=1 judged=0 verdict= findings= head= prev_head= jhead= status=0
   while :; do
     # Every worker round opens with the house rules (least code that satisfies "Done when"), read from this checkout like the judge prompt.
-    prompt="$(cat "$FACTORY_DIR/worker-prompt.md")"$'\n\n'"## Task"$'\n'"$instructions"
+    prompt="$(cat "$FACTORY_DIR/worker-prompt.md")"$'\n\n'"## Task"$'\n'"task_id: $task_id (a blocked note is docs/BLOCKED-$task_id.md)"$'\n'"$instructions"
     [ -n "$findings" ] && prompt="$prompt"$'\n\n'"## Review of your previous attempt (round $((round-1)) verdict: $verdict)"$'\n'"The reviewer refused the branch as it stands. Fix every finding below on the current branch, keep the task's scope, and commit. Findings:"$'\n'"$findings"
     an_tok=$(anthropic_token) || an_tok=; [ -n "$an_tok" ] || die "Anthropic did not exchange the Keycard token (rule $ANTHROPIC_FEDERATION_RULE, workspace $ANTHROPIC_WORKSPACE)"
     log "round $round: anthropic_token issued (Keycard $KEYCARD_ZONE -> Anthropic WIF rule $ANTHROPIC_FEDERATION_RULE, workspace $ANTHROPIC_WORKSPACE); ttl ${TIMEOUT_SEC}s"
@@ -398,13 +406,18 @@ cmd_run() {
     head=$(git -C "$work" rev-parse --verify -q "refs/heads/factory/$task_id") || die "worker exited 0 but factory/$task_id does not exist"
     if [ "$head" = "$prev_head" ]; then log "round $round: no new commits; the round $((round-1)) verdict stands"; round=$((round-1)); break; fi   # rounds = judged rounds
     prev_head=$head
+    # The worker's note ends the run before the judge: nothing to review, and the reason reaches the gate below (exit 10). A round-1
+    # note is judge:{rounds:0, verdict:null}; a later one keeps the earlier rounds' record.
+    nr=0; note_at "$work" "$head" || nr=$?; [ "$nr" -ne 2 ] || die "cannot read $head in the worker's checkout"
+    if [ "$nr" -eq 0 ]; then log "round $round: docs/BLOCKED-$task_id.md is at $head; no judge round"; break; fi
 
     oa_key=$(openai_key) || oa_key=; [ -n "$oa_key" ] || die "no Codex key (Keycard $OPENAI_RESOURCE)"
     log "round $round: openai_key issued (Keycard $KEYCARD_ZONE resource $OPENAI_RESOURCE)"
     jwork=$(mktemp -d "${TMPDIR:-/tmp}/factory-judge.XXXXXX"); jout=$(mktemp -d "${TMPDIR:-/tmp}/factory-judge-out.XXXXXX")
     jprompt="$(cat "$FACTORY_DIR/judge-prompt.md")"$'\n\n'"## Round"$'\n'"$round of $MAX_ROUNDS"$'\n\n'"## Commits"$'\n'"Base: $base_sha"$'\n'"Head: $head"$'\n\n'"## Task given to the agent"$'\n'"$instructions"
-    # The judge sees its own previous findings, so it can mark each finding NEW or REPEAT; the worker's fix is judged against them.
-    [ -z "$findings" ] || jprompt="$jprompt"$'\n\n'"## Your findings on the previous round (round $((round-1)), verdict $verdict)"$'\n'"$findings"
+    # A fresh judge session each round. What the orchestrator saw (which commit the last round judged, what the agent committed since) is
+    # one section; the previous round's findings are another, marked as another party's claims: REPEAT only when re-established at this head.
+    [ -z "$findings" ] || jprompt="$jprompt"$'\n\n'"## Facts observed by the orchestrator"$'\n'"Round $((round-1)) was judged at $jhead and ended $verdict. The agent then committed; this round's head is $head (\`git log $jhead..$head\`)."$'\n\n'"## Claims from the previous round's reviewer (round $((round-1)), verdict $verdict)"$'\n'"Another reviewer session wrote these about $jhead. They are claims, not facts: mark one REPEAT only after re-establishing it at $head."$'\n'"$findings"
     run_container judge "$oa_key" -v "$work":/src:ro -v "$jwork":/work -v "$jout":/out -e HEAD_SHA="$head" -- "$jprompt"
     jstatus=$status; status=0   # the worker succeeded; a failed judge is a missing verdict (exit 6 below), not a failed run
     # The verdict counts only if the judge exited 0 and left a regular file in /out, a mount the repository cannot reach.
@@ -425,7 +438,7 @@ cmd_run() {
     if [ -z "$oversize" ] && [ "$(printf '%s\n' "$findings" | grep -c '^VERDICT:')" -eq 1 ]; then
       verdict=$(printf '%s\n' "$findings" | sed -e '/^[[:space:]]*$/d' | tail -1 | grep -E '^VERDICT: (VERIFIED|CAVEATS|REFUTED)[[:space:]]*$' | awk '{print $2}' || true)
     fi
-    judged=$((judged+1))
+    judged=$((judged+1)); jhead=$head   # jhead: the commit this round's review is about, for the next round's facts section
     # Persist what is known now: a later failure (push token, HALT, a kill) must not leave the manifest without the judge's word.
     manifest_set '. + {judge:{rounds:$n, verdict:(if $v=="" then null else $v end)}}' --argjson n "$judged" --arg v "$verdict"
     log "round $round: judge verdict ${verdict:-NONE}${oversize:+ (review over 200000 bytes)} (container status $jstatus, $(printf '%s' "$findings" | wc -c | tr -d ' ') bytes)"
@@ -437,7 +450,7 @@ cmd_run() {
   done
   wstatus=$status
 
-  # Push the last judged commit whenever there is one (evidence, and the human's starting point if they want it), even when a
+  # Push the last commit whenever there is one (the judged commit, or a blocked note; evidence, and the human's starting point), even when a
   # later revision round failed, with a fresh token the agents never held. A round-1 worker that fails leaves nothing to push. Then the PR: only when every worker round succeeded and
   # the verdict is VERIFIED or CAVEATS. REFUTED exits 5 and NONE exits 6, both without a PR.
   final_sha=${head:-null}; pr_url=; pushed=false; push_status=null
@@ -465,28 +478,33 @@ cmd_run() {
       # The diff can fail too: a worker that rewrote the branch's ancestry leaves base_sha unreachable from either fetched ref.
       files=; [ "$gt" -ne 0 ] || files=$(git -C "$gate" diff --name-only "$base_sha" "$head" 2>&1) || { gt=1; gto="diff $base_sha..$head: $files"; }
       if [ "$gt" -ne 0 ]; then manifest_set '. + {outcome:"gate_error"}'; log "gate fetch or diff of $base_branch and factory/$task_id failed (git exit $gt); no PR. ${gto:0:2000}"; status=12
-      # Blocked: the branch's only own change is the worker's docs/BLOCKED-* note (base_sha is the chain base, so a predecessor's note
-      # does not count). Decided from git, not from the verdict: a note's Done when clauses are all MISSING, so the judge refutes it, and
-      # "blocked" must win over exit 5 so the batch can report the reason. Nothing to review, no PR.
-      elif [ -n "$files" ] && ! printf '%s\n' "$files" | grep -v '^docs/BLOCKED-' >/dev/null; then   # grep -q would stop reading: SIGPIPE on printf, and pipefail turns that into "blocked"
-        note=${files%%$'\n'*}
-        # First non-blank, non-heading line. awk reads the whole note (an early exit would SIGPIPE git show and, under pipefail, lose the reason).
-        reason=$(git -C "$gate" show "$head:$note" 2>/dev/null | tr -d '\r' | awk '!/^[[:space:]]*#/ && NF && !f {print; f=1}' | redact | cut -c1-200) || reason=   # redact the whole line, then bound it
-        manifest_set '. + {outcome:"blocked", reason:$r}' --arg r "$reason"
-        log "blocked: the only change is $note; no PR. $reason"; status=10
       # A dependency manifest changed without permission: the task's Scope section naming package.json is the permission (Out of scope
       # and findings appended by requeue do not count). A PR gate on the committed tree, after the package already ran in the containers;
-      # a worker that installed with --no-save or restored the manifest before committing walks past it. Branch pushed, no PR.
+      # a worker that installed with --no-save or restored the manifest before committing walks past it. Branch pushed, no PR. Ahead of
+      # blocked: a note beside a manifest change is still a manifest change.
       elif printf '%s\n' "$files" | grep -E "$MANIFEST_RE" >/dev/null && ! scope_of "$instructions" | grep 'package\.json' >/dev/null; then
         dep=$(printf '%s\n' "$files" | grep -E "$MANIFEST_RE" | tr '\n' ' '); dep=${dep:0:200}
         manifest_set '. + {outcome:"dependency_change", reason:$r}' --arg r "$dep"
         log "dependency manifest changed without permission: ${dep}(Scope does not name package.json); no PR"; status=14
+      # Blocked: this task's own note is a regular file at the pushed head. A note on top of code is blocked; a note deleted again, another
+      # task's note on the base, or a directory or symlink at the path is not. Decided from git, not from the verdict: a round-1 note was never
+      # judged, a later one left the earlier verdict standing, and "blocked" must win over both so the batch can report the reason. No PR.
+      elif nr=0; note_at "$gate" "$head" || nr=$?; [ "$nr" -eq 2 ]; then manifest_set '. + {outcome:"gate_error"}'; log "cannot read factory/$task_id at $head in the gate repo; no PR"; status=12
+      elif [ "$nr" -eq 0 ]; then
+        note="docs/BLOCKED-$task_id.md"
+        # First non-blank, non-heading line. awk reads the whole note (an early exit would SIGPIPE git show and, under pipefail, lose the reason).
+        reason=$(git -C "$gate" show "$head:$note" 2>/dev/null | tr -d '\r' | awk '!/^[[:space:]]*#/ && NF && !f {print; f=1}' | redact | cut -c1-200) || reason=   # redact the whole line, then bound it
+        manifest_set '. + {outcome:"blocked", reason:$r}' --arg r "$reason"
+        log "blocked: $note is at $head; no PR. $reason"; status=10
       else
       case "$verdict" in
         VERIFIED|CAVEATS)
+          # The verdict is about $jhead. A head nobody judged can only get here if the loop's note check (a read of the worker's checkout)
+          # and the gate's disagreed: never a PR on a commit no judge saw.
           # Conflict gate: dry-run the merge into the target as fetched above. 0 clean, 1 conflicts, anything else (git < 2.38) is a gate error. Both: no PR.
           mt=0; mto=$(git -C "$gate" merge-tree --write-tree refs/heads/base "$head" 2>&1) || mt=$?
-          if [ "$mt" -eq 1 ]; then manifest_set '. + {outcome:"conflict"}'; log "factory/$task_id conflicts with $base_branch; no PR. ${mto:0:2000}"; status=11
+          if [ "$head" != "$jhead" ]; then manifest_set '. + {outcome:"gate_error"}'; log "pushed head $head was not judged (round $judged judged ${jhead:-nothing}); no PR"; status=12
+          elif [ "$mt" -eq 1 ]; then manifest_set '. + {outcome:"conflict"}'; log "factory/$task_id conflicts with $base_branch; no PR. ${mto:0:2000}"; status=11
           elif [ "$mt" -ne 0 ]; then manifest_set '. + {outcome:"gate_error"}'; log "merge-tree against $base_branch failed (git exit $mt); no PR. ${mto:0:2000}"; status=12
           elif [ "$gh_src" != file ]; then
             # The PR is opened here, not by an agent: a separate token (pull_requests:write + contents:read, so it can read refs but not push) that no container ever held.
@@ -765,7 +783,7 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
     # The retry file is written after the original is archived, so a kill between the two leaves nothing to run twice.
     # ponytail: retried and plain live in this loop only. A retry left queued by HALT, --max-tasks or --stop-at runs tomorrow as an ordinary
     # task: a same-way failure then reads as "retry failed too" (archived, no second retry), and a conflict retry is cut from the chain base.
-    if [ -n "$new" ]; then jq --arg id "$new" '.task_id=$id' "$task" > "$dir/$new.json"; retried="$retried$new=$rc/$outcome "; next_id=$new; [ "$outcome" != conflict ] || plain="$plain$new "; fi
+    if [ -n "$new" ]; then jq --arg id "$new" --arg o "docs/BLOCKED-$id.md" --arg n "docs/BLOCKED-$new.md" '.task_id=$id | .instructions |= (split($o) | join($n))' "$task" > "$dir/$new.json"; retried="$retried$new=$rc/$outcome "; next_id=$new; [ "$outcome" != conflict ] || plain="$plain$new "; fi
     [ "$streak" -lt 2 ] || { why="two infra failures in a row (${streakids% })"; break; }
     [ "$eff" -eq 0 ] || [ "$cls" = infra ] || [ -n "$cont" ] || { why="$name exited $rc"; break; }   # 3 no changes, 5 REFUTED, 10 blocked, 14 manifest; the row has the verdict
   done
@@ -826,7 +844,8 @@ cmd_requeue() {  # factory requeue <queue/failed/file.json>: the same task again
     esac
   fi
   [ -z "$add" ] || add=$'\n\n'"$add"
-  jq --arg id "$new" --arg add "$add" '.task_id=$id | .instructions+=$add' "$f" > "$dir/$new.json"
+  # The note path in the task text follows the new id (README tells authors to write the literal id), so the gate finds the note under it.
+  jq --arg id "$new" --arg add "$add" --arg o "docs/BLOCKED-$id.md" --arg n "docs/BLOCKED-$new.md" '.task_id=$id | .instructions |= (split($o) | join($n)) | .instructions+=$add' "$f" > "$dir/$new.json"
   echo "wrote $dir/$new.json${add:+ (with the findings of the previous attempt)}"
 }
 
