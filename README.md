@@ -20,7 +20,7 @@ One run takes one task through these steps:
 8. On VERIFIED or CAVEATS, the orchestrator does a dry-run merge into the target. If it conflicts, the run ends with exit 11 and no PR.
 9. The verification gate. A fresh Claude Code session (`review-prompt.md`, the break-it lens, in its own container on a fresh clone; it never sees the judge's findings) writes JSON findings: BLOCKs, each with a shell command that reproduces the problem, and NOTEs. Then a container with no model and no credential (`verify.js`) runs every BLOCK's command at the pushed head and at the base, plus two checks on the changed test files (the base's tests against the head's code, the head's tests against the base's code). A BLOCK counts only when the machine reproduced it: a regression (fails at head, passes at base) or an unmet "Done when" clause (fails at both, clause named). A command that passes, times out or isn't found is invalid; one that fails at both with no clause is pre-existing, a note. Nothing reproduced: the PR. Something reproduced: one more worker round with those findings as facts, one more judge round, the push again, and the gate again (a gate cycle). The gate records every cycle in the manifest (`gate`) and the evidence files `gate-<n>-breakit.json` and `gate-<n>-verify.json`. A review or verifier that crashed, or left no valid record, is `gate_pending` (exit 12, infra: the batch retries the task once). No new commits in a cycle, the same command reproducing in a later cycle, REFUTED from the judge in a cycle, or a fourth cycle: `refuted` by the gate, exit 5, no PR.
 10. The orchestrator opens the pull request itself, with the judge's verdict and findings and the gate's record in the body. It uses a separate `pull_requests:write` token that no container ever holds.
-11. You review and merge. The target repo's ruleset requires one approval and green CI, and the GitHub App can't approve its own pull request.
+11. You review and merge. The target repo's ruleset requires one approval and green CI, and the GitHub App can't approve its own pull request. In merge mode (a task whose `base_branch` is `next`, and a merger App configured: see factory.md, "The merge gate") the factory merges the PR into `next` itself once the gate passed, the chain base is on `next`, the accumulation cap is not reached and the required checks are green; `merge` in the manifest says `merged`, `held`, `open` or `timeout` and why. You promote `next` to `main`.
 
 | Verdict | Meaning | Result |
 |---|---|---|
@@ -70,6 +70,7 @@ These two files are the only credentials stored on the machine. The factory gets
 | `FACTORY_SECRETS_DIR` | Yes, for `run` and `batch` | The directory with `keycard_client_id` and `keycard_client_secret`. |
 | `FACTORY_NOTIFY_URL` | No | Where `batch` posts notifications, for example `https://ntfy.sh/<topic>`. The topic name acts as the secret. |
 | `FACTORY_QUEUE` | No | A queue directory other than `queue/`. |
+| `FACTORY_GATE` | No | `0` skips the verification gate for a night (the manifest says `gate.result: skipped`); the escape hatch for the gate's first real nights. |
 | `FACTORY_MAX_ROUNDS` | No | Worker and judge rounds per task. Defaults to 5. |
 | `FACTORY_ALLOW_DIRTY` | No | Set to `1` to run from a checkout with uncommitted changes. For development only; the manifest marks the commit `-dirty`. |
 
@@ -147,6 +148,8 @@ export FACTORY_NOTIFY_URL='https://ntfy.sh/YOUR_TOPIC'   # optional
 | `./factory report [n]` | Shows the last `n` runs (default 20): run ID, exit status, judge rounds, verdict, the worker rounds' reported cost (`?` when a round left none) and PR URL. |
 | `./factory requeue <queue/failed/file.json>` | Copies a failed task back into the queue as `<task_id>-r<N>`, with the last attempt's judge findings or blocked reason added to its instructions. |
 | `./factory stop <run_id>` | Stops the run's container, blocks new runs, and records the stop in the run's log. |
+| `./factory ruleset-check <owner/name>` | The negative tests of a repo's rulesets with real tokens (a push to `next` refused, a merge without `factory-gate` refused, a stale sha 409, an App approval or merge on `main` refused); run once after setting up `next` and the merger App. |
+| `./canary.sh <owner/name>` | The factory's own canary queue against a throwaway repo: run after every factory merge and before a real night, asserts each run's manifest. |
 
 ### Batches
 

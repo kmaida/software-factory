@@ -7,6 +7,7 @@
 #   factory report [n]        one line per run from the manifests: exit, judge rounds, verdict, PR
 #   factory requeue <file>    copy a task from queue/failed/ back into the queue as <id>-r<N>, with the last attempt's findings
 #   factory stop <run_id>     kill the container, block new dispatch, record the incident
+#   factory ruleset-check <owner/name>  the negative tests of a target repo's rulesets with real tokens (run by hand; see factory.md)
 # Compatible with the macOS /bin/bash (3.2). Needs: docker, git, jq.
 set -euo pipefail
 export LC_ALL=C   # task-id order is the batch's schedule and must not depend on the operator's locale
@@ -53,6 +54,15 @@ ALLOW_WORK='api\.anthropic\.com|registry\.npmjs\.org'   # Claude Code, and the r
 ALLOW_JUDGE='api\.openai\.com|registry\.npmjs\.org'     # Codex (its chatgpt.com model-list refresh is denied; non-fatal), and the repo's checks
 ALLOW_PUSH='github\.com'
 ALLOW_VERIFY='registry\.npmjs\.org'   # the verifier: the repo's own installs, nothing else; the review arm uses the worker's list
+# The merge gate (docs/cascade-plan.md, option (c)): a task whose base_branch is NEXT_BRANCH is merged into it by the factory through its
+# PR, when the verification gate passed, the chain base is already on next, the accumulation cap is not reached and the required checks
+# are green, with a separate merger App's token minted for that step and held by no container. MERGER_APP_ID empty: PR-only mode (the
+# gate opens PRs and stops). Set it by PR once the next ruleset and the App exist and `factory ruleset-check` and canary.sh pass on the mini.
+NEXT_BRANCH=next; MAIN_BRANCH=main   # the integration branch the factory merges into; the branch a human promotes next to
+MERGER_APP_ID="${FACTORY_MERGER_APP_ID:-}"   # the merger App's client id (checks:write, contents:write, pull_requests:write); its key is MERGER_APP_KEY_RESOURCE in Keycard. The env form is for test-factory.sh
+MERGER_APP_KEY_RESOURCE="urn:factory:merger-app-key"
+MERGE_CAP_COMMITS=60; MERGE_CAP_LINES=4000   # past either in next...main (commits, about two per merge; changed lines) the factory opens PRs instead, so the promotion review stays readable
+MERGE_WAIT_SEC="${FACTORY_MERGE_WAIT_SEC:-1800}"   # bound on waiting for the required checks on the gated sha; a timeout leaves the PR open
 # Supply chain. CRED_RE: common credential shapes (a heuristic: these shapes, not every provider's format), refused in the task text and
 # in the tree the worker will check out, before any credential is issued; the gate reports file names, never content. MANIFEST_RE:
 # dependency manifests at any depth; a PR that changes one needs the task's Scope section to name package.json. That is a gate on
@@ -67,7 +77,7 @@ NPM_BEFORE_DAYS=7   # npm policy on the fixed docker run line: no install script
 GIT_CRED='!f() { h=; while IFS= read -r l; do case "$l" in host=*) h=${l#host=};; esac; done; [ "$h" = github.com ] || exit 0; echo username=x-access-token; echo "password=$(cat <&3)"; }; f'
 
 die()   { echo "factory: $*" >&2; exit 1; }
-usage() { echo "usage: factory run <task-file> | factory lint [dir] | factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--no-chain] [--continue] | factory report [n] | factory requeue <queue/failed/file.json> | factory stop <run_id>" >&2; exit 2; }
+usage() { echo "usage: factory run <task-file> | factory lint [dir] | factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--no-chain] [--continue] | factory report [n] | factory requeue <queue/failed/file.json> | factory stop <run_id> | factory ruleset-check <owner/name>" >&2; exit 2; }
 # Job schema: these four keys, all non-empty strings, plus an optional depends_on (task ids, non-empty strings). Everything else is derived by the orchestrator.
 JOB_SCHEMA='type=="object" and ((keys|sort)==["base_branch","instructions","repo","task_id"] or (keys|sort)==["base_branch","depends_on","instructions","repo","task_id"]) and (to_entries | all(if .key=="depends_on" then (.value|type=="array" and all(.[]; type=="string" and length>0)) else (.value|type=="string" and length>0) end))'
 base_id() { b=$1; while [[ "$b" =~ ^(.*)-[ri][0-9]+$ ]]; do b=${BASH_REMATCH[1]}; done; printf '%s' "$b"; }   # every -r<N> (requeue) and -i<N> (infra retry) suffix off: 010-x-r1-i1 is 010-x
@@ -140,10 +150,10 @@ keycard_token() {  # keycard_token <resource>: client-credentials token for this
   | curl -sS -m 30 -K - "$KEYCARD_ZONE/oauth/2/token" -d grant_type=client_credentials -d "resource=$1" \
   | jq -r '.access_token // empty'
 }
-mint_github_token() {  # mint_github_token <owner/name> <pem> <permissions-json>: 1h installation token scoped to that repo
-  t=$(date +%s)
+mint_github_token() {  # mint_github_token <owner/name> <pem> <permissions-json> [app client id]: 1h installation token scoped to that repo
+  t=$(date +%s); app=${4:-$GITHUB_APP_ID}
   hdr=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
-  pld=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((t-60)) $((t+540)) "$GITHUB_APP_ID" | b64url)
+  pld=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((t-60)) $((t+540)) "$app" | b64url)
   sig=$(printf '%s.%s' "$hdr" "$pld" | openssl dgst -sha256 -sign <(printf '%s\n' "$2") -binary | b64url)   # key never touches disk
   jwt_cfg=$(printf 'header = "Authorization: Bearer %s.%s.%s"\nheader = "Accept: application/vnd.github+json"\n' "$hdr" "$pld" "$sig")
   # The App has one installation per account it is installed on, so the installation is looked up from the repo, not pinned.
@@ -151,7 +161,7 @@ mint_github_token() {  # mint_github_token <owner/name> <pem> <permissions-json>
   code=${resp##*$'\n'}; body=${resp%$'\n'*}
   case "$code" in
     200) inst=$(printf '%s' "$body" | jq -r '.id // empty') ;;
-    404) echo "factory: GitHub App $GITHUB_APP_ID is not installed on $1 (GET /repos/$1/installation returned 404). Install it on ${1%%/*}, or add the repo to the existing installation: https://github.com/apps/kmaida-software-factory/installations/new" >&2; return 1 ;;
+    404) echo "factory: GitHub App $app is not installed on $1 (GET /repos/$1/installation returned 404). Install it on ${1%%/*}, or add the repo to the existing installation: https://github.com/apps/kmaida-software-factory/installations/new" >&2; return 1 ;;
     *)   echo "factory: installation lookup for $1 failed (HTTP $code): $(printf '%s' "$body" | jq -r '.message // empty')" >&2; return 1 ;;
   esac
   [ -n "$inst" ] || return 1
@@ -348,6 +358,65 @@ gate_body() {  # the gate's record for the PR body, from the manifest, bounded
       (.verifier.checks // {} | if .base_tests_at_head != null and .base_tests_at_head != 0 then "- note: the base'"'"'s test files fail against this head (exit \(.base_tests_at_head)): a regression, or a test changed under the code" else empty end),
       (.verifier.checks // {} | if .head_tests_at_base == 0 then "- note: the changed test files pass against the base'"'"'s code: they test nothing the change added" else empty end))' "$rundir/manifest.json")
   printf '%s' "${b:0:20000}"   # bounded here, not by head: a closed pipe under pipefail would fail the body and kill the run after a passing gate
+}
+
+gh_api() {  # gh_api <token> <method> <api path> [json body]: sets code and body. The token goes to curl as config on stdin, never argv.
+  extra=(); [ -z "${4:-}" ] || extra=(-d "$4")   # ${extra[@]+...}: an empty array is "unbound" under set -u in bash 3.2
+  resp=$(printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/vnd.github+json"\n' "$1" | curl -sS -m 30 -K - -w '\n%{http_code}' -X "$2" "https://api.github.com$3" ${extra[@]+"${extra[@]}"}) || resp=$'\n000'
+  code=${resp##*$'\n'}; body=${resp%$'\n'*}; body=${body//"$1"/[REDACTED]}
+}
+merger_token() {  # the merger App's token for one step: checks:write to post factory-gate, contents:write and pull_requests:write to merge
+  key=$(keycard_token "$MERGER_APP_KEY_RESOURCE" | openssl base64 -d -A 2>/dev/null) || return 1; [ -n "$key" ] || return 1
+  t=$( rundir=; mint_github_token "$repo" "$key" '{"checks":"write","contents":"write","pull_requests":"write"}' "$MERGER_APP_ID" ) || return 1; key=; [ -n "$t" ] || return 1   # rundir unset: the manifest's installation_id stays the push App's
+  printf '%s' "$t"
+}
+merge_next() {  # The merge gate (docs/cascade-plan.md), after the PR is open and the verification gate passed: merge the PR into NEXT_BRANCH
+  # with the merger App's token, minted here and held by no container. Only when the chain base is already on next (chain taint: otherwise
+  # the PR carries an ancestor a human is holding) and the accumulation cap is not reached (the promotion review must stay readable). Posts
+  # the factory-gate check on the gated head, waits (bounded) for the required checks, merges by sha (409 if the head moved), and reconciles
+  # a lost or refused answer by reading the PR before calling it open (unknown when it cannot be read). Records merge:{state, sha, reason}
+  # and never changes the exit status:
+  # a PR that did not merge is still a PR (option (b) of the plan), and factory status picks it up.
+  n=${pr_url##*/}; mstate=open mreason= msha= mt=
+  if ! git -C "$gate" merge-base --is-ancestor "$base_sha" refs/heads/base 2>/dev/null; then mstate=held; mreason="chain base $base_sha is not on $NEXT_BRANCH; an earlier task did not merge"
+  elif mt=$(merger_token) && [ -n "$mt" ]; then
+    gh_api "$mt" GET "/repos/$repo/compare/$MAIN_BRANCH...$NEXT_BRANCH"
+    acc=$(jq -r --argjson c "$MERGE_CAP_COMMITS" --argjson l "$MERGE_CAP_LINES" 'if type!="object" or (.ahead_by|type)!="number" then "ERR"
+            elif .ahead_by >= $c then "\(.ahead_by) commits" elif (.files|length) >= 300 then "300 or more files" elif ([.files[] | .additions + .deletions] | add // 0) >= $l then "\([.files[] | .additions + .deletions] | add) changed lines" else "" end' <<< "$body" 2>/dev/null) || acc=ERR
+    if [ "$code" != 200 ] || [ "$acc" = ERR ]; then mreason="compare $MAIN_BRANCH...$NEXT_BRANCH: HTTP $code"
+    elif [ -n "$acc" ]; then mstate=held; mreason="accumulation cap: $acc in $NEXT_BRANCH...$MAIN_BRANCH; promote $NEXT_BRANCH first"
+    else
+      rec=$(shasum -a 256 "$rundir/gate-$cycle-verify.json" | cut -d' ' -f1)
+      gh_api "$mt" POST "/repos/$repo/check-runs" "$(jq -nc --arg s "$head" --arg d "verifier record sha256 $rec (run $run_id, gate cycle $cycle)" '{name:"factory-gate", head_sha:$s, status:"completed", conclusion:"success", output:{title:"factory gate passed", summary:$d}}')"
+      if [ "$code" != 201 ]; then mreason="check run factory-gate on $head: HTTP $code ${body:0:300}"
+      else
+        # The required checks are asynchronous: wait for the PR to be mergeable, bounded; a timeout leaves the PR open for factory status.
+        t0=$(date +%s); ms=unknown
+        while :; do
+          gh_api "$mt" GET "/repos/$repo/pulls/$n"; ms=$(jq -r '.mergeable_state // "unknown"' <<< "$body" 2>/dev/null) || ms=unknown
+          case "$ms" in clean|unstable|has_hooks) break ;; dirty) break ;; esac   # unstable: only non-required checks failing; the ruleset guards the merge itself
+          [ $(( $(date +%s) - t0 )) -lt "$MERGE_WAIT_SEC" ] || break; sleep 30
+        done
+        if [ "$ms" = dirty ]; then mreason="PR $n not mergeable (mergeable_state dirty)"
+        elif [ "$ms" != clean ] && [ "$ms" != unstable ] && [ "$ms" != has_hooks ]; then mstate=timeout; mreason="PR $n not mergeable after $(( $(date +%s) - t0 ))s (mergeable_state $ms)"
+        elif [ -e "$HALT" ]; then mreason="stopped before the merge ($HALT)"
+        else
+          gh_api "$mt" PUT "/repos/$repo/pulls/$n/merge" "$(jq -nc --arg s "$head" '{merge_method:"merge", sha:$s}')"
+          if [ "$code" = 200 ] && [ "$(jq -r '.merged' <<< "$body" 2>/dev/null)" = true ]; then mstate=merged; msha=$(jq -r '.sha // empty' <<< "$body")
+          else   # lost or refused: the PR itself is the truth (outcome rule 3)
+            mc=$code; mb=${body:0:300}; gh_api "$mt" GET "/repos/$repo/pulls/$n"
+            if [ "$code" != 200 ]; then mstate=unknown; mreason="merge answered HTTP $mc and the PR could not be read back (HTTP $code); factory status settles it"
+            elif [ "$(jq -r '.merged' <<< "$body" 2>/dev/null)" = true ]; then mstate=merged; msha=$(jq -r '.merge_commit_sha // empty' <<< "$body"); mreason="merge answered HTTP $mc; the PR reads merged"
+            elif [ "$mc" = 000 ] || [ "${mc:0:1}" = 5 ]; then mstate=unknown; mreason="merge answered HTTP $mc and the PR does not read merged yet; GitHub may still finish it, factory status settles it"
+            else mreason="merge: HTTP $mc $mb"; fi
+          fi
+        fi
+      fi
+    fi
+  else mreason="no merger token (Keycard $MERGER_APP_KEY_RESOURCE, App $MERGER_APP_ID)"; fi
+  mt=
+  manifest_set '.merge = {state:$s, sha:(if $sha=="" then null else $sha end), reason:(if $r=="" then null else $r end)}' --arg s "$mstate" --arg sha "$msha" --arg r "$(printf '%s' "$mreason" | redact)"
+  log "merge into $NEXT_BRANCH: $mstate${msha:+ $msha}${mreason:+; $mreason}"; echo "  merge: $mstate${mreason:+ ($mreason)}"
 }
 
 cmd_run() {
@@ -611,10 +680,12 @@ cmd_run() {
       esac
       fi
     [ -n "$clean" ] || break
+    # FACTORY_GATE=0: the verification gate is skipped for the night (the escape hatch for its first real nights; the manifest says so).
+    if [ "${FACTORY_GATE:-1}" = 0 ]; then manifest_set '.gate.result="skipped"'; log "verification gate skipped (FACTORY_GATE=0)"; gres=pass
+    else run_gate; fi
     # The verification gate, after the push and the cheap gates: fresh reviewers that never saw the loop judge's findings, and a machine
     # that reproduces every BLOCK before it counts. Nothing reproduced: the PR. Something reproduced: one more worker round and one more
     # judge round with the facts, then the gate again. No progress is dead: a repro that reproduced in an earlier cycle, or MAX_GATES cycles.
-    run_gate
     case "$gres" in
       error)  manifest_set '. + {outcome:"gate_pending", reason:$r} | .gate.result="gate_pending"' --arg r "$greason"; log "gate cycle $cycle: $greason; outcome gate_pending (re-gate factory/$task_id at $head); no PR"; status=12; break ;;
       blocks) if [ -n "$gagain" ] || [ "$((cycle+1))" -ge "$MAX_GATES" ]; then
@@ -622,12 +693,13 @@ cmd_run() {
               fi
               cycle=$((cycle+1)); ghead=$head; round=$((round+1)); log "gate cycle $cycle: $(printf '%s\n' "$gfacts" | grep -c .) reproduced finding(s) go back to the worker"; continue ;;
     esac
-    manifest_set '.gate.result="pass"'
+    [ "${FACTORY_GATE:-1}" = 0 ] || manifest_set '.gate.result="pass"'
     if [ "$gh_src" != file ]; then
       # The PR is opened here, not by an agent: a separate token (pull_requests:write + contents:read, so it can read refs but not push) that no container ever held.
       body="$instructions"$'\n\n'"## Judge (Codex), $judged round(s), verdict $verdict"$'\n\n'"$findings"$'\n\n'"$(gate_body)"
       pr_url=$(open_pr "$repo" "$task_id" "$base_branch" "$body") || pr_url=
       if [ -n "$pr_url" ]; then log "opened $pr_url"; else manifest_set '. + {outcome:"pr_failed"}'; log "branch factory/$task_id pushed but opening the PR failed; open it by hand"; status=4; fi
+      [ -z "$pr_url" ] || [ -z "$MERGER_APP_ID" ] || [ "$base_branch" != "$NEXT_BRANCH" ] || merge_next
     fi
     break
   done
@@ -789,6 +861,19 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
   # Where notifications go, host only (a token in the URL never reaches the log): a silent night must say whether it could have spoken.
   nhost=off; if [ -n "${FACTORY_NOTIFY_URL:-}" ]; then nhost=${FACTORY_NOTIFY_URL#*://}; nhost=${nhost%%[/?#]*}; nhost=${nhost##*@}; fi
   echo "notify: $nhost$([ "$nhost" != off ] || echo ' (FACTORY_NOTIFY_URL not set)')"
+  # Merge mode: main must be contained in next (a hotfix on main that was not forward-merged would be lost at the promotion, and every merge
+  # tonight would build on a next that lacks it). Checked per GitHub repo the queue targets; anything but "behind" or "identical" stops the batch.
+  if [ -n "$MERGER_APP_ID" ]; then
+    for r in $(jq -r "select(.base_branch==\"$NEXT_BRANCH\") | .repo" "$dir"/*.json 2>/dev/null | sort -u); do
+      repo_norm "$r" || continue; case "$repo_url" in https://github.com/*) ;; *) continue ;; esac
+      tok=$(dep_token "$repo" "$repo_url") || tok=; [ -n "$tok" ] || { notify "stopped: no read token for $repo to check $MAIN_BRANCH is in $NEXT_BRANCH"; die "merge mode: no read token for $repo"; }
+      gh_api "$tok" GET "/repos/$repo/compare/$NEXT_BRANCH...$MAIN_BRANCH"; st=$(jq -r '.status // "ERR"' <<< "$body" 2>/dev/null) || st=ERR; tok=
+      case "$st" in behind|identical) echo "merge mode: $MAIN_BRANCH is in $NEXT_BRANCH on $repo ($st)" ;;
+        *) notify "stopped: $MAIN_BRANCH is not contained in $NEXT_BRANCH on $repo (compare $NEXT_BRANCH...$MAIN_BRANCH: $st, HTTP $code); forward-merge it, then run again"
+           die "merge mode: $MAIN_BRANCH is not contained in $NEXT_BRANCH on $repo (compare: $st, HTTP $code)" ;;
+      esac
+    done
+  fi
   # passed/failed: base ids (an -i<N> retry counts for its task); prev: the literal chain head; outcomes: "<base id>=<rc>" per run, for the
   # exit status; retried: "<retry id>=<rc>/<outcome>" of the attempt a retry stands for; plain: retries cut from the task's own base.
   # failed: ids and base ids (an -i<N> retry counts for its task); prev: the literal chain head; outcomes: "<base id>=<rc>" per run
@@ -961,6 +1046,68 @@ cmd_requeue() {  # factory requeue <queue/failed/file.json>: the same task again
   echo "wrote $dir/$new.json${add:+ (with the findings of the previous attempt)}"
 }
 
+# ---------------------------------------------------------------- ruleset-check
+cmd_ruleset_check() {  # factory ruleset-check <owner/name>: the negative tests of the target repo's rulesets with real tokens (docs/cascade-plan.md,
+  # loop 7), run by hand once the next ruleset and the merger App exist: a push to next with the push token is refused; a merge without
+  # factory-gate is refused; a merge with a stale sha is 409; with the check posted and the required checks green, the merge lands (an empty
+  # commit on next, which proves the positive path); the rules on next name factory-gate; an App merge on main is refused (an App approval
+  # is a note: whether it counts is what the merge shows). Creates one branch
+  # factory/ruleset-check-<ts> (deletion is restricted by the ruleset, so it stays) and two PRs (closed at the end). Exit 1 on any FAIL.
+  repo_norm "${1:-}" || usage; case "$repo_url" in https://github.com/*) ;; *) die "ruleset-check needs a GitHub repo" ;; esac
+  [ -n "$MERGER_APP_ID" ] || die "MERGER_APP_ID is empty: no merger App to test with"
+  [ -n "${FACTORY_SECRETS_DIR:-}" ] || die "FACTORY_SECRETS_DIR is not set"
+  fails=0; say() { echo "$1: $2"; [ "$1" != FAIL ] || fails=$((fails+1)); }
+  refused() { case "$code" in 403|405|409|422) return 0 ;; *) return 1 ;; esac; }   # a refusal by GitHub; a transport error or a 5xx proves nothing
+  ts=$(date -u +%Y%m%dT%H%M%SZ); id="ruleset-check-$ts"; br="factory/$id"
+  app_key=$(keycard_token "$GITHUB_APP_KEY_RESOURCE" | openssl base64 -d -A 2>/dev/null) || app_key=; [ -n "$app_key" ] || die "Keycard did not issue the GitHub App key"
+  push_tok=$(mint_github_token "$repo" "$app_key" '{"contents":"write"}') || die "no push token"; app_key=
+  mt=$(merger_token) || die "no merger token"
+  w=$(mktemp -d "${TMPDIR:-/tmp}/factory-rc.XXXXXX"); trap 'rm -rf "$w"' EXIT
+  git -c credential.helper= -c credential.helper="$GIT_CRED" clone -q "$repo_url" "$w" 3< <(printf '%s' "$push_tok") || die "clone failed"
+  ci() { git -C "$w" -c commit.gpgsign=false -c user.name="$GITHUB_APP_SLUG[bot]" -c user.email="$GITHUB_APP_SLUG[bot]@users.noreply.github.com" commit -q --allow-empty -m "factory: ruleset check $ts" || die "commit failed"; }
+  # The push test: an empty commit on top of next, pushed by sha, so a refusal can only be the ruleset's (a non-fast-forward would be git's).
+  git -C "$w" checkout -q --detach "origin/$NEXT_BRANCH" || die "no $NEXT_BRANCH on $repo"; ci; cn=$(git -C "$w" rev-parse HEAD)
+  # The PRs: an empty commit on top of main, so the PR to main carries nothing else and a protection that fails cannot promote next.
+  git -C "$w" checkout -q -b "$br" "origin/$MAIN_BRANCH" || die "no $MAIN_BRANCH on $repo"; ci
+  sha=$(git -C "$w" rev-parse HEAD); base=$(git -C "$w" rev-parse "origin/$NEXT_BRANCH")
+  if git -C "$w" -c credential.helper= -c credential.helper="$GIT_CRED" push -q "$repo_url" "$cn:refs/heads/$NEXT_BRANCH" 3< <(printf '%s' "$push_tok") 2>/dev/null
+  then say FAIL "the push token pushed to $NEXT_BRANCH (an empty commit landed there; the ruleset must restrict updates to factory/**)"
+  elif [ "$(git -C "$w" ls-remote -q "$repo_url" "refs/heads/$NEXT_BRANCH" 2>/dev/null | cut -f1)" = "$base" ]; then say PASS "the push token cannot push to $NEXT_BRANCH"
+  else say FAIL "inconclusive: the push to $NEXT_BRANCH failed but $NEXT_BRANCH could not be read back or moved"; fi
+  git -C "$w" -c credential.helper= -c credential.helper="$GIT_CRED" push -q "$repo_url" "HEAD:refs/heads/$br" 3< <(printf '%s' "$push_tok") || die "the push token cannot push $br either; nothing else can be tested"
+  push_tok=
+  gh_api "$mt" GET "/repos/$repo/rules/branches/$NEXT_BRANCH"
+  if [ "$code" = 200 ] && [ "$(jq -r 'any(.[] | select(.type=="required_status_checks") | .parameters.required_status_checks[]?; .context=="factory-gate")' <<< "$body" 2>/dev/null)" = true ]; then say PASS "the rules on $NEXT_BRANCH require the factory-gate check"
+  else say FAIL "the rules on $NEXT_BRANCH do not require factory-gate (HTTP $code ${body:0:200})"; fi
+  pr=$(open_pr "$repo" "$id" "$NEXT_BRANCH" "Ruleset check $ts: an empty commit. Opened and merged by \`factory ruleset-check\`.") || die "cannot open the PR to $NEXT_BRANCH"
+  n=${pr##*/}
+  gh_api "$mt" PUT "/repos/$repo/pulls/$n/merge" "$(jq -nc --arg s "$sha" '{merge_method:"merge", sha:$s}')"
+  if [ "$code" = 200 ]; then say FAIL "merged $pr without the factory-gate check (HTTP 200)"; elif refused; then say PASS "a merge without factory-gate is refused (HTTP $code)"; else say FAIL "inconclusive: a merge without factory-gate answered HTTP $code ${body:0:200}"; fi
+  gh_api "$mt" POST "/repos/$repo/check-runs" "$(jq -nc --arg s "$sha" '{name:"factory-gate", head_sha:$s, status:"completed", conclusion:"success", output:{title:"factory gate passed", summary:"ruleset check"}}')"
+  if [ "$code" = 201 ]; then say PASS "the merger App posted factory-gate on $sha"; else say FAIL "the merger App cannot post factory-gate (HTTP $code ${body:0:200})"; fi
+  gh_api "$mt" PUT "/repos/$repo/pulls/$n/merge" "$(jq -nc --arg s "$base" '{merge_method:"merge", sha:$s}')"
+  if [ "$code" = 409 ]; then say PASS "a merge with a stale sha is 409"; else say FAIL "a merge with a stale sha answered HTTP $code, not 409"; fi
+  t0=$(date +%s); ms=unknown; while :; do gh_api "$mt" GET "/repos/$repo/pulls/$n"; ms=$(jq -r '.mergeable_state // "unknown"' <<< "$body" 2>/dev/null) || ms=unknown
+    case "$ms" in clean|dirty) break ;; esac; [ $(( $(date +%s) - t0 )) -lt "$MERGE_WAIT_SEC" ] || break; sleep 30; done
+  if [ "$ms" = clean ]; then
+    gh_api "$mt" PUT "/repos/$repo/pulls/$n/merge" "$(jq -nc --arg s "$sha" '{merge_method:"merge", sha:$s}')"
+    if [ "$code" = 200 ]; then say PASS "with factory-gate and the required checks green, the merger App merged $pr"; else say FAIL "the merge with everything green answered HTTP $code ${body:0:200}"; fi
+  else say FAIL "PR $n never became mergeable (mergeable_state $ms after $(( $(date +%s) - t0 ))s): the required checks on $NEXT_BRANCH did not go green"; fi
+  pr2=$(open_pr "$repo" "$id" "$MAIN_BRANCH" "Ruleset check $ts against $MAIN_BRANCH: must not be approvable or mergeable by an App. Closed by \`factory ruleset-check\`.") || { say FAIL "cannot open a PR to $MAIN_BRANCH"; pr2=; }
+  if [ -n "$pr2" ]; then n2=${pr2##*/}
+    gh_api "$mt" GET "/repos/$repo/pulls/$n2"; [ "$(jq -r '.base.ref' <<< "$body" 2>/dev/null)" = "$MAIN_BRANCH" ] || { say FAIL "PR $n2 is not against $MAIN_BRANCH (open_pr found an older PR from the same head); the $MAIN_BRANCH tests did not run"; pr2=; }
+  fi
+  if [ -n "$pr2" ]; then
+    gh_api "$mt" POST "/repos/$repo/pulls/$n2/reviews" '{"event":"APPROVE","body":"ruleset check: an App approval must not count"}'
+    if [ "$code" = 200 ]; then echo "note: the merger App could submit an approval on $pr2 (HTTP 200); whether it counts is what the merge below tests"; elif refused; then say PASS "an App approval on $MAIN_BRANCH is refused (HTTP $code)"; else echo "note: an App approval on $MAIN_BRANCH answered HTTP $code ${body:0:200}"; fi
+    gh_api "$mt" PUT "/repos/$repo/pulls/$n2/merge" "$(jq -nc --arg s "$sha" '{merge_method:"merge", sha:$s}')"
+    if [ "$code" = 200 ]; then say FAIL "the merger App merged $pr2 into $MAIN_BRANCH (an empty commit landed there)"; elif refused; then say PASS "an App merge on $MAIN_BRANCH is refused (HTTP $code)"; else say FAIL "inconclusive: an App merge on $MAIN_BRANCH answered HTTP $code ${body:0:200}"; fi
+    gh_api "$mt" PATCH "/repos/$repo/pulls/$n2" '{"state":"closed"}'; [ "$code" = 200 ] || echo "note: could not close $pr2 (HTTP $code); close it by hand"
+  fi
+  mt=
+  echo "branch $br stays on $repo (the ruleset restricts deletions); $fails FAIL"; [ "$fails" -eq 0 ]
+}
+
 # ---------------------------------------------------------------- stop
 cmd_stop() {
   run_id="${1:-}"; [ -n "$run_id" ] || usage
@@ -1003,5 +1150,6 @@ case "${1:-}" in
   report) shift; cmd_report "$@" ;;
   requeue) shift; cmd_requeue "$@" ;;
   stop)   shift; cmd_stop "$@" ;;
+  ruleset-check) shift; cmd_ruleset_check "$@" ;;
   *)    usage ;;
 esac
