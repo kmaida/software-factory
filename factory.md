@@ -192,6 +192,36 @@ Status is Implemented, Partial, or Planned. Each has a check that proves it. (re
   synchronously), `maxConnections` 64, `clientError` and `drop` are logged as denials, logged strings are truncated,
   and a 1 MiB stdout backlog or a closed stdout exits the proxy so the run fails closed. All checks rerun green after
   the fixes; the list is in the Bash history of that session, the important ones in the plan's item 1 and item 13.
+- **Harness through the proxy, laptop, 2026-11-01** (closes the "not done here" above; still OrbStack). Image built on
+  the laptop (Claude Code 2.1.316 unpinned, Codex 0.164.0), real `MODE=work` and `MODE=judge` containers with the
+  factory's exact `docker run` flags plus `--network factory-int -e HTTPS_PROXY=http://factory-proxy:8888`, and a
+  bogus token, since the laptop holds no factory secrets. Worker: Claude Code's only egress is `api.anthropic.com`
+  (seven CONNECTs, nothing denied), which answered `401 Invalid bearer token` through the proxy, so the path is proven
+  end to end short of a valid credential. Judge: Codex first tries `github.com`, `api.github.com` and `chatgpt.com`
+  (the "refresh available models" call; denied, logged as `ERROR … Connection failed`, non-fatal), then opens the
+  responses websocket to `api.openai.com` through the proxy and gets the key's 401. So the allowlists are per mode:
+  work `api.anthropic.com` plus whatever the repo's own checks fetch (`registry.npmjs.org`), judge `api.openai.com`
+  plus the same, push `github.com`. Not verified without a real key: that a Codex review completes with `chatgpt.com`
+  denied (it proceeded to the API here; the mini's first judged run settles it, and allowing `chatgpt.com` for the
+  judge is the fallback). Scratch: `$TMPDIR/…/scratchpad/egress/`.
+- **Egress allowlist, 2026-11-01** (plan item 1; PR `egress`). `factory run` creates one `--internal` network per run
+  (`factory-<run_id>`, labelled `factory.run` so orphan cleanup covers it) and `run_container` starts one proxy per
+  step (`<container>-proxy`: `proxy.js` from this checkout, in the sandbox image with the same hardening flags, on
+  the bridge and connected to the run's network, `ALLOW` from a per-mode constant in `factory`), waits for its
+  `listening` line, runs the step with `--network` and the four proxy vars, then collects the proxy's decisions into
+  `log.jsonl` as `type: proxy` events and removes it. Per-step proxies so a worker never shares one with the judge or
+  the push. Decisions are collected after the step, not streamed: simplest, and the only loss is a run the
+  orchestrator abandons. Not in the manifest; the log is the network record. The README's Network row is Partial:
+  host filtering, credentials still inside. Codex's `chatgpt.com` call stays denied until a real judge round shows
+  it matters. Codex reviewed the wiring (2026-11-01), five findings, all confirmed and fixed: a proxy that never
+  listened still dispatched the step (now `die`, with the proxy's output in the log); a proxy whose removal failed
+  stayed on the run network where the next step could use its allowlist (now `die`); a failed `docker logs` lost the
+  network record under `|| true` while the step stayed successful (now `die`); the network was created before the
+  manifest existed, so its failure left no run record (moved after the manifest); `factory stop` after an
+  orchestrator crash left the network until the next run's sweep, which HALT blocks (stop removes it). Two stub
+  cases cover the first and third. Its speculative item, services on the Docker host's bridge address being
+  reachable from an internal network, is the "no route to the internet except the proxy" wording already in the
+  plan; the demo script says that now too.
 
 ## TODO (Kim)
 

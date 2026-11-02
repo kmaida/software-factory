@@ -31,6 +31,13 @@ GITHUB_APP_SLUG="kmaida-software-factory"  # the App's bot user is <slug>[bot]; 
 GITHUB_APP_KEY_RESOURCE="urn:factory:github-app-key"
 OPENAI_RESOURCE="https://api.openai.com"       # Keycard Vault API Token credential on the OpenAI API resource: the Codex judge's key, fetched per judge round
 MAX_ROUNDS="${FACTORY_MAX_ROUNDS:-5}"          # worker -> judge rounds before the verdict is final; a round with no new commits ends the loop early
+# Egress. Every step runs on a per-run internal network (no route out, no external DNS) with its own proxy container on both that
+# network and the bridge: proxy.js in this checkout, run in the sandbox image, CONNECT to the step's hosts on 443 and nothing else,
+# one JSON line per decision into log.jsonl. The proxy vars are a courtesy to the clients: with no route out, a client that ignores
+# them has no network, not an open one. Hosts are regex alternatives; the proxy anchors them (^(?:…)$) and refuses IP literals.
+ALLOW_WORK='api\.anthropic\.com|registry\.npmjs\.org'   # Claude Code, and the repo's own installs
+ALLOW_JUDGE='api\.openai\.com|registry\.npmjs\.org'     # Codex (its chatgpt.com model-list refresh is denied; non-fatal), and the repo's checks
+ALLOW_PUSH='github\.com'
 # Git credential helper for the clone and the base fetch: answers only for github.com and reads the token from fd 3, so it is in
 # neither argv nor the environment. `credential.helper=` first clears inherited helpers (the mini's system gitconfig sets osxkeychain,
 # which would store the token on success).
@@ -49,7 +56,7 @@ notify() {  # notify <line>: POST "<batch_id>: <line>" to FACTORY_NOTIFY_URL whe
 }
 
 # ---------------------------------------------------------------- run
-run_id= work= jwork= jout= gate= logf= borrowed=
+run_id= net= work= jwork= jout= gate= logf= borrowed=
 manifest_set() {  # manifest_set <jq-filter> [jq args...]: atomic update of this run's manifest
   f="$1"; shift
   jq "$@" "$f" "$rundir/manifest.json" > "$rundir/manifest.json.tmp.$$" && mv "$rundir/manifest.json.tmp.$$" "$rundir/manifest.json"
@@ -58,6 +65,7 @@ cleanup() {
   rc=$?
   # Best effort, every step: a docker outage here must not stop the manifest from being finalized or the lock from being released.
   if [ -n "$run_id" ]; then c=$(docker ps -aq --filter "label=factory.run=$run_id" 2>/dev/null) || c=; [ -n "$c" ] && docker rm -f $c >/dev/null 2>&1 || true; fi
+  [ -z "$net" ] || docker network rm "$net" >/dev/null 2>&1 || true   # after the containers: a network with members cannot be removed
   for d in "$work" "$jwork" "$jout" "$gate"; do [ -z "$d" ] || rm -rf "$d" 2>/dev/null || true; done   # never let a failed rm change the exit status
   # A run that died before finalizing still gets a terminal state, so no manifest is left open-ended.
   if [ -n "${rundir:-}" ] && [ -f "$rundir/manifest.json" ] && [ "$(jq -r .ended_at "$rundir/manifest.json")" = null ]; then
@@ -156,12 +164,25 @@ run_container() {  # run_container <mode> <secret> [docker args...] -- [entrypoi
   [ -e "$HALT" ] && die "dispatch blocked by $HALT ($(cat "$HALT"))"
   b64=$(printf 'x-access-token:%s' "$secret" | openssl base64 -A)   # the Basic-auth form git prints in verbose traces
   cname="factory-$run_id-$mode-$round"
-  log "container $cname starting"
+  # This step's proxy: fresh per step, so the worker never shares one with the judge or the push. Removed with the step; its decisions
+  # are collected into the log after the step, so a run the orchestrator abandons loses them (cleanup removes the container).
+  # Any proxy failure is the run's failure (die), never the step's: a step must not run without its proxy, a proxy must not outlive
+  # its step on the run network, and a step whose network record cannot be collected is not a recorded step.
+  case "$mode" in work) allow=$ALLOW_WORK;; judge) allow=$ALLOW_JUDGE;; *) allow=$ALLOW_PUSH;; esac
+  pname="$cname-proxy"
+  egress_record() { docker logs "$pname" 2>&1 | jq -R -c --arg r "$run_id" --arg m "$mode" '{run_id:$r, ts:(now|todate), event:((. as $l | try fromjson catch {text:$l}) + {type:"proxy", mode:$m})}' >> "$logf"; }
+  docker run -d --name "$pname" --label "factory.run=$run_id" --read-only --memory 256m --pids-limit 64 --cap-drop ALL --security-opt no-new-privileges \
+    --network bridge -e ALLOW="$allow" -v "$FACTORY_DIR/proxy.js":/proxy.js:ro --entrypoint node "$image_digest" /proxy.js >/dev/null || die "proxy $pname did not start"
+  docker network connect "$net" "$pname" || die "cannot connect $pname to $net"
+  for i in 1 2 3 4 5 6 7 8 9 10; do docker logs "$pname" 2>&1 | grep -q '"listening"' && break; sleep 0.5; done   # ~100 ms normally
+  docker logs "$pname" 2>&1 | grep -q '"listening"' || { egress_record || true; die "proxy $pname is not listening after 5s; its output is in the log"; }
+  log "container $cname starting; egress ^(?:$allow)$ via $pname"
   ( sleep "$TIMEOUT_SEC" && docker stop -t 10 "$cname" >/dev/null 2>&1 ) & watchdog=$!
   set +e
   printf '%s\n' "$secret" \
   | docker run -i --name "$cname" --label "factory.run=$run_id" --rm --read-only --tmpfs /tmp --tmpfs /run/secrets:size=64k \
     --memory 4g --cpus 2 --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges \
+    --network "$net" -e HTTPS_PROXY="http://$pname:8888" -e https_proxy="http://$pname:8888" -e HTTP_PROXY="http://$pname:8888" -e http_proxy="http://$pname:8888" \
     -e MODE="$mode" -e TASK_ID="$task_id" -e BASE_BRANCH="$from_branch" \
     -e GIT_AUTHOR_NAME="$git_name" -e GIT_AUTHOR_EMAIL="$git_email" -e GIT_COMMITTER_NAME="$git_name" -e GIT_COMMITTER_EMAIL="$git_email" \
     "${dargs[@]}" "$image_digest" "$@" 2>&1 \
@@ -173,6 +194,9 @@ run_container() {  # run_container <mode> <secret> [docker args...] -- [entrypoi
   set -e
   kill "$watchdog" 2>/dev/null || true
   log "container $cname exited with status $status"
+  # The network record: every CONNECT the proxy allowed or refused, tagged with the step. Nothing in it is secret.
+  egress_record || die "cannot collect the egress record of $pname"
+  docker rm -f "$pname" >/dev/null 2>&1 || die "cannot remove proxy $pname; the next step would share the run network with it"
 }
 
 cmd_run() {
@@ -239,6 +263,10 @@ cmd_run() {
       image_digest:$image, factory_commit:(if $fc=="" then null else $fc end), keycard_zone:$kz,
       installation_id:null, git_identity:null, started_at:$started, ended_at:null, exit_status:null, final_sha:null, pr_url:null}' \
     > "$rundir/manifest.json"
+  # The run's network, after the manifest exists so a failure here is a recorded run (exit 1), not a vanished one. Orphan networks of
+  # crashed runs go first (their containers went above; a network with members cannot be removed).
+  orphans=$(docker network ls -q --filter label=factory.run); if [ -n "$orphans" ]; then docker network rm $orphans >/dev/null || die "cannot remove orphan network(s) $orphans"; fi
+  net="factory-$run_id"; docker network create --internal --label "factory.run=$run_id" "$net" >/dev/null || die "cannot create network $net"
 
   # Commits are authored by the App's bot user, so a ruleset that requires approval of unattributed changes accepts one human
   # approval (a made-up bot email left keycard-workshop-platform#9 REVIEW_REQUIRED after approval). The user id comes from the
@@ -533,6 +561,7 @@ cmd_stop() {
     c=$(docker ps -q --filter "label=factory.run=$run_id" 2>/dev/null) || { c=; echo "docker is not answering; signalling the orchestrator anyway"; }
     if [ -n "$c" ]; then docker stop -t 5 $c >/dev/null 2>&1 && echo "stopped container(s) $c"; else echo "no container running for $run_id"; fi
     c=$(docker ps -aq --filter "label=factory.run=$run_id" 2>/dev/null) || c=; [ -n "$c" ] && docker rm -f $c >/dev/null 2>&1 || true
+    docker network rm "factory-$run_id" >/dev/null 2>&1 || true   # a crashed orchestrator's network; harmless if the run already removed it
   else
     echo "docker not found; nothing to stop on this host"
   fi

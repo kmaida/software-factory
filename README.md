@@ -212,8 +212,8 @@ The table compares the factory to the controls in the reference architecture's a
 | Boundary | The architecture asks for | The factory does | Status |
 |---|---|---|---|
 | Sandbox | A fresh, hardened sandbox per task, unprivileged, writes confined to the workspace, resource limits, destroyed afterward | A fresh container per step: non-root, read-only root filesystem, all capabilities dropped, `no-new-privileges`, 4 GB memory, 2 CPUs, 512 processes, one-hour timeout, no Docker socket, only the clone mounted (the judge also gets its own scratch and output directories), removed on exit | Meets |
-| Sandbox | A microVM for untrusted code; process, file and network activity recorded outside the agent | Containers share the Docker Desktop VM; only the agent's own output stream is recorded | Partial |
-| Network | Default-deny egress proxy that all traffic passes through | Egress is open | Gap |
+| Sandbox | A microVM for untrusted code; process, file and network activity recorded outside the agent | Containers share the Docker Desktop VM; only the agent's own output stream and its outbound connections, by host, are recorded | Partial |
+| Network | Default-deny egress proxy that all traffic passes through | Each step runs on an internal Docker network with no route out. Its only exit is a proxy container started for that step with that step's hosts (worker: Anthropic and npm; judge: OpenAI and npm; push: GitHub); it allows `CONNECT` on 443 to those and refuses everything else, and every decision goes into the run's log. It filters by host, not by request, and the credential still travels inside the container | Partial |
 | Identity and access | Credentials attached at the proxy, never inside the sandbox | Each container holds one short-lived credential | Gap |
 | Identity and access | Its own identity per agent, short-lived task-scoped credentials, independent approval, fail-closed | One shared Application identity, `urn:factory:mini`, not one per agent, and a run ID per run in the manifest; one-hour Anthropic and GitHub tokens, the GitHub tokens scoped to one repo, but a long-lived Codex key; ruleset requires a human approval the App can't give; the run refuses to start on any token or schema failure | Partial |
 | Identity and access | Revoke any grant at any time | `factory stop` kills the run and blocks dispatch; tokens aren't revoked, they expire within an hour | Partial |
@@ -226,7 +226,7 @@ The table compares the factory to the controls in the reference architecture's a
 
 Known limits:
 
-- Open egress lets the worker send the repo or its Anthropic token anywhere over HTTPS. The judge runs the repo's tests as the same user as Codex, so a test the worker wrote can read the judge's key.
+- Egress is limited to each step's hosts, but a key read inside a container can still leave through an allowed host (npm and OpenAI both accept uploads) or through the judge's findings, which become the next prompt and the PR body. The judge runs the repo's tests as the same user as Codex, so a test the worker wrote can read the judge's key.
 - GitHub can't scope an installation token to one branch, so the push token can push to any branch of the target repo that no rule protects.
 - The Keycard client secret is a long-lived static secret on the Mac. It never enters a container.
 - Log redaction catches the literal tokens and their Basic-auth form, but not an encoded or split token.
@@ -237,6 +237,7 @@ Known limits:
 |---|---|
 | `factory` | The orchestrator (bash 3.2, macOS). |
 | `Dockerfile` | The sandbox image and its entrypoint, with three modes: `work`, `judge` and `push`. |
+| `proxy.js` | The per-step egress proxy: `CONNECT` to that step's allowlisted hosts on 443, nothing else. Runs in the sandbox image. |
 | `worker-prompt.md` | The house rules every worker round starts with. |
 | `judge-prompt.md` | The judge's instructions. They live here, not in the target repo, so the worker can't change them. |
 | `test-factory.sh` | Tests the orchestrator against stubbed `docker` and `curl`. |
