@@ -45,7 +45,9 @@ while [ $# -gt 0 ]; do case "$1" in
   -*) shift;; *) args+=("$1"); shift;; esac; done
 # The step's proxy (`run -d … --entrypoint node`): record its allowlist and pretend to start.
 [ -z "$detached" ] || { [ -z "${STUB_ALLOW:-}" ] || echo "${ALLOW:-}" >> "$STUB_ALLOW"; echo stub-proxy; exit 0; }
-IFS= read -r secret; echo "stub $mode secret=$secret net=$net proxy=${HTTPS_PROXY:-} npm=${NPM_CONFIG_IGNORE_SCRIPTS:-}/${NPM_CONFIG_BEFORE:-}"
+IFS= read -r secret; echo "stub $mode secret=$secret net=$net proxy=${HTTPS_PROXY:-} npm=${NPM_CONFIG_IGNORE_SCRIPTS:-}/${NPM_CONFIG_BEFORE:-} model=${FACTORY_MODEL:-}/${FACTORY_BUDGET_USD:-}/${JUDGE_MODEL:-}"
+# The worker leaks its secret encoded and a token by shape, and ends with Claude Code's cost event.
+[ "$mode" != work ] || { echo "b64=$(printf '%s' "$secret" | base64) shape=sk-ant-$(printf 'x%.0s' $(seq 24))"; echo '{"type":"result","total_cost_usd":0.12,"num_turns":3,"duration_ms":100}'; }
 case "$mode" in
   work) cd "$work"; git checkout -q "factory/$TASK_ID" 2>/dev/null || git checkout -qb "factory/$TASK_ID" "origin/$BASE_BRANCH"
         [ "${STUB_KILL_RUN:-}" = "$TASK_ID" ] && kill -9 "$(cat "$STUB_LOCK_PID")"   # the orchestrator dies mid-run, before its cleanup
@@ -71,12 +73,19 @@ case "$mode" in
            DOUBLE) printf 'VERDICT: REFUTED\nVERDICT: VERIFIED\n' > "$out/verdict.md"; exit 0;;
            BIG)    { head -c 199982 /dev/zero | tr '\0' x; printf 'VERDICT: VERIFIED\n\nVERDICT: REFUTED\n'; } > "$out/verdict.md"; exit 0;;   # byte 200000 ends the first verdict
          esac
-         printf 'finding %d: fix it (file.js:1)\nVERDICT: %s\n\n' "$n" "$v" > "$out/verdict.md";;
+         printf 'finding %d: fix it (file.js:1)\nsaw key ghs_%s and mine b64 %s\nVERDICT: %s\n\n' "$n" "$(printf 'y%.0s' $(seq 36))" "$(printf '%s' "$secret" | base64)" "$v" > "$out/verdict.md";;   # a token by shape, and the judge's own key encoded
   push) [ -n "${HEAD_SHA:-}" ] && [ -n "${REPO_URL:-}" ] || exit 9
         git -C "$src" push -q "$REPO_URL" "$HEAD_SHA:refs/heads/factory/$TASK_ID"   # a chained task clones this branch as its base
         [ "$TASK_ID" = "${STUB_HALT_AFTER:-}" ] && echo test-factory > "$STUB_HALT_FILE"; exit 0;;
 esac
 D
+realjq=$(type -P jq)
+cat > "$t/bin/jq" <<J
+#!/bin/bash
+# Stub: the real jq, except STUB_JQ_FAIL=<mode> fails the log pipeline's jq for that mode (its --arg m <mode>): an incomplete record.
+[ -n "\${STUB_JQ_FAIL:-}" ] && [[ "\$*" == *"--arg m \$STUB_JQ_FAIL"* ]] && exit 7
+exec "$realjq" "\$@"
+J
 chmod +x "$t/bin/"*
 run() {  # run <task_id> <verdicts> -> prints exit status; RUN_REPO overrides the local bare repo (a GitHub owner/name goes through the App path); RUN_INSTR the instructions (JSON-escaped)
   echo "{\"repo\":\"${RUN_REPO:-$t/remote.git}\",\"base_branch\":\"main\",\"task_id\":\"$1\",\"instructions\":\"${RUN_INSTR:-do the thing}\"}" > "$t/$1.json"
@@ -100,8 +109,29 @@ grep -q 'Review of your previous attempt (round 1 verdict: REFUTED)' "$m/log.jso
 grep -q 'stub work secret=\[REDACTED\] net=factory-[0-9TZ]*-t1 proxy=http://factory-[0-9TZ]*-t1-work-1-proxy:8888' "$m/log.jsonl" || { echo "FAIL: t1 worker not on the run network behind its proxy"; grep 'stub work' "$m/log.jsonl"; exit 1; }
 check "$(tr '\n' ' ' < "$t/allow")" 'api\.anthropic\.com|registry\.npmjs\.org api\.openai\.com|registry\.npmjs\.org api\.anthropic\.com|registry\.npmjs\.org api\.openai\.com|registry\.npmjs\.org github\.com ' "t1 allowlist per step"
 check "$(jq -r 'select(.event.type=="proxy") | .event.mode' "$m/log.jsonl" | tr '\n' ' ')" "work judge work judge push " "t1 proxy record per step"
-grep -q 'stub work secret=\[REDACTED\] net=[^ ]* proxy=[^ ]* npm=true/20[0-9][0-9]-' "$m/log.jsonl" || { echo "FAIL: t1 npm policy not on the docker run line"; grep 'stub work' "$m/log.jsonl"; exit 1; }
+grep -q 'stub work secret=\[REDACTED\] net=[^ ]* proxy=[^ ]* npm=true/20[0-9][0-9]-[^ ]* model=claude-opus-5-5/10/gpt-6.1-sol' "$m/log.jsonl" || { echo "FAIL: t1 npm policy or model/budget not on the docker run line"; grep 'stub work' "$m/log.jsonl"; exit 1; }
+# Pins, cost and redaction: model and budget in the manifest; each worker round's reported cost; the report sums them; the encoded secret
+# and a token by shape are redacted in the log, and the shaped token in the judge's review is redacted in judge-<n>.md.
+check "$(jq -r '"\(.model) \(.judge_model) \(.budget_usd) \(.image_pinned)"' "$m/manifest.json")" "claude-opus-5-5 gpt-6.1-sol 10 false" "t1 model, budget and image pin in manifest"
+check "$(jq -c '.worker.rounds | map([.round, .status, .reported_cost_usd, .num_turns])' "$m/manifest.json")" "[[1,0,0.12,3],[2,0,0.12,3]]" "t1 worker rounds with cost"
+check "$("$here/factory" report 1 | tail -1 | awk '{print $5}')" 0.24 "t1 report cost column"
+! grep -q "$(printf '%s' stub-token | base64)" "$m/log.jsonl" || { echo "FAIL: t1 base64 of the token leaked into the log"; exit 1; }
+check "$(grep -c 'b64=\[REDACTED\] shape=\[REDACTED\]' "$m/log.jsonl")" 2 "t1 encoded and shaped tokens redacted in the log"
+check "$(grep -c 'saw key \[REDACTED\] and mine b64 \[REDACTED\]' "$m/judge-1.md")" 1 "t1 shaped token and the judge's encoded key redacted in the judge file"
+! grep -q "ghs_yyyy\|$(printf '%s' dummy-openai_key | base64)" "$m/judge-1.md" "$m/log.jsonl" || { echo "FAIL: t1 shaped token or encoded judge key leaked"; exit 1; }
 check "$(jq -r '.npm_policy.ignore_scripts' "$m/manifest.json")" true "t1 npm policy in manifest"; check "$(jq -r '.npm_policy.before' "$m/manifest.json" | cut -c1-2)" 20 "t1 npm before date in manifest"
+# Image pin: without FACTORY_ALLOW_DIRTY, an image other than IMAGE_ID refuses to start (before the dirty-tree check). A bad budget refuses too.
+set +e; out=$(PATH="$t/bin:$PATH" FACTORY_SECRETS_DIR="$t/secrets" "$here/factory" run "$t/t1.json" 2>&1); rc=$?; set -e
+check "$rc" 1 "image pin exit"; case "$out" in *"is sha256:stub, not the pinned sha256:"*) ;; *) echo "FAIL: image pin message: $out"; exit 1;; esac
+check "$(FACTORY_BUDGET_USD=abc run b1 "VERIFIED")" 1 "bad budget exit"
+# Evidence: a failing log stage (jq here) in a worker or a judge round is outcome evidence_error, exit 12: nothing further runs, nothing is pushed.
+rc=$(STUB_JQ_FAIL=work run e1 "VERIFIED"); m=$(ls -d "$runs"/*-e1 | tail -1)
+check "$rc" 12 "e1 evidence error exit"; check "$(jq -r '"\(.outcome) \(.final_sha) \(.exit_status)"' "$m/manifest.json")" "evidence_error null 12" "e1 manifest"; check "$(grep -c 'stub judge' "$m/log.jsonl")" 0 "e1 no judge ran"
+check "$(jq -c '.worker.rounds | map([.round, .status, .reported_cost_usd])' "$m/manifest.json")" "[[1,0,null]]" "e1 the round is recorded with no cost"; check "$("$here/factory" report 1 | tail -1 | awk '{print $5}')" "?" "e1 report shows unknown cost"
+rc=$(STUB_JQ_FAIL=push run e3 "VERIFIED"); m=$(ls -d "$runs"/*-e3 | tail -1)   # the push may have completed before its record was lost: final_sha is kept
+check "$rc" 12 "e3 evidence error exit (push step)"; check "$(jq -r '"\(.outcome) \(.pr_url)"' "$m/manifest.json")" "evidence_error null" "e3 manifest"; check "$(jq -r .final_sha "$m/manifest.json")" "$(git -C "$t/remote.git" rev-parse refs/heads/factory/e3)" "e3 final_sha is the pushed commit"
+rc=$(STUB_JQ_FAIL=judge run e2 "VERIFIED"); m=$(ls -d "$runs"/*-e2 | tail -1)
+check "$rc" 12 "e2 evidence error exit (judge round)"; check "$(jq -r '"\(.outcome) \(.final_sha) \(.pr_url) \(.judge.rounds // 0)"' "$m/manifest.json")" "evidence_error null null 0" "e2 manifest: no push, no PR, round not counted"
 # A proxy that never listens: the run fails (exit 1) before the step runs, with the proxy's output in the log. A step whose network
 # record cannot be collected (the 3rd `docker logs`: readiness poll, readiness check, collection) fails the run too; the step itself ran.
 rc=$(STUB_PROXY_DEAD=1 run t1p "VERIFIED"); m=$(ls -d "$runs"/*-t1p | tail -1)
@@ -294,6 +324,7 @@ rc=$(STUB_APP_KEY="$t/app-key.b64" STUB_PRS="$t/prs" FACTORY_NOTIFY_URL=http://n
 check "$rc" 0 "gh chain exit"; check "$(jq -r .base "$t/prs" | tr '\n' ' ')" "main main " "gh chain PRs both target main"
 check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" "done: 2 run, 2 PR(s), 0 failed. All tasks ran." "summary counts the PRs opened (no per-task line: both passed)"; rm -f "$t/notify"
 check "$(jq -r .head "$t/prs" | tr '\n' ' ')" "factory/010-gc-a factory/020-gc-b " "gh chain PR heads"
+check "$(grep -c 'saw key \[REDACTED\]' "$t/prs")" 2 "gh chain PR bodies carry the redacted review"; ! grep -q 'ghs_yyyy' "$t/prs" || { echo "FAIL: shaped token leaked into a PR body"; exit 1; }
 m=$(ls -d "$runs"/*-020-gc-b | tail -1); check "$(jq -r '"\(.base_branch) \(.chain_base)"' "$m/manifest.json")" "main factory/010-gc-a" "gh chain 020 manifest"
 git -C "$t/remote.git" merge-base --is-ancestor refs/heads/factory/010-gc-a refs/heads/factory/020-gc-b || { echo "FAIL: gh chain 020 not cut from 010"; exit 1; }
 # An ambiguous POST /pulls (422 "already exists", or a 201 whose body has no URL) is reconciled against the open PR from this head: exit 0, URL recorded.
@@ -313,4 +344,4 @@ mkdir -p "$runs/stoptest"; echo '{"ended_at":null,"exit_status":null}' > "$runs/
 PATH="$t/bin:$PATH" STUB_DOCKER_PS_FAIL=1 "$here/factory" stop stoptest > "$t/stop.out" 2>&1 || { echo "FAIL: stop with docker down exited $?"; cat "$t/stop.out"; exit 1; }
 check "$(jq -r .exit_status "$runs/stoptest/manifest.json")" 137 "stop with docker down records the incident"; rm -f "$here/HALT"; rm -rf "$runs/stoptest"
 find "$runs" -maxdepth 1 -newer "$t/secrets" \( -name 'batch-*.md' -o -name '*-0[0-9]0-[a-z][a-z]-[a-d]' \) -exec rm -rf {} +   # the GitHub-path batch cases ran after the first sweep
-echo "ok: egress (per-step proxy, allowlists, network record, dead proxy, lost record), supply chain (credential in tree, in task, in lint; dependency manifest gate and its Scope permission; npm policy; requeue notes), judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, five rounds, App bot commit identity and its failed lookup), gates (blocked note, conflict with the target), lint, batch (chain, refuted chain, chain after a failure, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run, blocked reason on the phone), requeue (blocked, refuted, skipped), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), stop with docker down"
+echo "ok: egress (per-step proxy, allowlists, network record, dead proxy, lost record), pins (image id, model, budget), cost per round and report, evidence error (worker, judge), redaction (encoded, by shape: log, judge file, PR body), supply chain (credential in tree, in task, in lint; dependency manifest gate and its Scope permission; npm policy; requeue notes), judge loop (revise, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, five rounds, App bot commit identity and its failed lookup), gates (blocked note, conflict with the target), lint, batch (chain, refuted chain, chain after a failure, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run, blocked reason on the phone), requeue (blocked, refuted, skipped), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), stop with docker down"
