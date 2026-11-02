@@ -10,4 +10,6 @@ Tests: one per behaviour the task adds, at the boundary a caller or user sees. N
 
 Prefer deleting over adding. Follow the repository's existing conventions over your own. If the smallest correct change looks too simple, make it anyway and say so in the commit message.
 
+Never kill process groups or processes you did not start: your own session is one of them, and a kill that takes it out ends the task with nothing to show.
+
 An independent reviewer will read the diff, run the checks, try to break the change, and will send the branch back for revision if it finds bugs, scope creep, or code the task did not need.

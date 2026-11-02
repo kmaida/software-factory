@@ -157,16 +157,18 @@ export FACTORY_NOTIFY_URL='https://ntfy.sh/YOUR_TOPIC'   # optional
 | `--no-chain` | Base every task on its own `base_branch`. |
 | `--continue` | Keep going after a failure. Tasks whose `base_branch` names a task that failed or was skipped in this batch are skipped too, and moved to `failed/<batch_id>-<task_id>.json` unrun. |
 
-By default, the first failure (any exit other than 0) stops the batch, and the remaining tasks stay in the queue. After each task, `batch` moves its file to `queue/done/` on exit 0 or to `queue/failed/` otherwise, so rerunning `batch` never repeats a task. At the end, `batch` writes a report to `runs/batch-<timestamp>.md`.
+Every failed run is classed in its manifest as `task` (it cannot pass as specified: refuted, blocked, a dependency change, a credential in the input, no changes) or `infra` (something around it failed: no verdict, a conflict with a target that moved, a PR open that failed, a gate that could not fetch, a token, a proxy, a kill). A task failure moves the file to `queue/failed/` and, without `--continue`, stops the batch; the remaining tasks stay in the queue. An infra failure never stops the batch by itself: with nothing pushed (`pushed: false`) the file stays in the queue under its own id for the next night; with a branch pushed the task is retried once, next, as `<id>-i1` from the same chain base (a conflict with no chain head retries from the task's own base; mid-chain it is archived instead, since neither base would do), and a retry that fails the same way is the task's own failure. A stopped run (`factory stop`) is a task failure, never re-dispatched. Two infra failures in a row from different tasks stop the batch with the queue as it is. Exit 0, or `pr_failed` (judged and pushed, every gate clean, only the PR missing), moves the file to `queue/done/` and the chain goes on from it. Ids ending in `-i<N>` belong to the batch; do not write them by hand. Rerunning `batch` never repeats a task. At the end, `batch` writes a report to `runs/batch-<timestamp>.md` with a note per row (`retrying as …`, `nothing pushed; left in queue`, `retry failed the same way`), and exits with the status of the last task that did not pass tonight, 0 when every task passed or was recovered by its retry.
 
 ### Notifications
 
 With `FACTORY_NOTIFY_URL` set, `batch` posts plain-text lines to it:
 
-- For each task that fails: `<batch_id>: <task> exited <status> (<outcome or verdict>, continuing|stopped)`. The outcome is `blocked`, `dependency_change`, `conflict` or `gate_error` when a gate stopped the PR, or `credential_in_input` when the run refused to start. A blocked task adds `: <reason>` from its note.
-- Once when the batch ends, whatever happened: `<batch_id>: done: <n> run, <k> PR(s), <f> failed, <b> blocked. All tasks ran.` (the blocked count appears only when it isn't zero) or `Stopped: <reason>. <m> task(s) left in queue.`
+- For each task that fails: `<batch_id>: <task> exited <status> (<outcome or verdict>, continuing|stopped|retrying as <id>-i1|left in queue)`. The outcome is `blocked`, `dependency_change`, `conflict` or `gate_error` when a gate stopped the PR, or `credential_in_input` when the run refused to start; an infra failure says `infra: …`. A blocked task adds `: <reason>` from its note. A task that exits 4 sends a line too (open its PR by hand), although it counts as passed.
+- Once when the batch ends, whatever happened: `<batch_id>: done: <n> run, <k> PR(s), <f> failed, <b> blocked, <i> infra. All tasks ran.` (the blocked and infra counts appear only when they aren't zero) or `Stopped: <reason>. <m> task(s) left in queue.`
 
-Passing and skipped tasks send nothing of their own, and skipped tasks don't count as run or failed. Passing tasks are quiet because GitHub already notifies you of each PR. If no message arrives at all, the batch never reached its end (lint, `HALT` or the lock refused it, or it was killed), or the endpoint was unreachable. The batch's own output tells you which; a batch refused at startup writes no report. A single `factory run` sends nothing.
+Passing and skipped tasks send nothing of their own, and skipped tasks don't count as run or failed. Passing tasks are quiet because GitHub already notifies you of each PR. A single `factory run` sends nothing.
+
+`batch` prints `notify: <host>` (the host only, never the path, which carries the topic) or `notify: off (FACTORY_NOTIFY_URL not set)` after taking the lock, and the same in the report header; a POST that fails prints `notify: POST failed (curl exit N)` to stderr and the batch goes on. So if no message arrives at all, read the batch's output or the report header: `notify: off` means the variable was not in the batch's environment (put the `export` in `~/.zshenv`, not `~/.zshrc`: an ssh one-liner and launchd read no rc file); a `POST failed` line means the endpoint; neither means the batch never reached its end (lint, `HALT` or the lock refused it, or it was killed), and a batch refused at startup writes no report.
 
 ### Stopping
 
@@ -190,7 +192,7 @@ Each run leaves its evidence in `runs/<run_id>/`, where `run_id` is `<UTC timest
 |---|---|
 | `0` | The PR is open. |
 | `3` | The worker made no changes. Nothing was pushed. |
-| `4` | The branch was pushed, but opening the PR failed. `pr_error` in the manifest has the HTTP status and body. |
+| `4` | The branch was pushed, but opening the PR failed (`outcome: pr_failed`). `pr_error` in the manifest has the HTTP status and body. |
 | `5` | The judge refuted the final round. The branch was pushed with no PR. |
 | `6` | The judge gave no verdict. The branch was pushed with no PR. |
 | `10` | Blocked: the branch's only change is a `docs/BLOCKED-*` note. `reason` in the manifest has its first line. No PR. |
@@ -199,6 +201,8 @@ Each run leaves its evidence in `runs/<run_id>/`, where `run_id` is `<UTC timest
 | `13` | Refused to start: the task text or the base tree contains something shaped like a credential. `reason` names the file (or `instructions`), never the content. No container ran and no agent credential was issued; the task-text check runs before anything is minted, the tree check after the clone, so by then the one-hour clone token exists. |
 | `14` | The branch changes a dependency manifest (`package.json`, a lockfile) and the task's Scope doesn't name `package.json`. The branch was pushed with no PR; `reason` lists the files. |
 | Other | The orchestrator or a worker round failed. Check the end of `log.jsonl` and the factory's stderr. |
+
+Every non-zero exit also carries `class` (`task` or `infra`) and `pushed` (`true`, `false`, or `null` when the push step started and its result is unknown; `final_sha` is set only on a successful push, and a failed one records `outcome: push_failed`). `batch` reads both: see [Batches](#batches).
 
 In the morning, run `./factory report`, then review the stacked PRs from the bottom up. Merge the oldest first, and each later PR's diff shrinks to its own commits.
 
