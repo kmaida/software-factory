@@ -151,6 +151,18 @@ export FACTORY_NOTIFY_URL='https://ntfy.sh/YOUR_TOPIC'   # optional
 | `./factory ruleset-check <owner/name>` | The negative tests of a repo's rulesets with real tokens (a push to `next` refused, a merge without `factory-gate` refused, a stale sha 409, an App approval or merge on `main` refused); run once after setting up `next` and the merger App. |
 | `./canary.sh <owner/name>` | The factory's own canary queue against a throwaway repo: run after every factory merge and before a real night, asserts each run's manifest. |
 
+### Before a real night
+
+On the mini, after any factory merge, in this order:
+
+1. `git -C ~/software-factory pull --ff-only`
+2. Rebuild the image if the Dockerfile changed (the `IMAGE_ID` header in `factory` says how).
+3. `./canary.sh kmaida/test-repo` and wait for exit 0.
+4. `./factory batch queue --continue > runs/night.out 2>&1 &`
+5. `caffeinate -i -w $! &`
+
+Never skip step 3. The canary's task ids are as long as real ones; a hand-written smoke task with a short id proves only the short path (2026-11-02: the proxy's DNS name broke above 63 bytes, every real task failed, the smoke had passed).
+
 ### Batches
 
 `batch` chains tasks. Each task cuts its branch from the last task in the batch that passed, so dependent tasks build on each other overnight without waiting for a merge. A failed task's branch is never used as a base. Every PR still targets its task's own `base_branch`, so a later PR shows the earlier tasks' commits until those merge. A chained queue must target one repo.
