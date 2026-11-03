@@ -232,8 +232,10 @@ Status is Implemented, Partial, or Planned. Each has a check that proves it. (re
 - **Egress allowlist, 2026-11-01** (plan item 1; PR `egress`). `factory run` creates one `--internal` network per run
   (`factory-<run_id>`, labelled `factory.run` so orphan cleanup covers it) and `run_container` starts one proxy per
   step (`<container>-proxy`: `proxy.js` from this checkout, in the sandbox image with the same hardening flags, on
-  the bridge and connected to the run's network, `ALLOW` from a per-mode constant in `factory`), waits for its
-  `listening` line, runs the step with `--network` and the four proxy vars, then collects the proxy's decisions into
+  the bridge and connected to the run's network under the alias `proxy`, `ALLOW` from a per-mode constant in `factory`), waits for its
+  `listening` line, runs the step with `--network` and the four proxy vars pointing at `proxy:8888` (the alias, never the container
+  name: a name over 63 bytes is not a resolvable DNS label, and every real task id makes one; 2026-11-02, two runs, ENOTFOUND, circuit
+  breaker), then collects the proxy's decisions into
   `log.jsonl` as `type: proxy` events and removes it. Per-step proxies so a worker never shares one with the judge or
   the push. Decisions are collected after the step, not streamed: simplest, and the only loss is a run the
   orchestrator abandons. Not in the manifest; the log is the network record. The README's Network row is Partial:

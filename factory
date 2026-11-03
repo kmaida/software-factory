@@ -236,7 +236,10 @@ run_container() {  # run_container <mode> <secret> [docker args...] -- [entrypoi
   egress_record() { docker logs "$pname" 2>&1 | jq -R -c --arg r "$run_id" --arg m "$mode" '{run_id:$r, ts:(now|todate), event:((. as $l | try fromjson catch {text:$l}) + {type:"proxy", mode:$m})}' >> "$logf"; }
   docker run -d --name "$pname" --label "factory.run=$run_id" --read-only --memory 256m --pids-limit 64 --cap-drop ALL --security-opt no-new-privileges \
     --network bridge -e ALLOW="$allow" -v "$FACTORY_DIR/proxy.js":/proxy.js:ro --entrypoint node "$image_digest" /proxy.js >/dev/null || die "proxy $pname did not start"
-  docker network connect "$net" "$pname" || die "cannot connect $pname to $net"
+  # --alias proxy: the step reaches it as "proxy", not by container name. A container name is a DNS label, and a label over 63 bytes resolves
+  # to nothing (ENOTFOUND): "factory-<timestamp>-<task id>-work-1-proxy" passes 63 for any task id over 25 characters. The alias is per
+  # network, and the network is per run, so it is unique where it matters.
+  docker network connect --alias proxy "$net" "$pname" || die "cannot connect $pname to $net"
   for i in 1 2 3 4 5 6 7 8 9 10; do docker logs "$pname" 2>&1 | grep -q '"listening"' && break; sleep 0.5; done   # ~100 ms normally
   docker logs "$pname" 2>&1 | grep -q '"listening"' || { egress_record || true; die "proxy $pname is not listening after 5s; its output is in the log"; }
   log "container $cname starting; egress ^(?:$allow)$ via $pname"
@@ -246,7 +249,7 @@ run_container() {  # run_container <mode> <secret> [docker args...] -- [entrypoi
   printf '%s\n' "$secret" \
   | docker run -i --name "$cname" --label "factory.run=$run_id" --rm --read-only --tmpfs /tmp --tmpfs /run/secrets:size=64k \
     --memory 4g --cpus 2 --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges \
-    --network "$net" -e HTTPS_PROXY="http://$pname:8888" -e https_proxy="http://$pname:8888" -e HTTP_PROXY="http://$pname:8888" -e http_proxy="http://$pname:8888" \
+    --network "$net" -e HTTPS_PROXY=http://proxy:8888 -e https_proxy=http://proxy:8888 -e HTTP_PROXY=http://proxy:8888 -e http_proxy=http://proxy:8888 \
     -e NPM_CONFIG_IGNORE_SCRIPTS=true -e NPM_CONFIG_BEFORE="$npm_before" \
     -e FACTORY_MODEL="$FACTORY_MODEL" -e JUDGE_MODEL="$JUDGE_MODEL" -e REVIEW_MODEL="$REVIEW_MODEL" -e FINDINGS_SCHEMA="$FINDINGS_SCHEMA" \
     -e MODE="$mode" -e TASK_ID="$task_id" -e BASE_BRANCH="$from_branch" \

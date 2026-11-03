@@ -55,7 +55,8 @@ cat > "$t/bin/docker" <<'D'
 # Stub: emulates the entrypoint modes on the host-side mounts. $STUB_VERDICTS lists the verdict per judge round; $STUB_REVIEW the
 # break-it review's findings per gate cycle (none, regress, preexist, unmet, invalid, many, bad, crash; default none); the verifier runs
 # the real verify.js against the host mounts (STUB_VERIFY_CRASH=1: it exits 1 with no record).
-case "$1" in info) exit 0;; image) echo sha256:stub; exit 0;; ps) [ "${STUB_DOCKER_PS_FAIL:-}" = 1 ] && exit 1; exit 0;; rm|stop|network) exit 0;;
+case "$1" in info) exit 0;; image) echo sha256:stub; exit 0;; ps) [ "${STUB_DOCKER_PS_FAIL:-}" = 1 ] && exit 1; exit 0;; rm|stop) exit 0;;
+  network) [ "$2" != connect ] || [ -z "${STUB_NETLOG:-}" ] || echo "$*" >> "$STUB_NETLOG"; exit 0;;
   logs) n=$(cat "$STUB_LOGS" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_LOGS"   # STUB_PROXY_DEAD: never listens; STUB_LOGS_FAIL=<n>: the n-th `docker logs` fails
         [ "${STUB_PROXY_DEAD:-}" = 1 ] || echo '{"listening":8888,"allow":"stub"}'; [ "$n" -ge "${STUB_LOGS_FAIL:-999}" ] && exit 1; exit 0;; esac
 set -e; mode= work= jwork= net= detached= args=()
@@ -142,7 +143,7 @@ chmod +x "$t/bin/"*
 run() {  # run <task_id> <verdicts> -> prints exit status; RUN_REPO overrides the local bare repo (a GitHub owner/name goes through the App path); RUN_INSTR the instructions (JSON-escaped)
   echo "{\"repo\":\"${RUN_REPO:-$t/remote.git}\",\"base_branch\":\"${RUN_BASE:-main}\",\"task_id\":\"$1\",\"instructions\":\"${RUN_INSTR:-do the thing}\"}" > "$t/$1.json"
   rm -f "$t/state" "$t/state.r" "$t/state.p" "$t/state.m" "$t/state.g" "$t/allow" "$t/logs"; set +e   # FACTORY_MAX_ROUNDS=3: the verdict fixtures below are written for three rounds; one case sets 5
-  PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_ALLOW="$t/allow" STUB_LOGS="$t/logs" STUB_PROMPT="$t/prompt" STUB_APP_KEY="$t/app-key.b64" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_MAX_ROUNDS="${FACTORY_MAX_ROUNDS:-3}" \
+  PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_ALLOW="$t/allow" STUB_NETLOG="$t/netlog" STUB_LOGS="$t/logs" STUB_PROMPT="$t/prompt" STUB_APP_KEY="$t/app-key.b64" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_MAX_ROUNDS="${FACTORY_MAX_ROUNDS:-3}" \
     "$here/factory" run "$t/$1.json" >"$t/$1.out" 2>&1; rc=$?; set -e
   echo "$rc"
 }
@@ -158,7 +159,9 @@ check "$(git -C "$t/remote.git" log -1 --format='%an <%ae> %cn <%ce>' refs/heads
 check "$(jq -r '"\(.git_identity.name) <\(.git_identity.email)>"' "$m/manifest.json")" "$bot" "t1 git_identity in manifest"
 grep -q 'Review of your previous attempt (round 1 verdict: REFUTED)' "$m/log.jsonl" || grep -q 'round 2: judge verdict VERIFIED' "$m/log.jsonl" || { echo "FAIL: t1 revision prompt/log"; exit 1; }
 # Egress: each step ran on the run's internal network behind its own proxy, the proxy got that step's allowlist, and its decisions are in the log.
-grep -q 'stub work secret=\[REDACTED\] net=factory-[0-9TZ]*-t1 proxy=http://factory-[0-9TZ]*-t1-work-1-proxy:8888' "$m/log.jsonl" || { echo "FAIL: t1 worker not on the run network behind its proxy"; grep 'stub work' "$m/log.jsonl"; exit 1; }
+# The proxy is reached by its network alias, never by container name: a name over 63 bytes is not a resolvable DNS label (2026-11-02: every real task id).
+grep -q 'stub work secret=\[REDACTED\] net=factory-[0-9TZ]*-t1 proxy=http://proxy:8888' "$m/log.jsonl" || { echo "FAIL: t1 worker not on the run network behind its proxy alias"; grep 'stub work' "$m/log.jsonl"; exit 1; }
+grep -q '^network connect --alias proxy factory-[0-9TZ]*-t1 factory-[0-9TZ]*-t1-work-1-proxy$' "$t/netlog" || { echo "FAIL: t1 proxy not aliased on the run network"; cat "$t/netlog"; exit 1; }
 check "$(tr '\n' ' ' < "$t/allow")" 'api\.anthropic\.com|registry\.npmjs\.org api\.openai\.com|registry\.npmjs\.org api\.anthropic\.com|registry\.npmjs\.org api\.openai\.com|registry\.npmjs\.org github\.com api\.anthropic\.com|registry\.npmjs\.org registry\.npmjs\.org ' "t1 allowlist per step (the gate's review and verifier after the push)"
 check "$(jq -r 'select(.event.type=="proxy") | .event.mode' "$m/log.jsonl" | tr '\n' ' ')" "work judge work judge push review verify " "t1 proxy record per step"
 grep -q 'stub work secret=\[REDACTED\] net=[^ ]* proxy=[^ ]* npm=true/20[0-9][0-9]-[^ ]* model=claude-opus-5-5/gpt-6.1-sol/claude-opus-5-5 schema=[1-9]' "$m/log.jsonl" || { echo "FAIL: t1 npm policy, models or schema not on the docker run line"; grep 'stub work' "$m/log.jsonl"; exit 1; }
