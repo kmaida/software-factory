@@ -1214,10 +1214,13 @@ cmd_unhold() {  # factory unhold <queue/held/<id>.json | <id>.proposed.json>: af
   dir=${h%/held}; id=$(jq -r .task_id "$f"); b=$(basename "$f" .json); b=${b%.proposed}
   [ "$id" = "$b" ] || die "task_id $id is not the held file's id $b"
   [ ! -e "$dir/$id.json" ] || die "$dir/$id.json already exists"
-  take_lock; echo unhold > "$LOCK/run_id"; echo $$ > "$LOCK/pid"; trap 'rm -rf "$LOCK"' EXIT   # no batch lists the queue while the file is in it unlinted
+  # Under the lock (no batch lists the queue while the file is in it unlinted), with INT and TERM ignored from the copy to the cleanup, so
+  # a stop leaves the task held or released, never both, and the EXIT trap (which bash 3.2 skips on an unhandled TERM) frees the lock.
+  take_lock; trap 'rm -rf "$LOCK"' EXIT; trap 'exit 130' INT TERM; echo unhold > "$LOCK/run_id"; echo $$ > "$LOCK/pid"
+  trap '' INT TERM
   cp "$f" "$dir/.$id.json.$$" || die "cannot write into $dir"; mv "$dir/.$id.json.$$" "$dir/$id.json" || die "cannot write $dir/$id.json"   # a failed copy keeps the held files
   out=$(cmd_lint "$dir") || { rm -f "${dir:?}/${id:?}.json"; die "not unheld: with $id the queue fails lint (the batch would refuse the night):"$'\n'"$out"; }
-  rm -f "${h:?}/${id:?}.json" "$h/$id.reason" "$h/$id.proposed.json"
+  rm -f "${h:?}/${id:?}.json" "$h/$id.reason" "$h/$id.proposed.json"; trap 'exit 130' INT TERM
   mkdir -p "$RUNS"; printf '%s\tunhold\t%s\t%s\t%s\n' "$(now)" "$id" "$(shasum -a 256 "$dir/$id.json" | cut -d' ' -f1)" "${USER:-?}" >> "$RUNS/touches.tsv"
   echo "unheld $id: $dir/$id.json"
 }
