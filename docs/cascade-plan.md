@@ -27,7 +27,7 @@ Next, in order, one branch and one PR each, merged before the next starts:
    **To enable, with the operator: the `next` ruleset on the target repo and a separate merger App with its Keycard
    resource (factory.md, "The merge gate"), then `ruleset-check` and `canary.sh` on the mini, then `MERGER_APP_ID` by PR.**
    `scope_widened` holds come with loop 5, which creates them.
-4. Loop 1 (deep lint: additions and holds only, `held/`, `unhold`): PR #LOOP1PR, with `deep-lint-replay.sh` and its score on
+4. Loop 1 (deep lint: additions and holds only, `held/`, `unhold`): PR #54, with `deep-lint-replay.sh` and its score on
    the 2026-11-03 night in the PR body. Then loop 6 (`factory status`, the `main` ⊆ `next` invariant, the revert procedure).
 5. Loop 5 (triage with attribution, the revision file, host requeue with locked Goal and Done when and the Scope refusal
    list, one revision ever, the audit paragraph).
