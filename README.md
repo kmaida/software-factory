@@ -157,7 +157,7 @@ On the mini, after any factory merge, in this order:
 
 1. `git -C ~/software-factory pull --ff-only`
 2. Rebuild the image if the Dockerfile changed (the `IMAGE_ID` header in `factory` says how).
-3. `./canary.sh kmaida/test-repo` and wait for exit 0.
+3. `./canary.sh kmaida/test-repo` and wait for exit 0. The canary repo needs a root `package.json` whose `npm test` passes, and its lockfile; without them the pass and manifest canaries end blocked.
 4. `./factory batch queue --continue > runs/night.out 2>&1 &`
 5. `caffeinate -i -w $! &`
 

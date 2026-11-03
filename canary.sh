@@ -1,6 +1,8 @@
 #!/bin/bash
 # canary.sh <owner/name> [batch flags]: the factory's own verification (docs/cascade-plan.md, loop 7). Run on the mini after every factory
-# merge and before a real night, against a throwaway repo that has a `next` branch (merge mode) or not (PR-only mode). Writes a canary
+# merge and before a real night, against a throwaway repo that has a `next` branch (merge mode) or not (PR-only mode). The repo needs a
+# root package.json whose `npm test` passes, and its lockfile: the judge runs npm test, and the manifest canary needs a manifest to change
+# (with only a README, the pass and manifest canaries both end blocked, as on 2026-11-03). Writes a canary
 # queue, runs `factory batch` on it, then asserts each run's manifest: outcome, class, exit_status, gate.result and merge.state. Exit 1 on
 # any mismatch. Of the plan's seven canaries this covers the four a plain repo can carry: a task that passes the gate (and merges when
 # merge mode is on), a task with an impossible Scope (the worker's note: blocked), a task that depends on it (waits on a dead task), and a
