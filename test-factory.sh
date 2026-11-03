@@ -59,10 +59,10 @@ case "$1" in info) exit 0;; image) echo sha256:stub; exit 0;; ps) [ "${STUB_DOCK
   network) [ "$2" != connect ] || [ -z "${STUB_NETLOG:-}" ] || echo "$*" >> "$STUB_NETLOG"; exit 0;;
   logs) n=$(cat "$STUB_LOGS" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_LOGS"   # STUB_PROXY_DEAD: never listens; STUB_LOGS_FAIL=<n>: the n-th `docker logs` fails
         [ "${STUB_PROXY_DEAD:-}" = 1 ] || echo '{"listening":8888,"allow":"stub"}'; [ "$n" -ge "${STUB_LOGS_FAIL:-999}" ] && exit 1; exit 0;; esac
-set -e; mode= work= jwork= net= detached= args=()
+set -e; mode= work= jwork= net= detached= queue= args=()
 while [ $# -gt 0 ]; do case "$1" in
   -e) case "$2" in MODE=*) mode=${2#MODE=};; *) export "$2";; esac; shift 2;;
-  -v) case "$2" in *:/work) work=${2%%:*};; *:/src:ro) src=${2%%:*};; *:/out) out=${2%%:*};; *:/in:ro) vin=${2%%:*};; *:/verify.js:ro) vjs=${2%%:*};; esac; shift 2;;
+  -v) case "$2" in *:/work) work=${2%%:*};; *:/src:ro) src=${2%%:*};; *:/out) out=${2%%:*};; *:/in:ro) vin=${2%%:*};; *:/verify.js:ro) vjs=${2%%:*};; *:/queue:ro) queue=${2%%:*};; esac; shift 2;;
   --network) net=$2; shift 2;;
   --name|--label|--tmpfs|--memory|--cpus|--pids-limit|--security-opt|--entrypoint) shift 2;;
   -d) detached=1; shift;;
@@ -93,7 +93,12 @@ case "$mode" in
         elif [ -n "${STUB_WORK_DIFF:-}" ]; then echo new > a.txt; sed -i '' 's/old/new/' t.test.js   # the code and its test change together   # a nested manifest, in a path git quotes in --name-only output
         else echo "${args[0]}" >> work.log; fi
         git add -A; git -c commit.gpgsign=false -c user.name=w -c user.email=w@w commit -qm "round";;
-  judge) n=$(cat "$STUB_STATE" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_STATE"
+  judge) if [ -n "$queue" ]; then   # deep lint: the queue mounted read-only, the base at its tip. STUB_DEEP: the answer (a file), crash, or unset (every task as it is)
+           [ "$HEAD_SHA" = "$(git -C "$src" rev-parse "origin/$BASE_BRANCH")" ] || { echo "stub: deep lint is not at the tip of $BASE_BRANCH" >&2; exit 9; }
+           case "${args[$((${#args[@]}-1))]}" in "You review a queue of coding tasks"*"## Inputs"*"Queue directory: /queue (read-only). Tasks, in order: "*) ;; *) echo "stub: deep lint prompt" >&2; exit 9;; esac
+           case "${STUB_DEEP:-}" in crash) exit 1;; "") jq -n '{tasks:[inputs | {task_id, depends_on:(.depends_on // []), hold:null}]}' "$queue"/*.json > "$out/verdict.md";; *) cp "$STUB_DEEP" "$out/verdict.md";; esac; exit 0
+         fi
+         n=$(cat "$STUB_STATE" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_STATE"
          v=$(echo "$STUB_VERDICTS" | cut -d, -f$n)
          # STUB_CONFLICT=<remote>: main moves under the run, with a change that conflicts with the worker's (both edit README.md).
          [ -z "${STUB_CONFLICT:-}" ] || [ "${STUB_CONFLICT_TASK:-$TASK_ID}" != "$TASK_ID" ] || ( git clone -q "$STUB_CONFLICT" "$out/c" && cd "$out/c" && echo moved > README.md && git -c commit.gpgsign=false -c user.name=m -c user.email=m@m commit -qam moved && git push -q origin HEAD:main ) || true   # already moved on a retry's round
@@ -255,7 +260,7 @@ taskd o/r main 040-d "$body" "$t/lint-dep2" '["999-z"]'; task o/x main 050-e "$b
 set +e; out=$("$here/factory" lint "$t/lint-dep2"); rc=$?; set -e; check "$rc" 1 "lint depends_on bad exit"
 printf '%s\n' "$out" | grep -q "010-a: depends_on 020-b is a later task in the queue; reorder" || { echo "FAIL: lint later dep: $out"; exit 1; }
 printf '%s\n' "$out" | grep -q "030-c: depends_on 030-c is the task itself" || { echo "FAIL: lint self dep: $out"; exit 1; }
-printf '%s\n' "$out" | grep -q "040-d: depends_on 999-z is not a task in this queue, done/ or failed/" || { echo "FAIL: lint unknown dep: $out"; exit 1; }
+printf '%s\n' "$out" | grep -q "040-d: depends_on 999-z is not a task in this queue, done/, failed/ or held/" || { echo "FAIL: lint unknown dep: $out"; exit 1; }
 printf '%s\n' "$out" | grep -q "060-f: depends_on 050-e is a task of another repo" || { echo "FAIL: lint cross-repo dep: $out"; exit 1; }
 printf '{"repo":"o/r","base_branch":"main","task_id":"070-g","instructions":"%s","depends_on":["", 1]}\n' "$body" > "$t/lint-dep2/070-g.json"
 printf '{"repo":"o/r","base_branch":"main","task_id":"080-h","instructions":"%s","depends_on":["010-a 020-b","*"]}\n' "$body" > "$t/lint-dep2/080-h.json"
@@ -265,7 +270,7 @@ printf '%s\n' "$out" | grep -q "080-h: depends_on '010-a 020-b' is not a task id
 # bytes after the move to done/), base_branch stays the task's own and chain_base is in the manifest, and the report has one row per task.
 batch() {  # batch <queue-dir> <verdicts> [flags...] -> exit status; output in $t/batch.out
   rm -f "$t/state" "$t/state.r" "$t/state.p" "$t/state.m" "$t/state.g"; set +e
-  PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_MAX_ROUNDS=3 \
+  PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_MAX_ROUNDS=3 FACTORY_DEEP_LINT="${FACTORY_DEEP_LINT:-0}" \
     "$here/factory" batch "$1" "${@:3}" > "$t/batch.out" 2>&1; rc=$?; set -e
   echo "$rc"
 }
@@ -392,6 +397,80 @@ queue dy 010-dy-a 015-dy-b; taskd "$t/remote.git" main 020-dy-c "$body" "$t/dy" 
 rc=$(batch "$t/dy" "REFUTED,REFUTED,REFUTED,VERIFIED" --continue); check "$rc" 1 "deps worst-first: dead behind an open dependency decides"
 grep -q 'waiting on 010-dy-a (dead): nothing queued' "$(ls "$runs"/batch-*.md | tail -1)" && grep -q 'waiting on 020-dy-c (waiting itself)' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: deps worst-first rows"; cat "$t/batch.out"; exit 1; }
 check "$(moved dy)" "020-dy-c.json 030-dy-d.json done failed " "deps worst-first: both waiters untouched"
+# Deep lint (loop 1). `lint --deep` runs the judge arm once, with the queue mounted read-only and the base at its tip (the stub checks both,
+# and the prompt); STUB_DEEP is the session's answer. Additions land in place under the same id, after the original text, with the host's
+# paragraph and nothing else changed; an id the answer drops stays (refused, said); a hold moves the task to held/ beside its reason and the
+# proposal; a supplier that runs later is held for reordering; lint knows a held task and the batch waits on it as dead. All or nothing.
+deep() {  # deep <queue-dir> [answer-file|crash] -> exit status; output in $t/deep.out
+  sleep 1; set +e   # a deep-lint run id is a second plus "deep-lint": two in one second would collide
+  PATH="$t/bin:$PATH" STUB_DEEP="${2:-}" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 "$here/factory" lint --deep "$1" > "$t/deep.out" 2>&1; rc=$?; set -e; echo "$rc"
+}
+answer() { jq -n "$1" > "$t/answer-$2.json"; echo "$t/answer-$2.json"; }   # answer <jq program> <name>: the session's final message
+dlm() { jq -r "$1" "$(ls -d "$runs"/*-deep-lint | tail -1)/manifest.json"; }   # the last deep-lint run's manifest
+queue dl 010-dl-a 020-dl-b; taskd "$t/remote.git" main 030-dl-c "$body" "$t/dl" '["010-dl-a"]'; queue dl 040-dl-d
+cp "$t/dl/020-dl-b.json" "$t/dl-020.orig"; s010=$(shasum < "$t/dl/010-dl-a.json"); s030=$(shasum < "$t/dl/030-dl-c.json")
+a=$(answer '{tasks:[{task_id:"010-dl-a",depends_on:[],hold:null},{task_id:"020-dl-b",depends_on:["010-dl-a"],hold:null},
+  {task_id:"030-dl-c",depends_on:[],hold:null},{task_id:"040-dl-d",prerequisites:[{need:"x",source:"020-dl-b",evidence:"y"}],depends_on:["020-dl-b","010-dl-a-r1"],hold:null}]}' dl)
+rc=$(deep "$t/dl" "$a"); check "$rc" 0 "deep lint: applied"
+check "$(jq -c '[.task_id, .depends_on]' "$t/dl/020-dl-b.json")" '["020-dl-b",["010-dl-a"]]' "deep lint: depends_on added in place, under the same id"
+check "$(jq -r --slurpfile o "$t/dl-020.orig" '(.instructions|startswith($o[0].instructions)) and ((.instructions|ltrimstr($o[0].instructions))|test("^\n\nDeep lint \\(run [0-9TZ]+-deep-lint\\) added these to depends_on, [^\n]*runs/[0-9TZ]+-deep-lint/deep-lint.json: 010-dl-a\\.$")) and (del(.instructions,.depends_on)==($o[0]|del(.instructions)))' "$t/dl/020-dl-b.json")" true "deep lint: the text as it was, then the host's paragraph (ids only), nothing else changed"
+check "$(jq -c .depends_on "$t/dl/040-dl-d.json")" '["010-dl-a-r1","020-dl-b"]' "deep lint: every supplier added"
+check "$(shasum < "$t/dl/010-dl-a.json") $(shasum < "$t/dl/030-dl-c.json")" "$s010 $s030" "deep lint: a task with nothing to add, and one whose answer dropped an id, are byte-identical"
+grep -q '^  refused 030-dl-c: the answer dropped 010-dl-a, which stays$' "$t/deep.out" || { echo "FAIL: deep lint refused removal not said"; cat "$t/deep.out"; exit 1; }
+check "$(dlm '[.deep_lint.result, (.deep_lint.added|length), (.deep_lint.refused|length), (.deep_lint.held|length), .exit_status] | @json')" '["applied",2,1,0,0]' "deep lint: the manifest"
+check "$(dlm .base_sha)" "$(git -C "$t/remote.git" rev-parse main)" "deep lint: read the base at its tip"
+check "$("$here/factory" lint "$t/dl" | tail -1)" "lint ok: 4 task(s)" "deep lint: the result passes lint"
+queue dh 010-dh-a 020-dh-b 030-dh-c 040-dh-d; cp "$t/dh/010-dh-a.json" "$t/dh-010.orig"
+a=$(answer '{tasks:[{task_id:"010-dh-a",depends_on:[],hold:{kind:"contradiction",reason:"Done when needs x.js;\nScope lists s",proposed_instructions:"Goal: g.\nContext: c.\nScope: s, x.js.\nDone when: tests pass.\nOut of scope: o."}},
+  {task_id:"020-dh-b",depends_on:["030-dh-c"],hold:null},{task_id:"030-dh-c",depends_on:["010-dh-a"],hold:null},{task_id:"040-dh-d",depends_on:[],hold:null}]}' dh)
+rc=$(deep "$t/dh" "$a"); check "$rc" 0 "deep lint: holds applied"
+check "$(moved dh) / $(moved dh/held)" "030-dh-c.json 040-dh-d.json held  / 010-dh-a.json 010-dh-a.proposed.json 010-dh-a.reason 020-dh-b.json 020-dh-b.proposed.json 020-dh-b.reason " "deep lint: a held task leaves the queue for held/, three files each"
+cmp -s "$t/dh/held/010-dh-a.json" "$t/dh-010.orig" || { echo "FAIL: deep lint: the held file is not the task as it was"; exit 1; }
+check "$(cat "$t/dh/held/010-dh-a.reason")" "contradiction: Done when needs x.js; Scope lists s" "deep lint: the reason, one line"
+check "$(jq -r '"\(.task_id) \(.instructions|test("Scope: s, x.js")) \(has("depends_on"))"' "$t/dh/held/010-dh-a.proposed.json")" "010-dh-a true false" "deep lint: the proposal is the operator's to apply"
+check "$(cut -c1-61 "$t/dh/held/020-dh-b.reason") $(jq -c .depends_on "$t/dh/held/020-dh-b.proposed.json")" 'ordering: relies on 030-dh-c, which is not an earlier task in ["030-dh-c"]' "deep lint: a supplier that runs later is held for reordering"
+check "$(jq -c .depends_on "$t/dh/030-dh-c.json")" '["010-dh-a"]' "deep lint: a supplier held tonight is still a dependency"
+check "$("$here/factory" lint "$t/dh" | head -1)" "graph: 030-dh-c <- 010-dh-a" "lint: a held task is known (a wait, not an unknown id)"
+check "$(dlm '[.deep_lint.held[] | .task_id + " " + .kind] | join(", ")')" "010-dh-a contradiction, 020-dh-b ordering" "deep lint: the holds in the manifest"
+# The batch: a dependency held for a human is a dead wait; the free task runs; the holds count (exit 10 each, behind tonight's failures).
+rc=$(FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/dh" "VERIFIED"); check "$rc" 1 "held dependency: a dead wait decides the exit"
+grep -q '^| - | waiting | - | - | - | - | - | waiting on 010-dh-a (dead): held: contradiction: Done when needs x.js; Scope lists s |' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: held dependency row"; cat "$t/batch.out"; exit 1; }
+check "$(moved dh/done)" "040-dh-d.json " "held dependency: the free task ran"
+check "$(tail -1 "$t/notify" | sed -E 's/^batch-[0-9]+T[0-9]+Z: //')" "done: 1 run, 0 PR(s), 0 failed, 1 waiting (1 on a dead dependency), 2 held. All tasks ran. 1 task(s) left in queue (1 waiting on a dependency), 2 held for a human (queue/held/)." "held: counted in the summary"; rm -f "$t/notify"
+# unhold: the given file back under its own id, the task's held files gone, the touch recorded; refused outside held/ or over a queued file.
+[ ! -e "$runs/touches.tsv" ] || cp -p "$runs/touches.tsv" "$t/touches.bak"   # the operator's record survives the test
+set +e; "$here/factory" unhold "$t/dh/030-dh-c.json" >/dev/null 2>&1; rc=$?; set -e; check "$rc" 1 "unhold: refused outside held/"
+"$here/factory" unhold "$t/dh/held/010-dh-a.proposed.json" > /dev/null
+check "$(moved dh/held) / $(jq -r '"\(.task_id) \(.instructions|test("Scope: s, x.js"))"' "$t/dh/010-dh-a.json")" "020-dh-b.json 020-dh-b.proposed.json 020-dh-b.reason  / 010-dh-a true" "unhold: the proposal queued under its own id, its held files gone"
+check "$(tail -1 "$runs/touches.tsv" | cut -f2,3) $(tail -1 "$runs/touches.tsv" | cut -f4)" "unhold	010-dh-a $(shasum -a 256 "$t/dh/010-dh-a.json" | cut -d' ' -f1)" "unhold: the touch recorded with the file's hash"
+cp "$t/dh/held/020-dh-b.json" "$t/dh/020-dh-b.json"; set +e; "$here/factory" unhold "$t/dh/held/020-dh-b.json" >/dev/null 2>&1; rc=$?; set -e; check "$rc" 1 "unhold: refused over a queued file"
+rm "$t/dh/020-dh-b.json"; set +e; out=$("$here/factory" unhold "$t/dh/held/020-dh-b.proposed.json" 2>&1); rc=$?; set -e   # its proposal names 030, later in the queue
+check "$rc $(moved dh/held) $(ls "$t/dh"/020-dh-b.json 2>/dev/null | wc -l | tr -d ' ')" "1 020-dh-b.json 020-dh-b.proposed.json 020-dh-b.reason  0" "unhold: refused when the queue would fail lint, nothing moved"
+case "$out" in *"020-dh-b: depends_on 030-dh-c is a later task in the queue; reorder"*) ;; *) echo "FAIL: unhold lint message: $out"; exit 1;; esac
+if [ -e "$t/touches.bak" ]; then cp -p "$t/touches.bak" "$runs/touches.tsv"; else rm -f "$runs/touches.tsv"; fi
+# All held, deep lint inside the batch: each hold notified once with its reason, a held row each, nothing ran, exit 10, never a quiet success.
+queue da 010-da-a 020-da-b
+a=$(answer '{tasks:[{task_id:"010-da-a",depends_on:[],hold:{kind:"human_input",reason:"docs/pins.md is blank",proposed_instructions:""}},{task_id:"020-da-b",depends_on:[],hold:{kind:"missing_prerequisite",reason:"no GET /x | for its caller",proposed_instructions:""}}]}' da)
+sleep 1; rc=$(FACTORY_DEEP_LINT=1 STUB_DEEP="$a" FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/da" "VERIFIED"); check "$rc" 10 "all held: exit 10, not success"
+check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" "010-da-a held by deep lint (human_input): docs/pins.md is blank
+020-da-b held by deep lint (missing_prerequisite): no GET /x / for its caller
+done: 0 run, 0 PR(s), 0 failed, 2 held. Nothing ran. 0 task(s) left in queue, 2 held for a human (queue/held/)." "all held: each hold notified, the summary says held"; rm -f "$t/notify"
+rep=$(ls "$runs"/batch-*.md | tail -1); grep -q '^| - | held | - | - | - | - | - | 010-da-a (human_input): docs/pins.md is blank |$' "$rep" && grep -q 'deep lint: run [0-9TZ]*-deep-lint, 0 task(s) gained depends_on, 2 held$' "$rep" || { echo "FAIL: all held: report"; cat "$rep"; exit 1; }
+# Transactional: an answer that misses a task, and one whose additions fail the deterministic lint (a supplier of another repo), change nothing,
+# the hold beside it included; no held/, no staging left. A queue that fails lint never reaches the container.
+queue dx 010-dx-a 020-dx-b; mkdir -p "$t/dx/done"; task o/x main 005-dx-z "$body" "$t/dx/done"; sx=$(cat "$t/dx"/*.json | shasum)
+rc=$(deep "$t/dx" "$(answer '{tasks:[{task_id:"010-dx-a",depends_on:[],hold:null}]}' dx1)"); check "$rc $(dlm .deep_lint.result)" "6 invalid" "deep lint: an answer that misses a task changes nothing"
+rc=$(deep "$t/dx" "$(answer '{tasks:[{task_id:"010-dx-a",depends_on:[],hold:{kind:"contradiction",reason:"r",proposed_instructions:""}},{task_id:"020-dx-b",depends_on:["005-dx-z"],hold:null}]}' dx2)")
+check "$rc $(dlm .deep_lint.result)" "6 refused" "deep lint: a proposed queue that fails lint changes nothing"
+grep -q '020-dx-b: depends_on 005-dx-z is a task of another repo' "$t/deep.out" || { echo "FAIL: deep lint: lint's refusal not shown"; cat "$t/deep.out"; exit 1; }
+check "$(cat "$t/dx"/*.json | shasum) $(ls -A "$t/dx" | tr '\n' ' ')" "$sx 010-dx-a.json 020-dx-b.json done " "deep lint: transactional (the queue as it was, no held/, no staging)"
+n0=$(ls -d "$runs"/*-deep-lint | wc -l); rc=$(deep "$t/lint-bad"); check "$rc $(ls -d "$runs"/*-deep-lint | wc -l)" "1 $n0" "deep lint: a queue that fails lint is refused before any run"
+grep -q 'the queue fails lint' "$t/deep.out" || { echo "FAIL: deep lint lint refusal"; cat "$t/deep.out"; exit 1; }
+# A deep lint that fails (the session crashed) changes nothing; the night runs on the deterministic lint, and the phone says so.
+queue df 010-df-a; sleep 1; rc=$(FACTORY_DEEP_LINT=1 STUB_DEEP=crash FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/df" "VERIFIED")
+check "$rc $(moved df/done)" "0 010-df-a.json " "deep lint failed: the task still ran"
+check "$(head -1 "$t/notify" | sed -E 's/^batch-[0-9]+T[0-9]+Z: //; s/run [0-9TZ]+-deep-lint/run <id>/')" "deep lint failed (exit 6, run <id>); the night runs on the deterministic lint" "deep lint failed: notified"; rm -f "$t/notify"
+grep -q 'deep lint: failed (exit 6, run [0-9TZ]*-deep-lint); deterministic lint only$' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: deep lint failure not in the report"; exit 1; }
 queue cg 005-cg-z 010-cg-a; rc=$(STUB_CONFLICT="$t/remote.git" STUB_CONFLICT_TASK=010-cg-a batch "$t/cg" "VERIFIED,VERIFIED" --continue)
 check "$rc" 11 "conflict mid-chain: exit"; check "$(moved cg/done)" "005-cg-z.json " "conflict mid-chain: the chain head stays"; check "$(moved cg/failed)" "010-cg-a.json " "conflict mid-chain: archived, no retry"
 check "$(ls "$t/cg"/*.json 2>/dev/null | wc -l | tr -d ' ')" 0 "conflict mid-chain: no retry file"; grep -q '010-cg-a | 11 |.*| conflicts with main mid-chain; not retried' "$(ls "$runs"/batch-*.md | tail -1)" || { echo "FAIL: conflict mid-chain row"; cat "$t/batch.out"; exit 1; }
@@ -668,4 +747,4 @@ mkdir -p "$runs/stoptest"; echo '{"ended_at":null,"exit_status":null}' > "$runs/
 PATH="$t/bin:$PATH" STUB_DOCKER_PS_FAIL=1 "$here/factory" stop stoptest > "$t/stop.out" 2>&1 || { echo "FAIL: stop with docker down exited $?"; cat "$t/stop.out"; exit 1; }
 check "$(jq -r '"\(.exit_status) \(.outcome) \(.class)"' "$runs/stoptest/manifest.json")" "137 stopped task" "stop with docker down records the incident; a stopped task is class task (never re-dispatched by the batch)"; rm -f "$here/HALT"; rm -rf "$runs/stoptest"
 find "$runs" -mindepth 1 -maxdepth 1 -newer "$t/secrets" -exec rm -rf {} +   # everything the run tree gained since this test began is the test's (the lock keeps a real run out)
-echo "ok: egress (per-step proxy, allowlists, network record, dead proxy, lost record), pins (image id, models, no spend cap), cost per round and report, evidence error (worker, judge), redaction (encoded, by shape: log, judge file, PR body), supply chain (credential in tree, in task, in lint; dependency manifest gate and its Scope permission; npm policy; requeue notes), judge loop (revise with facts and claims apart, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, five rounds, App bot commit identity and its failed lookup), verification gate (clean gate ships with the record in the PR body; pre-existing, invalid and truncated never block; a regression and an unmet clause cost one worker round with the facts, one judge round with the facts and a re-gate; crashed or invalid review, crashed verifier, a stop during the review are gate_pending and retried as -i1; a failed second push keeps the first; no new commits, the same repro twice, REFUTED in a cycle and the MAX_GATES ceiling are refuted by the gate; blocked and conflict never reach it; the differential test checks with npm ci), gates (blocked: round-1 note skips the judge, note on code, note in round 2 after REFUTED and after CAVEATS, deleted note, a directory is not a note, a replace ref does not skip the judge, manifest ahead of blocked; the worker prompt names the note path; conflict with the target), lint, batch (chain, refuted chain, chain after a failure, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run left in queue, blocked reason on the phone, notify host and off state, failed POST visible, infra retry recovered / failed the same way / conflict cut from its own base / conflict mid-chain not retried, hand-queued -i1 after a pass, circuit breaker, pr_failed chains, a stopped run is class task, depends_on: passed tonight / not merged waits / merged runs / no-chain waits / queued waits / dead notified and non-zero / pruned record unknown / worst dependency decides / declared base waiting / GitHub merged, open, reverted by exact title, 502 and 403 unknown, merged elsewhere dead / one cached read-only token), class and pushed in the manifest, lint depends_on (graph, later, self, unknown, other repo, schema, id grammar, malformed archive), requeue (blocked, refuted, skipped), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), merge gate (merged into next by the merger App; PR-only without it; held on chain taint and on the cap; open on a failed check post, a refused merge, a timeout, a conflict; a lost answer reconciled; the batch's main-in-next check; ruleset-check against the stubs), stop with docker down"
+echo "ok: egress (per-step proxy, allowlists, network record, dead proxy, lost record), pins (image id, models, no spend cap), cost per round and report, evidence error (worker, judge), redaction (encoded, by shape: log, judge file, PR body), supply chain (credential in tree, in task, in lint; dependency manifest gate and its Scope permission; npm policy; requeue notes), judge loop (revise with facts and claims apart, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, five rounds, App bot commit identity and its failed lookup), verification gate (clean gate ships with the record in the PR body; pre-existing, invalid and truncated never block; a regression and an unmet clause cost one worker round with the facts, one judge round with the facts and a re-gate; crashed or invalid review, crashed verifier, a stop during the review are gate_pending and retried as -i1; a failed second push keeps the first; no new commits, the same repro twice, REFUTED in a cycle and the MAX_GATES ceiling are refuted by the gate; blocked and conflict never reach it; the differential test checks with npm ci), gates (blocked: round-1 note skips the judge, note on code, note in round 2 after REFUTED and after CAVEATS, deleted note, a directory is not a note, a replace ref does not skip the judge, manifest ahead of blocked; the worker prompt names the note path; conflict with the target), lint, batch (chain, refuted chain, chain after a failure, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run left in queue, blocked reason on the phone, notify host and off state, failed POST visible, infra retry recovered / failed the same way / conflict cut from its own base / conflict mid-chain not retried, hand-queued -i1 after a pass, circuit breaker, pr_failed chains, a stopped run is class task, depends_on: passed tonight / not merged waits / merged runs / no-chain waits / queued waits / dead notified and non-zero / pruned record unknown / worst dependency decides / declared base waiting / GitHub merged, open, reverted by exact title, 502 and 403 unknown, merged elsewhere dead / one cached read-only token), class and pushed in the manifest, lint depends_on (graph, later, self, unknown, other repo, schema, id grammar, malformed archive), requeue (blocked, refuted, skipped), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), merge gate (merged into next by the merger App; PR-only without it; held on chain taint and on the cap; open on a failed check post, a refused merge, a timeout, a conflict; a lost answer reconciled; the batch's main-in-next check; ruleset-check against the stubs), deep lint (additions in place with the host's paragraph, a dropped id refused, holds with reason and proposal, a later supplier held for reordering, a held dependency known to lint and a dead wait in the batch, all held is exit 10 and notified, an invalid answer and a proposal that fails lint change nothing, a queue that fails lint never reaches the container, a failed deep lint falls through to the deterministic lint, notified), unhold (back under its own id, touch recorded, refused outside held/ or over a queued file), stop with docker down"

@@ -33,7 +33,8 @@ Done when: left-pad is listed under devDependencies and the lockfile is updated.
 Out of scope: everything else. Do not change any source file."
 echo "queue: $q (base $base, merge mode $([ "$base" = next ] && echo on || echo off))"
 "$here/factory" lint "$q"
-rc=0; "$here/factory" batch "$q" --continue "$@" || rc=$?
+# FACTORY_DEEP_LINT=0: 020 and 040 are impossible on purpose, and deep lint would hold them before they run; the canaries test the run path.
+rc=0; FACTORY_DEEP_LINT=0 "$here/factory" batch "$q" --continue "$@" || rc=$?
 echo "batch exit $rc"
 fails=0
 expect() {  # expect <task id> <jq expression> <want>
