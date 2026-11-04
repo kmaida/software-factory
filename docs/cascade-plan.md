@@ -27,8 +27,8 @@ Next, in order, one branch and one PR each, merged before the next starts:
    **To enable, with the operator: the `next` ruleset on the target repo and a separate merger App with its Keycard
    resource (factory.md, "The merge gate"), then `ruleset-check` and `canary.sh` on the mini, then `MERGER_APP_ID` by PR.**
    `scope_widened` holds come with loop 5, which creates them.
-4. Loop 1 (deep lint: additions and holds only, `held/`, `unhold`) and loop 6 (`factory status`, the `main` ⊆ `next`
-   invariant, the revert procedure).
+4. Loop 1 (deep lint: additions and holds only, `held/`, `unhold`): PR #54, with `deep-lint-replay.sh` and its score on
+   the 2026-11-03 night in the PR body. Then loop 6 (`factory status`, the `main` ⊆ `next` invariant, the revert procedure).
 5. Loop 5 (triage with attribution, the revision file, host requeue with locked Goal and Done when and the Scope refusal
    list, one revision ever, the audit paragraph).
 6. Loop 7's replay (`factory rejudge`) against last night's branches; then fix cycles may send work back.
@@ -200,6 +200,15 @@ only output that cannot be steered into authority is a delay or a hold. If deep 
 deterministic lint with a notification. `factory unhold <held/file>` moves a task back under its own id after the
 operator's edit and records the touch; `requeue` is for tasks that ran. The task generator in the workshop repo emits
 `depends_on` as the first source; deep lint is the check on it.
+
+As built (2026-11-03), from that night's 11 blocks: two more checks in the prompt, **ambiguity** (a verb that carries the
+task, read the way a strict reviewer would, needing more than Scope, Context's dependencies and Out of scope allow: hold with
+a narrower or widened wording) and **human preconditions** (a file a person fills in before the task runs, still a
+template: hold). A supplier that is no earlier or archived task (a later one, an unknown id, the task itself) is a hold for
+the operator to reorder, not a lint failure that would void the rest. Deep lint lints the queue before it reads it (no
+credential-shaped text reaches the model) and reads one base per queue. `deep-lint-replay.sh` replays the night's 16 tasks
+against `bcbf690` with the real prompt and scores it by what the batch would have done: a task counts as flagged when it is
+held or made to wait on something that was not there. The canary runs with deep lint off: its tasks are impossible on purpose.
 
 ### 2. Task or infra: classify every outcome, retry infra, break the circuit
 

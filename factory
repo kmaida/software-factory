@@ -2,10 +2,12 @@
 # factory: orchestrator for the software factory. See factory.md.
 #   factory run <task-file>   validate job, mint run, docker run the sandbox, write manifest + log
 #   factory lint [dir]        check queue/*.json against the task rules in README.md before a batch
+#   factory lint --deep [dir] one Codex session reads the queue and its base: adds the depends_on a task lacks, holds what cannot pass (held/)
 #   factory batch [dir] [--max-tasks N] [--stop-at HH:MM] [--no-chain] [--continue]
 #                             the overnight queue: each task bases on the previous task's branch; stops on the first failure
 #   factory report [n]        one line per run from the manifests: exit, judge rounds, verdict, PR
 #   factory requeue <file>    copy a task from queue/failed/ back into the queue as <id>-r<N>, with the last attempt's findings
+#   factory unhold <file>     move a held task (queue/held/<id>.json or its .proposed.json) back into the queue under its own id
 #   factory stop <run_id>     kill the container, block new dispatch, record the incident
 #   factory ruleset-check <owner/name>  the negative tests of a target repo's rulesets with real tokens (run by hand; see factory.md)
 # Compatible with the macOS /bin/bash (3.2). Needs: docker, git, jq.
@@ -77,7 +79,7 @@ NPM_BEFORE_DAYS=7   # npm policy on the fixed docker run line: no install script
 GIT_CRED='!f() { h=; while IFS= read -r l; do case "$l" in host=*) h=${l#host=};; esac; done; [ "$h" = github.com ] || exit 0; echo username=x-access-token; echo "password=$(cat <&3)"; }; f'
 
 die()   { echo "factory: $*" >&2; exit 1; }
-usage() { echo "usage: factory run <task-file> | factory lint [dir] | factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--no-chain] [--continue] | factory report [n] | factory requeue <queue/failed/file.json> | factory stop <run_id> | factory ruleset-check <owner/name>" >&2; exit 2; }
+usage() { echo "usage: factory run <task-file> | factory lint [--deep] [dir] | factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--no-chain] [--continue] | factory report [n] | factory requeue <queue/failed/file.json> | factory unhold <queue/held/file.json> | factory stop <run_id> | factory ruleset-check <owner/name>" >&2; exit 2; }
 # Job schema: these four keys, all non-empty strings, plus an optional depends_on (task ids, non-empty strings). Everything else is derived by the orchestrator.
 JOB_SCHEMA='type=="object" and ((keys|sort)==["base_branch","instructions","repo","task_id"] or (keys|sort)==["base_branch","depends_on","instructions","repo","task_id"]) and (to_entries | all(if .key=="depends_on" then (.value|type=="array" and all(.[]; type=="string" and length>0)) else (.value|type=="string" and length>0) end))'
 base_id() { b=$1; while [[ "$b" =~ ^(.*)-[ri][0-9]+$ ]]; do b=${BASH_REMATCH[1]}; done; printf '%s' "$b"; }   # every -r<N> (requeue) and -i<N> (infra retry) suffix off: 010-x-r1-i1 is 010-x
@@ -118,7 +120,7 @@ notify() {  # notify <line>: POST "<batch_id>: <line>" to FACTORY_NOTIFY_URL whe
 }
 
 # ---------------------------------------------------------------- run
-run_id= net= work= jwork= jout= gate= rwork= rout= vin= vwork= vout= logf= borrowed=
+run_id= net= work= jwork= jout= gate= rwork= rout= vin= vwork= vout= stage= logf= borrowed=
 manifest_set() {  # manifest_set <jq-filter> [jq args...]: atomic update of this run's manifest
   f="$1"; shift
   jq "$@" "$f" "$rundir/manifest.json" > "$rundir/manifest.json.tmp.$$" && mv "$rundir/manifest.json.tmp.$$" "$rundir/manifest.json"
@@ -128,7 +130,7 @@ cleanup() {
   # Best effort, every step: a docker outage here must not stop the manifest from being finalized or the lock from being released.
   if [ -n "$run_id" ]; then c=$(docker ps -aq --filter "label=factory.run=$run_id" 2>/dev/null) || c=; [ -n "$c" ] && docker rm -f $c >/dev/null 2>&1 || true; fi
   [ -z "$net" ] || docker network rm "$net" >/dev/null 2>&1 || true   # after the containers: a network with members cannot be removed
-  for d in "$work" "$jwork" "$jout" "$gate" "$rwork" "$rout" "$vin" "$vwork" "$vout"; do [ -z "$d" ] || rm -rf "$d" 2>/dev/null || true; done   # never let a failed rm change the exit status
+  for d in "$work" "$jwork" "$jout" "$gate" "$rwork" "$rout" "$vin" "$vwork" "$vout" "$stage"; do [ -z "$d" ] || rm -rf "$d" 2>/dev/null || true; done   # never let a failed rm change the exit status
   # A run that died before finalizing still gets a terminal state, so no manifest is left open-ended.
   if [ -n "${rundir:-}" ] && [ -f "$rundir/manifest.json" ] && [ "$(jq -r .ended_at "$rundir/manifest.json")" = null ]; then
     manifest_set '. + {ended_at:$ended, exit_status:$rc} | '"$END_JQ" --arg ended "$(now)" --argjson rc "$rc"
@@ -142,6 +144,20 @@ take_lock() {  # one job at a time. mkdir is atomic. The lock names the holder's
     if [ "$lpid" -gt 0 ] 2>/dev/null && kill -0 "$lpid" 2>/dev/null; then die "another run is in progress: $(cat "$LOCK/run_id" 2>/dev/null) (pid $lpid)"; fi
     echo "reclaiming stale lock left by run $(cat "$LOCK/run_id" 2>/dev/null)" >&2
     rm -rf "$LOCK"; mkdir "$LOCK" || die "cannot take lock $LOCK"
+  fi
+}
+pin_image() {  # sets image_digest, image_pinned and factory_commit: the image and the factory a step runs on, both as reviewed
+  image_digest=$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null) || die "image $IMAGE not built; run: docker build -t $IMAGE ."
+  image_pinned=true
+  if [ "$image_digest" != "$IMAGE_ID" ]; then
+    [ "${FACTORY_ALLOW_DIRTY:-}" = 1 ] || die "image $IMAGE is $image_digest, not the pinned $IMAGE_ID; rebuild from this checkout, or bump IMAGE_ID by PR, or set FACTORY_ALLOW_DIRTY=1 for a development run"
+    image_pinned=false
+  fi
+  # Which factory ran: this checkout's commit. The definition changes only by reviewed PR and `git pull`; a dirty tree is not that.
+  factory_commit=$(git -C "$FACTORY_DIR" rev-parse HEAD 2>/dev/null) || factory_commit=
+  if [ -n "$factory_commit" ] && [ -n "$(git -C "$FACTORY_DIR" status --porcelain)" ]; then
+    [ "${FACTORY_ALLOW_DIRTY:-}" = 1 ] || die "factory checkout has uncommitted changes; land them by PR and git pull, or set FACTORY_ALLOW_DIRTY=1 for a development run"
+    factory_commit="$factory_commit-dirty"
   fi
 }
 b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
@@ -452,19 +468,7 @@ cmd_run() {
     *) for t in github_token openai_key; do [ -s "$FACTORY_SECRETS_DIR/$t" ] || die "missing or empty token file: $FACTORY_SECRETS_DIR/$t"; done ;;
   esac
   for f in worker-prompt.md judge-prompt.md review-prompt.md verify.js proxy.js; do [ -s "$FACTORY_DIR/$f" ] || die "missing $FACTORY_DIR/$f"; done
-
-  image_digest=$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null) || die "image $IMAGE not built; run: docker build -t $IMAGE ."
-  image_pinned=true
-  if [ "$image_digest" != "$IMAGE_ID" ]; then
-    [ "${FACTORY_ALLOW_DIRTY:-}" = 1 ] || die "image $IMAGE is $image_digest, not the pinned $IMAGE_ID; rebuild from this checkout, or bump IMAGE_ID by PR, or set FACTORY_ALLOW_DIRTY=1 for a development run"
-    image_pinned=false
-  fi
-  # Which factory ran: this checkout's commit. The definition changes only by reviewed PR and `git pull`; a dirty tree is not that.
-  factory_commit=$(git -C "$FACTORY_DIR" rev-parse HEAD 2>/dev/null) || factory_commit=
-  if [ -n "$factory_commit" ] && [ -n "$(git -C "$FACTORY_DIR" status --porcelain)" ]; then
-    [ "${FACTORY_ALLOW_DIRTY:-}" = 1 ] || die "factory checkout has uncommitted changes; land them by PR and git pull, or set FACTORY_ALLOW_DIRTY=1 for a development run"
-    factory_commit="$factory_commit-dirty"
-  fi
+  pin_image
 
   # Inside `factory batch` the batch loop holds the lock for the whole queue and this run borrows it: it records its own id and
   # pid there (so `factory stop` signals the run, not the loop) and cleanup leaves it for the loop instead of removing it.
@@ -716,12 +720,13 @@ cmd_run() {
 # ---------------------------------------------------------------- lint
 cmd_lint() {  # factory lint [dir]: the task rules in README.md ("Writing tasks") that a sleeping operator cannot enforce. Exit 1 on any problem.
   dir="${1:-$QUEUE}"; bad=0; n=0; seen=" "; seenb=" "
-  # For depends_on: the base ids in the queue (any position), and "<base id>=<normalised repo>" for everything archived under this queue.
+  # For depends_on: the base ids in the queue (any position), and "<base id>=<normalised repo>" for everything archived under this queue
+  # (done/, failed/, and held/: a task deep lint held for a human is known, and waiting on it is a dead wait, never an unknown id).
   # The queue's own entries join `known` as the loop goes, so a dependency on a later task is caught (filename order is the schedule:
   # reorder, do not wait a night). Archived files may be anything (the batch archives a malformed mid-night file too): never fatal here.
   qb=" "; known=" "
   for g in "$dir"/*.json; do [ -e "$g" ] || break; qb="$qb$(base_id "$(jq -r '.task_id // empty' "$g" 2>/dev/null || true)") "; done
-  for g in "$dir"/done/*.json "$dir"/failed/*.json; do [ -e "$g" ] || continue
+  for g in "$dir"/done/*.json "$dir"/failed/*.json "$dir"/held/*.json; do [ -e "$g" ] || continue
     known="$known$(base_id "$(jq -r '.task_id // empty' "$g" 2>/dev/null || true)")=$(repo_norm "$(jq -r '.repo // empty' "$g" 2>/dev/null || true)" 2>/dev/null && printf '%s' "$repo" || true) "; done
   for f in "$dir"/*.json; do
     [ -e "$f" ] || { echo "no task files in $dir"; return 0; }
@@ -736,12 +741,13 @@ cmd_lint() {  # factory lint [dir]: the task rules in README.md ("Writing tasks"
         db=$(base_id "$d")
         if [ "$db" = "$(base_id "$id")" ]; then p="$p; depends_on $d is the task itself"
         elif case " $qb " in *" $db "*) case " $seenb " in *" $db "*) false ;; esac ;; *) false ;; esac; then p="$p; depends_on $d is a later task in the queue; reorder (filename order is the schedule)"   # in the queue, not seen yet
-        else case "$known" in *" $db="*) case "$known" in *" $db=$rn "*) ;; *) p="$p; depends_on $d is a task of another repo" ;; esac ;; *) p="$p; depends_on $d is not a task in this queue, done/ or failed/" ;; esac
+        else case "$known" in *" $db="*) case "$known" in *" $db=$rn "*) ;; *) p="$p; depends_on $d is a task of another repo" ;; esac ;; *) p="$p; depends_on $d is not a task in this queue, done/, failed/ or held/" ;; esac
         fi
         g="$g $db"
       done < "$f.deps.$$"; rm -f "$f.deps.$$"
       [ -z "$g" ] || echo "graph: $(base_id "$id") <-$g"
       [ "$id" = "$name" ] || p="$p; task_id '$id' is not the filename"
+      [[ "$id" != *.proposed ]] || p="$p; task_id must not end in .proposed (held/<id>.proposed.json is deep lint's proposal)"
       [[ "$id" =~ $ID_RE && "$id" =~ ^[0-9]+[a-z]?- ]] || p="$p; task_id must be <number>-<name> (or <number><letter>-<name> for a split task: 019a-x, 019b-y) matching $ID_RE"
       [[ "$base" =~ $BRANCH_RE ]] || p="$p; base_branch has unexpected characters"
       # The five headings (README.md, "Writing tasks"), each at the start of a line, in order, and something after "Done when:".
@@ -762,6 +768,130 @@ cmd_lint() {  # factory lint [dir]: the task rules in README.md ("Writing tasks"
   [ "$bad" -eq 0 ] && echo "lint ok: $n task(s)"
   return "$bad"
 }
+# ---------------------------------------------------------------- lint --deep
+# The deep-lint answer's contract: every queued task exactly once, depends_on a list of task ids, hold null or {kind, reason, proposed_instructions}.
+DEEP_JQ='(.tasks|type=="array") and (.tasks|length)==($ids|length) and ([.tasks[]|objects|.task_id]|sort)==($ids|sort)
+  and all(.tasks[]; (.depends_on|type=="array" and all(.[]; type=="string" and test($re))) and (.hold==null or (.hold|type=="object"
+  and (.kind|IN("missing_prerequisite","contradiction","ambiguity","human_input")) and (.reason|type=="string" and length>0) and ((.proposed_instructions // "")|type=="string"))))'
+cmd_deep_lint() {  # factory lint --deep [dir] (docs/cascade-plan.md, loop 1): before a night, one fresh Codex session (the judge arm, with
+  # deep-lint-prompt.md) reads the queue and a clone of its base branch, both read-only, and says per task what it relies on and who supplies
+  # it. The host applies only what can delay a task, never what widens one: depends_on becomes original plus proposed (an id the answer drops
+  # is kept, and said), in place under the same id, with a paragraph the host writes from ids alone; a task with a prerequisite nobody
+  # supplies, a contradiction, an ambiguity, a blank human input, or a supplier that is no earlier or archived task, is held: held/<id>.json
+  # (the file as it was), held/<id>.reason, held/<id>.proposed.json (for the operator; nothing here applies it). No model text enters a queued
+  # task and Goal, Scope, Done when and Out of scope are never touched: under the merge gate the base is next, which agents wrote and no
+  # human read, so its text can steer this session, and a delay or a hold is the only output that cannot become authority. The proposed
+  # queue goes through the deterministic lint whole and is applied, or nothing is. Exit 0 when applied (holds listed, and in the manifest's
+  # deep_lint); any other exit changed nothing, unless the manifest says deep_lint.result "applying" (it died between the renames), and
+  # `batch` then runs on the deterministic lint.
+  dir="${1:-$QUEUE}"; [ -d "$dir" ] || die "no such queue: $dir"; dir=$(cd "$dir" && pwd)   # absolute: it is mounted
+  set -- "$dir"/*.json; [ -e "$1" ] || { echo "deep lint: no task files in $dir"; return 0; }; ntasks=$#
+  out=$(cmd_lint "$dir") || die "the queue fails lint; deep lint reads only a queue that passes it:"$'\n'"$out"
+  [ "$(jq -r .repo "$dir"/*.json | sort -u | wc -l)" -eq 1 ] || die "deep lint reads one base; this queue targets more than one repo"
+  repo_norm "$(jq -r .repo "$1")" || die "repo must be owner/name, a GitHub URL, another https URL, or a local path"
+  # ponytail: one base per queue (a declared factory/<id> base builds on an earlier task, which the prompt covers); one container per base if a queue mixes them
+  base=$(jq -r 'select(.base_branch|startswith("factory/")|not) | .base_branch' "$dir"/*.json | sort -u)
+  [ -n "$base" ] && [[ "$base" != *$'\n'* ]] || die "deep lint reads one base; this queue has $(printf '%s' "$base" | grep -c .) base branches"
+  command -v docker >/dev/null || die "docker not found; install Docker Desktop or OrbStack"
+  docker info >/dev/null 2>&1 || die "docker daemon is not running"
+  [ -e "$HALT" ] && die "dispatch blocked by $HALT ($(cat "$HALT")); remove it to resume"
+  [ -n "${FACTORY_SECRETS_DIR:-}" ] || die "FACTORY_SECRETS_DIR is not set"
+  for s in keycard_client_id keycard_client_secret; do [ -s "$FACTORY_SECRETS_DIR/$s" ] || die "missing or empty token file: $FACTORY_SECRETS_DIR/$s"; done
+  case "$repo_url" in https://github.com/*) gh_src=keycard ;;
+    *) gh_src=file; for s in github_token openai_key; do [ -s "$FACTORY_SECRETS_DIR/$s" ] || die "missing or empty token file: $FACTORY_SECRETS_DIR/$s"; done ;; esac
+  for s in deep-lint-prompt.md proxy.js; do [ -s "$FACTORY_DIR/$s" ] || die "missing $FACTORY_DIR/$s"; done
+  pin_image
+  # The lock and the run record as `factory run` keeps them: a batch lends its lock, `factory stop <run_id>` reaches the container.
+  if [ "${FACTORY_BATCH:-}" = "$PPID" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$PPID" ]; then borrowed=1; else take_lock; fi
+  trap cleanup EXIT; trap 'exit 130' INT TERM
+  run_id="$(date -u +%Y%m%dT%H%M%SZ)-deep-lint"; echo "$run_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"
+  umask 077; mkdir -p "$RUNS"; rundir="$RUNS/$run_id"; mkdir "$rundir" 2>/dev/null || die "run dir $rundir already exists; try again"
+  logf="$rundir/log.jsonl"; : > "$logf"; echo "deep lint $run_id"; echo "  evidence: $rundir"
+  jq -n --arg run_id "$run_id" --arg repo "$repo" --arg b "$base" --arg q "$dir" --argjson n "$ntasks" --arg image "$image_digest" --argjson pinned "$image_pinned" \
+        --arg fc "$factory_commit" --arg jmodel "$JUDGE_MODEL" --arg started "$(now)" \
+    '{run_id:$run_id, task_id:"deep-lint", repo:$repo, base_branch:$b, base_sha:null, queue:$q, tasks:$n, image_digest:$image, image_pinned:$pinned,
+      factory_commit:(if $fc=="" then null else $fc end), judge_model:$jmodel, started_at:$started, ended_at:null, exit_status:null, deep_lint:null}' > "$rundir/manifest.json"
+  task_id=deep-lint from_branch=$base round=1 git_name= git_email= npm_before=$(date -u -v-"${NPM_BEFORE_DAYS}"d +%Y-%m-%dT%H:%M:%SZ)   # what run_container hands every step
+  net="factory-$run_id"; docker network create --internal --label "factory.run=$run_id" "$net" >/dev/null || die "cannot create network $net"
+  # The base, read-only for the session: cloned on the host with the batch's read token (contents:read), never one that can push.
+  tok=$(dep_token "$repo" "$repo_url") || tok=; [ -n "$tok" ] || die "no read token for $repo"
+  work=$(mktemp -d "${TMPDIR:-/tmp}/factory-deep.XXXXXX")
+  git -c credential.helper= -c credential.helper="$GIT_CRED" clone -q "$repo_url" "$work" 3< <(printf '%s' "$tok") || die "clone failed: $repo_url"; tok=
+  base_sha=$(git -C "$work" rev-parse "origin/$base" 2>/dev/null) || die "base branch not found: $base"
+  manifest_set '. + {base_sha:$s}' --arg s "$base_sha"; log "cloned $repo_url at $base_sha"
+  # The same screen as a run's, for the same reason: the base goes to a model provider. The queue's text passed lint's screen above.
+  set +e; hit=$(git -C "$work" grep -a -l -E "$CRED_RE" "origin/$base" -- 2>&1); g=$?; set -e
+  case "$g" in 1) ;;
+    0) hit=${hit%%$'\n'*}; hit=${hit#*:}; manifest_set '. + {outcome:"credential_in_input", reason:$r}' --arg r "$hit"; log "refused: $hit on $base contains something shaped like a credential"; echo "deep lint: refused, $hit on $base looks like it holds a credential"; exit 13 ;;
+    *) log "credential scan of origin/$base failed (git grep exit $g). ${hit:0:2000}"; exit 12 ;;
+  esac
+  oa_key=$(openai_key) || oa_key=; [ -n "$oa_key" ] || die "no Codex key (Keycard $OPENAI_RESOURCE)"
+  jwork=$(mktemp -d "${TMPDIR:-/tmp}/factory-judge.XXXXXX"); jout=$(mktemp -d "${TMPDIR:-/tmp}/factory-judge-out.XXXXXX")
+  # Keep the Inputs section in step with deep-lint-replay.sh, which measures this prompt.
+  prompt="$(cat "$FACTORY_DIR/deep-lint-prompt.md")"$'\n\n'"## Inputs"$'\n'"Base: $base at $base_sha, your working directory."$'\n'"Queue directory: /queue (read-only). Tasks, in order: $(for f in "$dir"/*.json; do printf '%s ' "$(basename "$f" .json)"; done)"
+  log "deep lint ($JUDGE_MODEL) of $ntasks task(s) at $base_sha"
+  run_container judge "$oa_key" -v "$work":/src:ro -v "$jwork":/work -v "$jout":/out -v "$dir":/queue:ro -e HEAD_SHA="$base_sha" -- "$prompt"
+  # The answer counts only from a container that exited 0 and left a regular file in /out, bounded; the key in any form and anything shaped
+  # like a credential redacted before it is kept. A Markdown fence around the JSON is stripped (a formatting slip, not a different answer).
+  ans=; if [ "$status" -eq 0 ] && [ -f "$jout/verdict.md" ] && [ ! -L "$jout/verdict.md" ] && [ "$(wc -c < "$jout/verdict.md")" -le 2000000 ]; then
+    ans=$(tr -d '\r' < "$jout/verdict.md" | sed '1{/^```/d;}; ${/^```$/d;}'); fi
+  ans=${ans//"$oa_key"/[REDACTED]}; ans=${ans//"$(printf '%s' "$oa_key" | openssl base64 -A)"/[REDACTED]}; ans=${ans//"$(jq -rn --arg s "$oa_key" '$s|@uri')"/[REDACTED]}; oa_key=
+  printf '%s\n' "$ans" | redact > "$rundir/deep-lint.json"
+  ids=$(jq -cn '[inputs.task_id]' "$dir"/*.json)
+  if ! jq -e --argjson ids "$ids" --arg re "$ID_RE" "$DEEP_JQ" "$rundir/deep-lint.json" >/dev/null 2>&1; then
+    manifest_set '.deep_lint = {result:"invalid"}'; log "deep lint left no valid answer (container status $status); nothing changed"
+    echo "deep lint: no valid answer (container status $status); nothing changed"; exit 6
+  fi
+  # The proposed queue, staged beside the real one (same filesystem, so applying is a rename per file), with done/, failed/ and every held
+  # task so the deterministic lint sees what it would see tomorrow. A supplier must be an earlier task or an archived one: anything else (a
+  # later task, an id that is no task here, the task itself) cannot be a wait, so the task is held for the operator to reorder or supply.
+  stage=$(mktemp -d "$dir/.deep-lint.XXXXXX"); mkdir "$stage/held"
+  for a in done failed; do [ ! -d "$dir/$a" ] || ln -s "$dir/$a" "$stage/$a"; done
+  known=" "; for g in "$dir"/done/*.json "$dir"/failed/*.json "$dir"/held/*.json; do [ -e "$g" ] || continue
+    [ "$(dirname "$g")" != "$dir/held" ] || cp "$g" "$stage/held/"; known="$known$(base_id "$(jq -r '.task_id // empty' "$g" 2>/dev/null || true)") "; done
+  added='[]' held='[]' refused='[]'
+  para="Deep lint (run $run_id) added these to depends_on, each for something this task relies on that is not on $base at ${base_sha:0:12}; the evidence is in runs/$run_id/deep-lint.json:"
+  for f in "$dir"/*.json; do
+    id=$(jq -r .task_id "$f"); o=$(jq -c '.depends_on // []' "$f")
+    d=$(jq -c --arg id "$id" --argjson o "$o" 'def b: sub("(-[ri][0-9]+)+$"; ""); first(.tasks[] | select(.task_id==$id)) | (.depends_on|map(b)) as $p
+          | {add: ([.depends_on[] | select(b as $x | $o|map(b)|index($x)|not)] | unique_by(b)), drop: [$o[] | select(b as $x | $p|index($x)|not)], hold}' "$rundir/deep-lint.json")
+    late=; for a in $(jq -r '.add[]' <<< "$d"); do case "$known" in *" $(base_id "$a") "*) ;; *) late="$late $a" ;; esac; done
+    kind=$(jq -r '.hold.kind // empty' <<< "$d"); why=$(jq -r '.hold.reason // empty' <<< "$d")
+    [ -z "$late" ] || [ -n "$kind" ] || { kind=ordering; why="relies on$late, which is not an earlier task in the queue or an archived one: reorder the queue, or add the task that supplies it"; }
+    if [ -n "$kind" ]; then
+      why=$(printf '%s' "$why" | tr '\n' ' ' | cut -c1-500); cp "$f" "$stage/held/$id.json"; printf '%s: %s\n' "$kind" "$why" > "$stage/held/$id.reason"
+      jq --argjson a "$(jq -c .add <<< "$d")" --arg i "$(jq -r '.hold.proposed_instructions // ""' <<< "$d")" \
+        'if $a != [] then .depends_on = ((.depends_on // []) + $a) else . end | if $i != "" then .instructions = $i else . end' "$f" > "$stage/held/$id.proposed.json"
+      held=$(jq -c --arg id "$id" --arg k "$kind" --arg r "$why" '. + [{task_id:$id, kind:$k, reason:$r}]' <<< "$held")
+    elif [ "$(jq '.add|length' <<< "$d")" -gt 0 ]; then
+      jq --argjson a "$(jq -c .add <<< "$d")" --arg p "$para" '.depends_on = ((.depends_on // []) + $a) | .instructions += "\n\n" + $p + " " + ($a|join(", ")) + "."' "$f" > "$stage/$id.json"
+      added=$(jq -c --arg id "$id" --argjson a "$(jq -c .add <<< "$d")" '. + [{task_id:$id, depends_on:$a}]' <<< "$added")
+    else cp "$f" "$stage/$id.json"; fi
+    [ "$(jq '.drop|length' <<< "$d")" -eq 0 ] || refused=$(jq -c --arg id "$id" --argjson x "$(jq -c .drop <<< "$d")" '. + [{task_id:$id, dropped:$x}]' <<< "$refused")
+    known="$known$(base_id "$id") "
+  done
+  if ! out=$(cmd_lint "$stage" 2>&1); then
+    manifest_set '.deep_lint = {result:"refused", lint:$l}' --arg l "${out:0:4000}"; log "the proposed queue fails lint; nothing changed. ${out:0:2000}"
+    echo "deep lint: the proposed queue fails lint; nothing changed:"; printf '%s\n' "$out"; exit 6
+  fi
+  # Applied: holds first (the held files, then the queue file goes), then the additions, with INT and TERM ignored for the renames, so a stop
+  # leaves the queue as it was or as answered (HALT still stops the batch). The manifest says "applying" (with the plan) before the first
+  # rename and "applied" as the last step, so an exit in between is told apart from one that changed nothing: the batch reports it as a
+  # queue that may be partly changed. ponytail: one rename per file and an honest record, not a rollback; every partial state passes lint
+  # (each change stands alone), and a hold left undone is held again at the next deep lint.
+  manifest_set '.deep_lint = {result:"applying", added:$a, held:$h, refused:$r}' --argjson a "$added" --argjson h "$held" --argjson r "$refused"
+  trap '' INT TERM; mkdir -p "$dir/held"
+  for id in $(jq -r '.[].task_id' <<< "$held"); do mv "$stage/held/$id.json" "$stage/held/$id.reason" "$stage/held/$id.proposed.json" "$dir/held/"; rm -f "${dir:?}/${id:?}.json"; done
+  for id in $(jq -r '.[].task_id' <<< "$added"); do mv "$stage/$id.json" "$dir/$id.json"; done
+  trap 'exit 130' INT TERM
+  jq -r '.[] | "  added \(.task_id): depends_on + \(.depends_on|join(" "))"' <<< "$added"
+  jq -r '.[] | "  refused \(.task_id): the answer dropped \(.dropped|join(" ")), which stays"' <<< "$refused"
+  jq -r '.[] | "  held \(.task_id) (\(.kind)): \(.reason)"' <<< "$held"
+  log "deep lint applied: $(jq length <<< "$added") addition(s), $(jq length <<< "$held") hold(s), $(jq length <<< "$refused") refused drop(s)"
+  echo "deep lint: $(jq length <<< "$added") task(s) gained depends_on, $(jq length <<< "$held") held"
+  manifest_set '.deep_lint.result = "applied"'
+}
+
 # What a dependency is to the task about to run, from the queue dir and GitHub, printed as "<state> [reason]":
 #   merged    a merged PR from factory/<id> (or a -r<N>/-i<N> head of it) into the dependent's base branch, and no merged PR titled
 #             `Revert "factory: <id>"` (the revert button's exact title). Dry runs (a local repo) have no PRs: the run's final_sha is an
@@ -771,7 +901,8 @@ cmd_lint() {  # factory lint [dir]: the task rules in README.md ("Writing tasks"
 #   unknown   GitHub or the run record could not be asked (HTTP error, no token, a pruned runs/ dir, a base that cannot be fetched):
 #             a wait, said as such, never a verdict either way
 #   reverted  merged, then reverted
-#   dead      none of the above: failed with nothing queued, closed unmerged, or merged into another branch than the base
+#   dead      none of the above: failed with nothing queued, held for a human by deep lint (its reason said), closed unmerged, or merged
+#             into another branch than the base
 # Candidates are the done/ files whose id normalises to the base id and whose repo is the dependent's. Precedence: merged as soon as one
 # candidate is, else queued, open, unknown, reverted, dead. GitHub is the truth for merged; done/ only says a PR was opened.
 dep_state() {  # dep_state <queue-dir> <base id> <repo as in the task> <base_branch>
@@ -814,6 +945,8 @@ dep_state() {  # dep_state <queue-dir> <base id> <repo as in the task> <base_bra
     esac
   done
   [ -z "$anyq" ] || { echo queued; return; }
+  # Held by deep lint, with nothing queued: dead (docs/cascade-plan.md, is_dead), ahead of an open PR or an unanswered lookup of an earlier attempt.
+  for g in "$d"/held/*.reason; do [ -e "$g" ] || break; [ "$(base_id "$(basename "$g" .reason)")" != "$bid" ] || { echo "dead held: $(head -1 "$g" | cut -c1-200)"; return; }; done
   [ -z "$anyopen" ] || { echo open; return; }
   [ -z "$unk" ] || { echo "unknown $unk"; return; }
   [ -z "$anyrev" ] || { echo "reverted its merge was reverted"; return; }
@@ -856,7 +989,7 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
   case "${FACTORY_NOTIFY_URL:-}" in *[\"\\[:space:]]*) die "FACTORY_NOTIFY_URL must not contain quotes, backslashes or whitespace (it is written into a curl config)";; esac
   [ -z "$stop_at" ] || deadline=$(date -j -f %H:%M "$stop_at" +%s 2>/dev/null) || die "--stop-at needs HH:MM (local time, today)"   # today at HH:MM, as an epoch
   [ -e "$HALT" ] && die "dispatch blocked by $HALT ($(cat "$HALT")); remove it to resume"
-  cmd_lint "$dir" || die "fix the queue before batching (see "Writing tasks" in README.md)"
+  out=$(cmd_lint "$dir") || { printf '%s\n' "$out"; die "fix the queue before batching (see "Writing tasks" in README.md)"; }   # quiet: it prints after deep lint
   [ -z "$chain" ] || [ "$(jq -r .repo "$dir"/*.json 2>/dev/null | sort -u | wc -l)" -le 1 ] || die "a chained queue targets one repo; use --no-chain"
   batch_id="batch-$(date -u +%Y%m%dT%H%M%SZ)"; report="$RUNS/$batch_id.md"; mkdir -p "$RUNS"
   take_lock; echo "$batch_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"
@@ -864,6 +997,24 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
   # Where notifications go, host only (a token in the URL never reaches the log): a silent night must say whether it could have spoken.
   nhost=off; if [ -n "${FACTORY_NOTIFY_URL:-}" ]; then nhost=${FACTORY_NOTIFY_URL#*://}; nhost=${nhost%%[/?#]*}; nhost=${nhost##*@}; fi
   echo "notify: $nhost$([ "$nhost" != off ] || echo ' (FACTORY_NOTIFY_URL not set)')"
+  # Deep lint (docs/cascade-plan.md, loop 1): under the lock, since it rewrites the queue (another batch may own it), and before the
+  # deterministic lint, which then checks what it changed (lint ran above too, so no model reads a queue lint refuses). Its own process, borrowing the lock like a run, since its container step can
+  # exit from anywhere. A failure changes nothing: the night runs on the deterministic lint, notified. Each hold is notified once, when it
+  # is made. FACTORY_DEEP_LINT=0 skips it for the night (the escape hatch, as FACTORY_GATE=0 is the gate's).
+  dlsay=off dlrows=
+  if [ "${FACTORY_DEEP_LINT:-1}" != 0 ]; then
+    dl=0; FACTORY_BATCH=$$ "$0" lint --deep "$dir" || dl=$?
+    dlid=$(cat "$LOCK/run_id"); echo "$batch_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"; [ "$dlid" != "$batch_id" ] || dlid=   # no run id: it died before it was a run
+    dres=; [ -z "$dlid" ] || dres=$(jq -r '.deep_lint.result // empty' "$RUNS/$dlid/manifest.json" 2>/dev/null) || dres=
+    if [ "$dl" -ne 0 ] && [ "$dres" = applying ]; then dlsay="failed while applying (exit $dl, run $dlid); the queue may be partly changed"; notify "deep lint failed while applying its result (exit $dl, run $dlid): the queue may be partly changed (deep_lint in the manifest has the plan); the night runs on the deterministic lint"
+    elif [ "$dl" -ne 0 ]; then dlsay="failed (exit $dl${dlid:+, run $dlid}); deterministic lint only"; notify "deep lint failed (exit $dl${dlid:+, run $dlid}); the night runs on the deterministic lint"
+    elif [ -z "$dlid" ]; then dlsay="nothing to read"
+    else dm="$RUNS/$dlid/manifest.json"; dlsay="run $dlid, $(jq -r '"\(.deep_lint.added|length) task(s) gained depends_on, \(.deep_lint.held|length) held"' "$dm" 2>/dev/null || echo 'its manifest is unreadable')"
+      while IFS=$'\t' read -r hid hk hr; do hr=${hr//|//}; dlrows="$dlrows| - | held | - | - | - | - | - | $hid ($hk): $hr |"$'\n'; notify "$hid held by deep lint ($hk): $hr"
+      done < <(jq -r '.deep_lint.held[] | [.task_id, .kind, .reason] | @tsv' "$dm" 2>/dev/null)
+    fi
+  fi
+  cmd_lint "$dir" || die "the queue fails lint after deep lint (a file changed by hand meanwhile?); fix it before batching"   # deep lint applies only a queue that passes
   # Merge mode: main must be contained in next (a hotfix on main that was not forward-merged would be lost at the promotion, and every merge
   # tonight would build on a next that lacks it). Checked per GitHub repo the queue targets; anything but "behind" or "identical" stops the batch.
   if [ -n "$MERGER_APP_ID" ]; then
@@ -883,6 +1034,10 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
   # in order, 0 for a pass, for the exit status; retried: "<retry id>=<rc>/<outcome>" of the attempt a retry stands for; plain: retries
   # cut from the task's own base; next_id: a retry the loop wrote, run before anything else.
   rows= prev= why= cursor= next_id= failed=" " passed=" " waited=" " retried=" " plain=" " outcomes= n=0 prs=0 nfail=0 nblk=0 ninfra=0 nwait=0 ndead=0 streak=0 lastinfra= streakids=
+  # Held tasks, tonight's and older, stand as exit 10 (nothing ran; a human must act) until `factory unhold`: first in the order, so any run
+  # that fails tonight decides the status before them, and a night is never quietly green while a task waits on the operator.
+  # A held id that is in the queue again (restored by hand, not by unhold) runs, so it is not counted.
+  nheld=0; for r in "$dir"/held/*.reason; do [ -e "$r" ] || break; h=$(basename "$r" .reason); [ ! -e "$dir/$h.json" ] || continue; nheld=$((nheld+1)); outcomes="$outcomes$(base_id "$h")=10 "; done
   while :; do
     [ -e "$HALT" ] && { why="halted by $HALT ($(cat "$HALT"))"; break; }
     [ -z "$max" ] || [ "$n" -lt "$max" ] || { why="--max-tasks $max reached"; break; }
@@ -895,7 +1050,7 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
     else for f in "$dir"/*.json; do [ -e "$f" ] || break; i=$(basename "$f" .json)
       if { [ -z "$cursor" ] || [[ "$i" > "$cursor" ]]; } && { [ -z "$tid" ] || [[ "$i" < "$tid" ]]; }; then task=$f; tid=$i; fi; done; fi
     next_id=
-    [ -n "$task" ] || { [ "$n" -gt 0 ] || [ "$nwait" -gt 0 ] || why="queue is empty"; break; }   # nothing after the cursor: the queue ran out, or was empty to begin with
+    [ -n "$task" ] || { [ "$n" -gt 0 ] || [ "$nwait" -gt 0 ] || [ "$nheld" -gt 0 ] || why="queue is empty"; break; }   # nothing after the cursor: the queue ran out, or was empty to begin with
     name=$(basename "$task" .json); cb=
     # A file that appeared after lint ran at the start (hand-added mid-night) may be malformed: a row and failed/, never a dead batch.
     if ! jq -e "$JOB_SCHEMA" "$task" >/dev/null 2>&1; then
@@ -988,16 +1143,16 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
     [ "$eff" -eq 0 ] || [ "$cls" = infra ] || [ -n "$cont" ] || { why="$name exited $rc"; break; }   # 3 no changes, 5 REFUTED, 10 blocked, 14 manifest; the row has the verdict
   done
   left=$(ls "$dir"/*.json 2>/dev/null | wc -l | tr -d ' ' || true)   # || true: an empty queue makes ls fail, and a failed substitution in an assignment is fatal under set -e
-  wsay=; [ "$nwait" -eq 0 ] || wsay=" ($nwait waiting on a dependency)"
+  wsay=; [ "$nwait" -eq 0 ] || wsay=" ($nwait waiting on a dependency)"; [ "$nheld" -eq 0 ] || wsay="$wsay, $nheld held for a human (queue/held/)"
   if [ -n "$why" ]; then end="Stopped: $why. $left task(s) left in queue$wsay."
-  elif [ "$n" -eq 0 ] && [ "$nwait" -gt 0 ]; then end="Nothing ran. $left task(s) left in queue$wsay."
+  elif [ "$n" -eq 0 ] && [ $((nwait+nheld)) -gt 0 ]; then end="Nothing ran. $left task(s) left in queue$wsay."
   elif [ "$left" -gt 0 ]; then end="All tasks ran. $left task(s) left in queue$wsay."
   else end="All tasks ran."; fi
-  { echo "# $batch_id"; echo; echo "queue: $dir, chain: ${chain:-off}, notify: $nhost, tasks run: $n"; echo
-    echo "| RUN | EXIT | ROUNDS | VERDICT | PR | CHAIN BASE | DURATION | NOTE |"; echo "|---|---|---|---|---|---|---|---|"; printf '%s' "$rows"
+  { echo "# $batch_id"; echo; echo "queue: $dir, chain: ${chain:-off}, notify: $nhost, tasks run: $n, deep lint: $dlsay"; echo
+    echo "| RUN | EXIT | ROUNDS | VERDICT | PR | CHAIN BASE | DURATION | NOTE |"; echo "|---|---|---|---|---|---|---|---|"; printf '%s' "$dlrows$rows"
     echo; echo "$end"; } > "$report"
   cat "$report"; echo "report: $report"
-  notify "done: $n run, $prs PR(s), $nfail failed$([ "$nblk" -eq 0 ] || echo ", $nblk blocked")$([ "$ninfra" -eq 0 ] || echo ", $ninfra infra")$([ "$nwait" -eq 0 ] || echo ", $nwait waiting")$([ "$ndead" -eq 0 ] || echo " ($ndead on a dead dependency)"). $end"   # always, once the loop is over: a night with no message means the batch never reached its end
+  notify "done: $n run, $prs PR(s), $nfail failed$([ "$nblk" -eq 0 ] || echo ", $nblk blocked")$([ "$ninfra" -eq 0 ] || echo ", $ninfra infra")$([ "$nwait" -eq 0 ] || echo ", $nwait waiting")$([ "$ndead" -eq 0 ] || echo " ($ndead on a dead dependency)")$([ "$nheld" -eq 0 ] || echo ", $nheld held"). $end"   # always, once the loop is over: a night with no message means the batch never reached its end
   # Exit: each task's standing is its last run tonight (a retry that passed clears its original; a later failure under the same base id
   # counts). The status is the latest task whose last run did not pass, 0 when every task's last run passed.
   fail=0 seen=" "; set -- $outcomes; i=$#
@@ -1047,6 +1202,27 @@ cmd_requeue() {  # factory requeue <queue/failed/file.json>: the same task again
   # The note path in the task text follows the new id (README tells authors to write the literal id), so the gate finds the note under it.
   jq --arg id "$new" --arg add "$add" --arg o "docs/BLOCKED-$id.md" --arg n "docs/BLOCKED-$new.md" '.task_id=$id | .instructions |= (split($o) | join($n)) | .instructions+=$add' "$f" > "$dir/$new.json"
   echo "wrote $dir/$new.json${add:+ (with the findings of the previous attempt)}"
+}
+
+# ---------------------------------------------------------------- unhold
+cmd_unhold() {  # factory unhold <queue/held/<id>.json | <id>.proposed.json>: after the operator's edit, the file given goes back into the queue
+  # under its own id (deep lint holds before any run, so no branch claims the id), and the task's held files go; refused when the queue
+  # would then fail lint (a later dependency in a proposal: reorder first). Deep lint reads it again at the next night. The touch is recorded in runs/touches.tsv (time, command, task id, sha256 of the file, user).
+  f="${1:-}"; [ -f "$f" ] || usage
+  jq -e "$JOB_SCHEMA" "$f" >/dev/null 2>&1 || die "not a task file: $f"
+  h=$(cd "$(dirname "$f")" && pwd); [ "${h##*/}" = held ] || die "$f is not in a held/ directory"
+  dir=${h%/held}; id=$(jq -r .task_id "$f"); b=$(basename "$f" .json); b=${b%.proposed}
+  [ "$id" = "$b" ] || die "task_id $id is not the held file's id $b"
+  [ ! -e "$dir/$id.json" ] || die "$dir/$id.json already exists"
+  # Under the lock (no batch lists the queue while the file is in it unlinted), with INT and TERM ignored from the copy to the cleanup, so
+  # a stop leaves the task held or released, never both, and the EXIT trap (which bash 3.2 skips on an unhandled TERM) frees the lock.
+  take_lock; trap 'rm -rf "$LOCK"' EXIT; trap 'exit 130' INT TERM; echo unhold > "$LOCK/run_id"; echo $$ > "$LOCK/pid"
+  trap '' INT TERM
+  cp "$f" "$dir/.$id.json.$$" || die "cannot write into $dir"; mv "$dir/.$id.json.$$" "$dir/$id.json" || die "cannot write $dir/$id.json"   # a failed copy keeps the held files
+  out=$(cmd_lint "$dir") || { rm -f "${dir:?}/${id:?}.json"; die "not unheld: with $id the queue fails lint (the batch would refuse the night):"$'\n'"$out"; }
+  rm -f "${h:?}/${id:?}.json" "$h/$id.reason" "$h/$id.proposed.json"; trap 'exit 130' INT TERM
+  mkdir -p "$RUNS"; printf '%s\tunhold\t%s\t%s\t%s\n' "$(now)" "$id" "$(shasum -a 256 "$dir/$id.json" | cut -d' ' -f1)" "${USER:-?}" >> "$RUNS/touches.tsv"
+  echo "unheld $id: $dir/$id.json"
 }
 
 # ---------------------------------------------------------------- ruleset-check
@@ -1148,10 +1324,11 @@ EOF
 
 case "${1:-}" in
   run)    shift; cmd_run "$@" ;;
-  lint)   shift; cmd_lint "$@" ;;
+  lint)   shift; if [ "${1:-}" = --deep ]; then shift; cmd_deep_lint "$@"; else cmd_lint "$@"; fi ;;
   batch)  shift; cmd_batch "$@" ;;
   report) shift; cmd_report "$@" ;;
   requeue) shift; cmd_requeue "$@" ;;
+  unhold) shift; cmd_unhold "$@" ;;
   stop)   shift; cmd_stop "$@" ;;
   ruleset-check) shift; cmd_ruleset_check "$@" ;;
   *)    usage ;;
