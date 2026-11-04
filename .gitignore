@@ -3,5 +3,7 @@ runs/*
 !runs/.gitkeep
 queue/*
 !queue/.gitkeep
+queue-canary-*/
+smoke/
 .lock/
 HALT
