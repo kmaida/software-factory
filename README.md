@@ -190,7 +190,7 @@ To release a held task, edit `queue/held/<id>.json` or read `<id>.proposed.json`
 
 ### Batches
 
-`batch` chains tasks. Each task cuts its branch from the last task in the batch that passed, so dependent tasks build on each other overnight without waiting for a merge. A failed task's branch is never used as a base. Every PR still targets its task's own `base_branch`, so a later PR shows the earlier tasks' commits until those merge. A chained queue must target one repo.
+`batch` chains tasks. Each task cuts its branch from the last task in the batch that passed, so dependent tasks build on each other overnight without waiting for a merge. A failed task's branch is never used as a base. Every PR still targets its task's own `base_branch`, so a later PR shows the earlier tasks' commits until those merge. A chained queue must target one repo. If `base_branch` moved while the batch ran (a PR merged by hand), its tip is merged into the chain base before the task starts, so the task sees it (`base_merged` in the manifest; a conflict is left for the PR, `base_merge_conflict`).
 
 | Flag | Effect |
 |---|---|
