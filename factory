@@ -79,7 +79,7 @@ NPM_BEFORE_DAYS=7   # npm policy on the fixed docker run line: no install script
 GIT_CRED='!f() { h=; while IFS= read -r l; do case "$l" in host=*) h=${l#host=};; esac; done; [ "$h" = github.com ] || exit 0; echo username=x-access-token; echo "password=$(cat <&3)"; }; f'
 
 die()   { echo "factory: $*" >&2; exit 1; }
-usage() { echo "usage: factory run <task-file> | factory lint [--deep] [dir] | factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--no-chain] [--continue] | factory report [n] | factory requeue <queue/failed/file.json> | factory unhold <queue/held/file.json> | factory stop <run_id> | factory ruleset-check <owner/name>" >&2; exit 2; }
+usage() { echo "usage: factory run <task-file> | factory lint [--deep] [dir] | factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--no-chain] [--continue] | factory report [n] | factory requeue <queue/failed/file.json> [source-task.json] | factory unhold <queue/held/file.json> | factory stop <run_id> | factory ruleset-check <owner/name>" >&2; exit 2; }
 # Job schema: these four keys, all non-empty strings, plus an optional depends_on (task ids, non-empty strings). Everything else is derived by the orchestrator.
 JOB_SCHEMA='type=="object" and ((keys|sort)==["base_branch","instructions","repo","task_id"] or (keys|sort)==["base_branch","depends_on","instructions","repo","task_id"]) and (to_entries | all(if .key=="depends_on" then (.value|type=="array" and all(.[]; type=="string" and length>0)) else (.value|type=="string" and length>0) end))'
 base_id() { b=$1; while [[ "$b" =~ ^(.*)-[ri][0-9]+$ ]]; do b=${BASH_REMATCH[1]}; done; printf '%s' "$b"; }   # every -r<N> (requeue) and -i<N> (infra retry) suffix off: 010-x-r1-i1 is 010-x
@@ -460,6 +460,7 @@ cmd_run() {
   # Chain mode (set by batch): the branch is cut from the previous task's branch, but the PR still targets the task's own
   # base_branch. A PR whose base is factory/<prev> dies with 422 "base ref not found" once that branch is merged and auto-deleted.
   chain_base="${FACTORY_CHAIN_BASE:-}"; [ -z "$chain_base" ] || [[ "$chain_base" =~ $BRANCH_RE ]] || die "FACTORY_CHAIN_BASE has unexpected characters"
+  chain_sha="${FACTORY_CHAIN_SHA:-}"; [ -z "$chain_sha" ] || [[ "$chain_sha" =~ ^[0-9a-f]{40}$ ]] || die "FACTORY_CHAIN_SHA is not a commit id"
   from_branch="${chain_base:-$base_branch}"
   repo_norm "$(jq -r .repo "$task")" || die "repo must be owner/name, a GitHub URL, another https URL, or a local path"
   # GitHub repos get a per-run installation token minted from the App key (fetched from Keycard Vault); anything else (dry runs) needs a github_token file.
@@ -485,10 +486,10 @@ cmd_run() {
   # Manifest exists from the first moment there is a run, before any credential is issued; later steps fill it in.
   npm_before=$(date -u -v-"${NPM_BEFORE_DAYS}"d +%Y-%m-%dT%H:%M:%SZ)
   jq -n --arg run_id "$run_id" --arg task_id "$task_id" --arg job "$(shasum -a 256 "$task" | cut -d' ' -f1)" \
-        --arg repo "$repo" --arg base_branch "$base_branch" --arg cb "$chain_base" \
+        --arg repo "$repo" --arg base_branch "$base_branch" --arg cb "$chain_base" --arg cs "$chain_sha" \
         --arg image "$image_digest" --argjson pinned "$image_pinned" --arg fc "$factory_commit" --arg started "$(now)" --arg kz "$KEYCARD_ZONE" --arg nb "$npm_before" \
         --arg model "$FACTORY_MODEL" --arg jmodel "$JUDGE_MODEL" --arg rmodel "$REVIEW_MODEL" \
-    '{run_id:$run_id, task_id:$task_id, job_sha256:$job, repo:$repo, base_branch:$base_branch, chain_base:(if $cb=="" then null else $cb end), base_sha:null,
+    '{run_id:$run_id, task_id:$task_id, job_sha256:$job, repo:$repo, base_branch:$base_branch, chain_base:(if $cb=="" then null else $cb end), chain_sha:(if $cs=="" then null else $cs end), base_sha:null,
       image_digest:$image, image_pinned:$pinned, factory_commit:(if $fc=="" then null else $fc end), keycard_zone:$kz, npm_policy:{ignore_scripts:true, before:$nb},
       model:$model, judge_model:$jmodel, review_model:$rmodel, worker:{rounds:[]}, gate:{cycles:[], result:null},
       installation_id:null, git_identity:null, started_at:$started, ended_at:null, exit_status:null, final_sha:null, pr_url:null}' \
@@ -526,7 +527,14 @@ cmd_run() {
   # Clone (the container never sees the task file; only /work and /run/secrets are mounted).
   work=$(mktemp -d "${TMPDIR:-/tmp}/factory-work.XXXXXX")
   git -c credential.helper= -c credential.helper="$GIT_CRED" clone -q "$repo_url" "$work" 3< <(printf '%s' "$gh_tok") || die "clone failed: $repo_url"
-  base_sha=$(git -C "$work" rev-parse "origin/$from_branch" 2>/dev/null) || die "base branch not found: $from_branch"
+  # A chain base merged and deleted mid-batch (GitHub auto-deletes a merged PR's branch; 2026-11-05 lost two tasks to it) is still its
+  # recorded commit, reachable from the merge: the ref is recreated locally, so the credential scan, the worker's checkout and the commit
+  # count run unchanged. A commit the clone lacks (deleted unmerged: that task's PR was closed) is not built on.
+  if ! base_sha=$(git -C "$work" rev-parse -q --verify "origin/$from_branch^{commit}" 2>/dev/null); then
+    { [ -n "$chain_sha" ] && git -C "$work" cat-file -e "$chain_sha^{commit}" 2>/dev/null; } || die "base branch not found: $from_branch"
+    git -C "$work" update-ref "refs/remotes/origin/$from_branch" "$chain_sha" || die "cannot recreate origin/$from_branch at $chain_sha"
+    base_sha=$chain_sha; manifest_set '. + {chain_sha_used:true}'; log "chain base $from_branch is gone from $repo (merged and deleted); building on its recorded commit $chain_sha"
+  fi
   log "cloned $repo_url at $base_sha"
   manifest_set '. + {base_sha:$sha}' --arg sha "$base_sha"
   if git -C "$work" rev-parse --verify -q "origin/factory/$task_id" >/dev/null; then
@@ -701,9 +709,20 @@ cmd_run() {
               cycle=$((cycle+1)); ghead=$head; round=$((round+1)); log "gate cycle $cycle: $(printf '%s\n' "$gfacts" | grep -c .) reproduced finding(s) go back to the worker"; continue ;;
     esac
     [ "${FACTORY_GATE:-1}" = 0 ] || manifest_set '.gate.result="pass"'
+    # docs/SCOPE-<id>.md at the head: edits outside Scope the agent declared (worker-prompt.md) and the judge ruled on (judge-prompt.md, check 4).
+    # Read whole (a closed pipe under pipefail would lose it), redacted, bounded; the flag, the report row and the phone follow it, the PR body
+    # carries it under its own heading. A git failure here is logged, not a flag: the judge ruled on the note in its own checkout.
+    ssec= snote= srm=0; sls=$(git --no-replace-objects -C "$gate" ls-tree "$head" -- "docs/SCOPE-$task_id.md" 2>&1) || srm=$?
+    if [ "$srm" -ne 0 ]; then log "cannot list docs/SCOPE-$task_id.md at $head (git exit $srm): ${sls:0:500}"
+    elif [ "$(awk '{print $2}' <<< "$sls")" = blob ]; then
+      snote=$(git -C "$gate" show "$head:docs/SCOPE-$task_id.md" 2>/dev/null | tr -d '\r' | redact) || snote=; snote=${snote:0:4000}
+      if [ -n "$snote" ]; then manifest_set '. + {scope_note:true}'; log "scope note docs/SCOPE-$task_id.md is at $head: edits outside Scope, declared; the PR body carries it"
+        ssec="## Scope note (edits outside Scope, declared by the agent and ruled on by the judge; read before merging)"$'\n\n'"$snote"$'\n\n'
+      else log "docs/SCOPE-$task_id.md at $head could not be read or is empty; no scope note recorded"; fi
+    fi
     if [ "$gh_src" != file ]; then
       # The PR is opened here, not by an agent: a separate token (pull_requests:write + contents:read, so it can read refs but not push) that no container ever held.
-      body="$instructions"$'\n\n'"## Judge (Codex), $judged round(s), verdict $verdict"$'\n\n'"$findings"$'\n\n'"$(gate_body)"
+      body="$instructions"$'\n\n'"$ssec## Judge (Codex), $judged round(s), verdict $verdict"$'\n\n'"$findings"$'\n\n'"$(gate_body)"
       pr_url=$(open_pr "$repo" "$task_id" "$base_branch" "$body") || pr_url=
       if [ -n "$pr_url" ]; then log "opened $pr_url"; else manifest_set '. + {outcome:"pr_failed"}'; log "branch factory/$task_id pushed but opening the PR failed; open it by hand"; status=4; fi
       [ -z "$pr_url" ] || [ -z "$MERGER_APP_ID" ] || [ "$base_branch" != "$NEXT_BRANCH" ] || merge_next
@@ -825,6 +844,26 @@ cmd_deep_lint() {  # factory lint --deep [dir] (docs/cascade-plan.md, loop 1): b
     0) hit=${hit%%$'\n'*}; hit=${hit#*:}; manifest_set '. + {outcome:"credential_in_input", reason:$r}' --arg r "$hit"; log "refused: $hit on $base contains something shaped like a credential"; echo "deep lint: refused, $hit on $base looks like it holds a credential"; exit 13 ;;
     *) log "credential scan of origin/$base failed (git grep exit $g). ${hit:0:2000}"; exit 12 ;;
   esac
+  # Base health (2026-11-05: 053 blocked itself on a main whose lint and typecheck were already red; every task that night would have).
+  # The verifier, with no model and no credential, runs the base's own lint, typecheck and test scripts (the ones package.json has) at
+  # its tip. A non-zero exit is the night's answer before any task runs: exit 15, the manifest says which script, batch stops and notifies.
+  # FACTORY_HEALTH=0 skips it (the escape hatch, as FACTORY_GATE=0 is the gate's). Health is deep lint's because it needs the same clone.
+  if [ "${FACTORY_HEALTH:-1}" != 0 ]; then
+    hin=$(mktemp -d "${TMPDIR:-/tmp}/factory-health-in.XXXXXX"); hwork=$(mktemp -d "${TMPDIR:-/tmp}/factory-health.XXXXXX"); hout=$(mktemp -d "${TMPDIR:-/tmp}/factory-health-out.XXXXXX")
+    echo '{"blocks":[]}' > "$hin/findings.json"; log "base health: lint, typecheck and test scripts of $base at $base_sha"
+    git -C "$work" update-ref refs/heads/factory-health "$base_sha"   # the verifier's clone takes local branches only; origin/$base alone would leave $base_sha unreachable there
+    run_container verify "" -v "$work":/src:ro -v "$hin":/in:ro -v "$hwork":/work -v "$hout":/out -v "$FACTORY_DIR/verify.js":/verify.js:ro -e HEAD_SHA="$base_sha" -e BASE_SHA="$base_sha" -e HEALTH=1 --
+    hstatus=$status; status=0; health=
+    [ "$hstatus" -ne 0 ] || [ ! -f "$hout/verify.json" ] || [ -L "$hout/verify.json" ] || health=$(jq -c 'select(type=="object" and (.install|type=="object")) | {install:.install.head, scripts:(.health // {})}' "$hout/verify.json" 2>/dev/null) || health=
+    rm -rf "$hin" "$hwork" "$hout"
+    [ -n "$health" ] || { manifest_set '. + {health:{result:"error"}}'; log "base health: the verifier left no record (container status $hstatus); the night goes on without the check"; }
+    if [ -n "$health" ]; then
+      red=$(jq -r 'if (.install // 0) != 0 then "npm ci exit \(.install)" else (.scripts | to_entries | map(select(.value != 0)) | map("npm run \(.key) exit \(.value)") | join(", ")) end' <<< "$health")
+      manifest_set '. + {health:($h + {result:(if $r=="" then "green" else "red" end), red:(if $r=="" then null else $r end)})}' --argjson h "$health" --arg r "$red"
+      if [ -n "$red" ]; then log "base health: $base at $base_sha is red: $red; nothing runs on it tonight"; echo "deep lint: base $base is red ($red); fix it or set FACTORY_HEALTH=0"; exit 15; fi
+      log "base health: green ($(jq -r '.scripts | keys | join(", ")' <<< "$health"))"
+    fi
+  fi
   oa_key=$(openai_key) || oa_key=; [ -n "$oa_key" ] || die "no Codex key (Keycard $OPENAI_RESOURCE)"
   jwork=$(mktemp -d "${TMPDIR:-/tmp}/factory-judge.XXXXXX"); jout=$(mktemp -d "${TMPDIR:-/tmp}/factory-judge-out.XXXXXX")
   # Keep the Inputs section in step with deep-lint-replay.sh, which measures this prompt.
@@ -1001,12 +1040,13 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
   # deterministic lint, which then checks what it changed (lint ran above too, so no model reads a queue lint refuses). Its own process, borrowing the lock like a run, since its container step can
   # exit from anywhere. A failure changes nothing: the night runs on the deterministic lint, notified. Each hold is notified once, when it
   # is made. FACTORY_DEEP_LINT=0 skips it for the night (the escape hatch, as FACTORY_GATE=0 is the gate's).
-  dlsay=off dlrows=
+  dlsay=off dlrows= base_red=
   if [ "${FACTORY_DEEP_LINT:-1}" != 0 ]; then
     dl=0; FACTORY_BATCH=$$ "$0" lint --deep "$dir" || dl=$?
     dlid=$(cat "$LOCK/run_id"); echo "$batch_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"; [ "$dlid" != "$batch_id" ] || dlid=   # no run id: it died before it was a run
     dres=; [ -z "$dlid" ] || dres=$(jq -r '.deep_lint.result // empty' "$RUNS/$dlid/manifest.json" 2>/dev/null) || dres=
-    if [ "$dl" -ne 0 ] && [ "$dres" = applying ]; then dlsay="failed while applying (exit $dl, run $dlid); the queue may be partly changed"; notify "deep lint failed while applying its result (exit $dl, run $dlid): the queue may be partly changed (deep_lint in the manifest has the plan); the night runs on the deterministic lint"
+    if [ "$dl" -eq 15 ]; then red=$(jq -r '.health.red // "red"' "$RUNS/$dlid/manifest.json" 2>/dev/null || echo red); dlsay="base is red ($red); nothing ran"; notify "stopped: the base is red ($red) at run $dlid; fix it (or FACTORY_HEALTH=0), then run again"; base_red="$red (run $dlid)"
+    elif [ "$dl" -ne 0 ] && [ "$dres" = applying ]; then dlsay="failed while applying (exit $dl, run $dlid); the queue may be partly changed"; notify "deep lint failed while applying its result (exit $dl, run $dlid): the queue may be partly changed (deep_lint in the manifest has the plan); the night runs on the deterministic lint"
     elif [ "$dl" -ne 0 ]; then dlsay="failed (exit $dl${dlid:+, run $dlid}); deterministic lint only"; notify "deep lint failed (exit $dl${dlid:+, run $dlid}); the night runs on the deterministic lint"
     elif [ -z "$dlid" ]; then dlsay="nothing to read"
     else dm="$RUNS/$dlid/manifest.json"; dlsay="run $dlid, $(jq -r '"\(.deep_lint.added|length) task(s) gained depends_on, \(.deep_lint.held|length) held"' "$dm" 2>/dev/null || echo 'its manifest is unreadable')"
@@ -1033,12 +1073,13 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
   # failed: ids and base ids (an -i<N> retry counts for its task); prev: the literal chain head; outcomes: "<base id>=<rc>" per run
   # in order, 0 for a pass, for the exit status; retried: "<retry id>=<rc>/<outcome>" of the attempt a retry stands for; plain: retries
   # cut from the task's own base; next_id: a retry the loop wrote, run before anything else.
-  rows= prev= why= cursor= next_id= failed=" " passed=" " waited=" " retried=" " plain=" " outcomes= n=0 prs=0 nfail=0 nblk=0 ninfra=0 nwait=0 ndead=0 streak=0 lastinfra= streakids=
+  rows= prev= prevsha= why= cursor= next_id= failed=" " passed=" " waited=" " retried=" " plain=" " outcomes= n=0 prs=0 nfail=0 nblk=0 ninfra=0 nwait=0 ndead=0 streak=0 lastinfra= streakids=
   # Held tasks, tonight's and older, stand as exit 10 (nothing ran; a human must act) until `factory unhold`: first in the order, so any run
   # that fails tonight decides the status before them, and a night is never quietly green while a task waits on the operator.
   # A held id that is in the queue again (restored by hand, not by unhold) runs, so it is not counted.
   nheld=0; for r in "$dir"/held/*.reason; do [ -e "$r" ] || break; h=$(basename "$r" .reason); [ ! -e "$dir/$h.json" ] || continue; nheld=$((nheld+1)); outcomes="$outcomes$(base_id "$h")=10 "; done
   while :; do
+    [ -z "$base_red" ] || { why="the base is red: $base_red"; outcomes="$outcomes base=15 "; break; }   # the night's status: never quietly green with nothing run
     [ -e "$HALT" ] && { why="halted by $HALT ($(cat "$HALT"))"; break; }
     [ -z "$max" ] || [ "$n" -lt "$max" ] || { why="--max-tasks $max reached"; break; }
     [ -z "$deadline" ] || [ "$(date +%s)" -lt "$deadline" ] || { why="--stop-at $stop_at passed"; break; }
@@ -1051,7 +1092,7 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
       if { [ -z "$cursor" ] || [[ "$i" > "$cursor" ]]; } && { [ -z "$tid" ] || [[ "$i" < "$tid" ]]; }; then task=$f; tid=$i; fi; done; fi
     next_id=
     [ -n "$task" ] || { [ "$n" -gt 0 ] || [ "$nwait" -gt 0 ] || [ "$nheld" -gt 0 ] || why="queue is empty"; break; }   # nothing after the cursor: the queue ran out, or was empty to begin with
-    name=$(basename "$task" .json); cb=
+    name=$(basename "$task" .json); cb= cbs=
     # A file that appeared after lint ran at the start (hand-added mid-night) may be malformed: a row and failed/, never a dead batch.
     if ! jq -e "$JOB_SCHEMA" "$task" >/dev/null 2>&1; then
       echo "== $name: skipped, not a task file"; rows="$rows| - | skipped | - | - | - | - | - | not a task file |"$'\n'
@@ -1060,8 +1101,8 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
     id=$(jq -r .task_id "$task"); base=$(jq -r .base_branch "$task")
     case "$retried" in *" $id="*) ;; *) cursor=$name ;; esac   # a retry does not move the cursor
     bid=$(base_id "$id"); isretry=; [[ ! "$id" =~ -i[0-9]+$ ]] || isretry=1   # the task this run stands for; whether it is already an infra retry
-    [ -z "$chain" ] || [ -z "$prev" ] || cb="factory/$prev"
-    case "$plain" in *" $id "*) cb= ;; esac
+    [ -z "$chain" ] || [ -z "$prev" ] || { cb="factory/$prev"; cbs=$prevsha; }   # the branch, and the commit it was at: the run falls back to the commit if the branch is gone
+    case "$plain" in *" $id "*) cb= cbs= ;; esac
     # --continue: a base that failed tonight (declared in the file, or the chain head) was pushed as evidence only; do not build on it.
     skip= skipw=; for d in "$base" "$cb"; do case "$d" in factory/*) case "$failed" in *" ${d#factory/} "*) skip=$d ;; esac; case "$waited" in *" ${d#factory/} "*) skipw=$d ;; esac ;; esac; done
     if [ -n "$skip" ]; then
@@ -1096,7 +1137,7 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
       continue
     fi
     echo "== $name ($(now))${cb:+, base $cb}"
-    t0=$(date +%s); rc=0; FACTORY_BATCH=$$ FACTORY_CHAIN_BASE="$cb" "$0" run "$task" || rc=$?
+    t0=$(date +%s); rc=0; FACTORY_BATCH=$$ FACTORY_CHAIN_BASE="$cb" FACTORY_CHAIN_SHA="$cbs" "$0" run "$task" || rc=$?
     # The run left its id in the borrowed lock; take the lock back at once, so a later `factory stop <that run>` signals nothing
     # and a run that dies before it takes the lock (docker down) cannot be mistaken for the previous one.
     run_id=$(cat "$LOCK/run_id"); echo "$batch_id" > "$LOCK/run_id"; echo $$ > "$LOCK/pid"; m="$RUNS/$run_id/manifest.json"
@@ -1118,7 +1159,10 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
     # from the outcome, never from the number: a worker's own exit 4 passes through as the run's status and is nothing of the kind.
     if [ "$rc" -eq 0 ] || [ "$outcome" = pr_failed ]; then
       dest=done; prev=$id; passed="$passed$bid "; streak=0 lastinfra= streakids=; next=continuing; eff=0
+      prevsha=$(jq -r 'select(.final_sha|type=="string") | .final_sha' "$m" 2>/dev/null) || prevsha=
       [ "$rc" -eq 0 ] || note="PR open failed; branch judged and pushed, open it by hand"
+      # A scope note (docs/SCOPE-<id>.md: edits outside Scope the agent declared and the judge accepted) is in the PR body; the human reads it before merging.
+      [ "$rc" -ne 0 ] || [ "$(jq -r '.scope_note // false' "$m" 2>/dev/null)" != true ] || { note="scope note in the PR: edits outside Scope, declared; read it before merging"; notify "$name opened its PR with a scope note (edits outside Scope, declared by the agent); read it before merging"; }
     elif [ "$cls" = infra ]; then
       ninfra=$((ninfra+1)); what="infra: $what"; failed="$failed$id "; [ "$id" = "$bid" ] || failed="$failed$bid "   # a declared base on this task is not built on, retry or not
       if [ "$lastinfra" != "$bid" ]; then streak=$((streak+1)); streakids="$streakids$id "; lastinfra=$bid; fi
@@ -1175,9 +1219,16 @@ cmd_report() {  # factory report [n]: the last n runs (default 20), oldest first
 cmd_requeue() {  # factory requeue <queue/failed/file.json>: the same task again as <id>-r<N> (a new id, since factory/<id> exists on the
   # repo), with what the last attempt learned appended to the instructions. Never called by batch: a task that fails the same way
   # twice is not run a third time on its own.
-  f="${1:-}"; [ -f "$f" ] || usage
+  f="${1:-}"; [ -f "$f" ] || usage; src="${2:-}"
   jq -e "$JOB_SCHEMA" "$f" >/dev/null 2>&1 || die "not a task file: $f"
   dir=$(cd "$(dirname "$f")/.." && pwd); id=$(jq -r .task_id "$f"); base_id=$(sed -E 's/-r[0-9]+$//' <<< "$id")
+  # The source: the task as its generator writes it today. Its instructions (and depends_on, when it has one) replace the failed file's,
+  # which carry the spec the attempt ran under; a spec fixed after a BLOCKED note is otherwise rerun unfixed (2026-11-03, 11-05).
+  if [ -n "$src" ]; then
+    [ -f "$src" ] && jq -e "$JOB_SCHEMA" "$src" >/dev/null 2>&1 || die "not a task file: $src"
+    [ "$(jq -r .task_id "$src")" = "$(base_id "$id")" ] || die "source task_id $(jq -r .task_id "$src") is not $(base_id "$id")"
+    [ "$(jq -r .repo "$src")" = "$(jq -r .repo "$f")" ] || die "source repo differs from the failed task's"
+  fi
   # N = 1 + the highest -r<N> already used for this task in the queue, done/ and failed/, read from each file's task_id (a literal
   # match: an id may contain dots, and another id may end in -<this id>). 10#: a zero-padded N is not octal.
   last=0; for g in "$dir"/*.json "$dir"/done/*.json "$dir"/failed/*.json; do
@@ -1200,7 +1251,10 @@ cmd_requeue() {  # factory requeue <queue/failed/file.json>: the same task again
   fi
   [ -z "$add" ] || add=$'\n\n'"$add"
   # The note path in the task text follows the new id (README tells authors to write the literal id), so the gate finds the note under it.
-  jq --arg id "$new" --arg add "$add" --arg o "docs/BLOCKED-$id.md" --arg n "docs/BLOCKED-$new.md" '.task_id=$id | .instructions |= (split($o) | join($n)) | .instructions+=$add' "$f" > "$dir/$new.json"
+  jq --arg id "$new" --arg add "$add" --arg o "docs/BLOCKED-$id.md" --arg n "docs/BLOCKED-$new.md" --slurpfile s "${src:-/dev/null}" \
+     --arg ob "docs/BLOCKED-$(base_id "$id").md" \
+     '(if $s|length>0 then .instructions=$s[0].instructions | (if $s[0].depends_on then .depends_on=$s[0].depends_on else del(.depends_on) end) else . end)
+      | .task_id=$id | .instructions |= (split("docs/BLOCKED-<task_id>.md") | join($n)) | .instructions |= (split($ob) | join($n)) | .instructions |= (split($o) | join($n)) | .instructions+=$add' "$f" > "$dir/$new.json"
   echo "wrote $dir/$new.json${add:+ (with the findings of the previous attempt)}"
 }
 

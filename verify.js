@@ -40,6 +40,11 @@ try {
   const tests = git('diff', '--name-only', '-z', '--no-renames', BASE, HEAD).split('\0').filter((f) => f && TEST_RE.test(f)); out.checks.test_files = tests;
   const inBase = new Set(git('ls-tree', '-r', '-z', '--name-only', BASE).split('\0')), inHead = new Set(git('ls-tree', '-r', '-z', '--name-only', HEAD).split('\0'));
   if (!install('head')) { write(); process.exit(0); }
+  if (process.env.HEALTH) {  // base health (deep lint): the base's own lint, typecheck and test scripts at HEAD, exit codes only; no blocks, no differential checks
+    const scripts = (() => { try { return JSON.parse(fs.readFileSync(path.join(WORK, 'package.json'), 'utf8')).scripts || {}; } catch { return {}; } })();
+    out.health = {}; for (const s of ['lint', 'typecheck', 'test']) if (scripts[s]) { checkout(HEAD); out.health[s] = sh(`npm run ${s}`, true); log(`health ${s}: exit ${out.health[s]}`); }
+    write(); process.exit(0);
+  }
   blocks.forEach((b, i) => { checkout(HEAD); out.blocks[i].head_exit = sh(String(b.repro)); log(`block ${i} at head: exit ${out.blocks[i].head_exit}`); });
   if (tests.length && hasTest()) { checkout(HEAD); swapTests(BASE, inBase, tests); out.checks.base_tests_at_head = sh('npm test', true); log(`base tests at head: exit ${out.checks.base_tests_at_head}`); }
   checkout(BASE); if (!install('base')) { write(); process.exit(0); }
