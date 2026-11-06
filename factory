@@ -535,6 +535,19 @@ cmd_run() {
     git -C "$work" update-ref "refs/remotes/origin/$from_branch" "$chain_sha" || die "cannot recreate origin/$from_branch at $chain_sha"
     base_sha=$chain_sha; manifest_set '. + {chain_sha_used:true}'; log "chain base $from_branch is gone from $repo (merged and deleted); building on its recorded commit $chain_sha"
   fi
+  # A chain base is the previous task's branch, cut from $base_branch as it was when the batch started; a PR merged since is not in it
+  # (2026-11-06: 083 read an empty docs/image-pins.md that main had held for three hours). Main's tip is merged into the chain base
+  # locally (the ref the worker branches from; the commit count is against it, so the merge is not counted as the task's work; the
+  # PR diff against main is unchanged). A conflict is left for the PR: the task builds on the chain base as it is, and the manifest says.
+  if [ -n "$chain_base" ] && main_sha=$(git -C "$work" rev-parse -q --verify "origin/$base_branch^{commit}") && ! git -C "$work" merge-base --is-ancestor "$main_sha" "$base_sha"; then
+    if git -C "$work" checkout -q --detach "$base_sha" && git -C "$work" -c user.name="$git_name" -c user.email="$git_email" merge -q --no-edit -m "merge $base_branch into $from_branch" "$main_sha" 2>/dev/null; then
+      base_sha=$(git -C "$work" rev-parse HEAD); git -C "$work" update-ref "refs/remotes/origin/$from_branch" "$base_sha"
+      manifest_set '. + {base_merged:$m}' --arg m "$main_sha"; log "chain base $from_branch lacked $base_branch's tip $main_sha; merged it in as $base_sha"
+    else
+      git -C "$work" merge --abort 2>/dev/null || true; manifest_set '. + {base_merge_conflict:$m}' --arg m "$main_sha"; log "chain base $from_branch conflicts with $base_branch's tip $main_sha; building on the chain base as it is (the PR will show the conflict)"
+    fi
+    git -C "$work" checkout -q "$base_branch" 2>/dev/null || git -C "$work" checkout -q --detach "$base_sha"
+  fi
   log "cloned $repo_url at $base_sha"
   manifest_set '. + {base_sha:$sha}' --arg sha "$base_sha"
   if git -C "$work" rev-parse --verify -q "origin/factory/$task_id" >/dev/null; then
