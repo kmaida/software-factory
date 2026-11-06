@@ -263,7 +263,7 @@ run_container() {  # run_container <mode> <secret> [docker args...] -- [entrypoi
   ( sleep "$wd" && docker stop -t 10 "$cname" >/dev/null 2>&1 ) & watchdog=$!
   set +e
   printf '%s\n' "$secret" \
-  | docker run -i --name "$cname" --label "factory.run=$run_id" --rm --read-only --tmpfs /tmp --tmpfs /run/secrets:size=64k \
+  | docker run -i --init --name "$cname" --label "factory.run=$run_id" --rm --read-only --tmpfs /tmp --tmpfs /run/secrets:size=64k \
     --memory 4g --cpus 2 --pids-limit 512 --cap-drop ALL --security-opt no-new-privileges \
     --network "$net" -e HTTPS_PROXY=http://proxy:8888 -e https_proxy=http://proxy:8888 -e HTTP_PROXY=http://proxy:8888 -e http_proxy=http://proxy:8888 \
     -e NPM_CONFIG_IGNORE_SCRIPTS=true -e NPM_CONFIG_BEFORE="$npm_before" \
@@ -852,7 +852,7 @@ cmd_deep_lint() {  # factory lint --deep [dir] (docs/cascade-plan.md, loop 1): b
     hin=$(mktemp -d "${TMPDIR:-/tmp}/factory-health-in.XXXXXX"); hwork=$(mktemp -d "${TMPDIR:-/tmp}/factory-health.XXXXXX"); hout=$(mktemp -d "${TMPDIR:-/tmp}/factory-health-out.XXXXXX")
     echo '{"blocks":[]}' > "$hin/findings.json"; log "base health: lint, typecheck and test scripts of $base at $base_sha"
     git -C "$work" update-ref refs/heads/factory-health "$base_sha"   # the verifier's clone takes local branches only; origin/$base alone would leave $base_sha unreachable there
-    run_container verify "" -v "$work":/src:ro -v "$hin":/in:ro -v "$hwork":/work -v "$hout":/out -v "$FACTORY_DIR/verify.js":/verify.js:ro -e HEAD_SHA="$base_sha" -e BASE_SHA="$base_sha" -e HEALTH=1 --
+    run_container verify "" -v "$work":/src:ro -v "$hin":/in:ro -v "$hwork":/work -v "$hout":/out -v "$FACTORY_DIR/verify.js":/verify.js:ro -e HEAD_SHA="$base_sha" -e BASE_SHA="$base_sha" -e HEALTH=1 -e VERIFY_TIMEOUT_MS=900000 --   # a whole workspace's test run, not one repro: 15 min
     hstatus=$status; status=0; health=
     [ "$hstatus" -ne 0 ] || [ ! -f "$hout/verify.json" ] || [ -L "$hout/verify.json" ] || health=$(jq -c 'select(type=="object" and (.install|type=="object")) | {install:.install.head, scripts:(.health // {})}' "$hout/verify.json" 2>/dev/null) || health=
     rm -rf "$hin" "$hwork" "$hout"
