@@ -25,7 +25,7 @@ IMAGE="factory-sandbox"
 # The image this factory commit was reviewed with: the local image config ID (`docker image inspect --format '{{.Id}}'`), not a registry
 # digest. A run refuses to start on any other image. Rollout is two steps: merge the code, pull, build, read the ID, merge a one-line
 # PR bumping this, pull again. FACTORY_ALLOW_DIRTY=1 runs on any image and the manifest says so (image_pinned:false).
-IMAGE_ID="sha256:dc50581ad05a6122854d0f3f0adfefe8f00d12a2e1e9645fde5f6be3987316e5"
+IMAGE_ID="sha256:ccb8a02a58d960fe5eeb66449d34856eb086fef6d8fcddd87651dad5a0136313"
 TIMEOUT_SEC=3600
 # Inference: a full model id is the pin (an alias moves). No spend cap: thrash is bounded by rounds and gate cycles, never by dollars
 # (docs/cascade-plan.md); the one backstop is a hard limit on the judge's OpenAI project as a stolen-key damage cap. The judge's cost is not visible here.
