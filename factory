@@ -540,7 +540,7 @@ cmd_run() {
   # locally (the ref the worker branches from; the commit count is against it, so the merge is not counted as the task's work; the
   # PR diff against main is unchanged). A conflict is left for the PR: the task builds on the chain base as it is, and the manifest says.
   if [ -n "$chain_base" ] && main_sha=$(git -C "$work" rev-parse -q --verify "origin/$base_branch^{commit}") && ! git -C "$work" merge-base --is-ancestor "$main_sha" "$base_sha"; then
-    if git -C "$work" checkout -q --detach "$base_sha" && git -C "$work" -c user.name="$git_name" -c user.email="$git_email" merge -q --no-edit -m "merge $base_branch into $from_branch" "$main_sha" 2>/dev/null; then
+    if git -C "$work" checkout -q --detach "$base_sha" && git -C "$work" -c user.name="$git_name" -c user.email="$git_email" -c commit.gpgsign=false merge -q --no-edit -m "merge $base_branch into $from_branch" "$main_sha" 2>/dev/null; then
       base_sha=$(git -C "$work" rev-parse HEAD); git -C "$work" update-ref "refs/remotes/origin/$from_branch" "$base_sha"
       manifest_set '. + {base_merged:$m}' --arg m "$main_sha"; log "chain base $from_branch lacked $base_branch's tip $main_sha; merged it in as $base_sha"
     else
