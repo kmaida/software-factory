@@ -30,7 +30,9 @@ Next, in order, one branch and one PR each, merged before the next starts:
 4. Loop 1 (deep lint: additions and holds only, `held/`, `unhold`): PR #54, with `deep-lint-replay.sh` and its score on
    the 2026-11-03 night in the PR body. Then loop 6 (`factory status`, the `main` ⊆ `next` invariant, the revert procedure).
 5. Loop 5 (triage with attribution, the revision file, host requeue with locked Goal and Done when and the Scope refusal
-   list, one revision ever, the audit paragraph).
+   list, one revision ever, the audit paragraph). **Landed cut down on 2026-11-12 as "Revisions" (factory.md): only a
+   blocked run triggers the planner, deep lint's rewrites use the same checks, and Goal and Done when are not locked while
+   the factory is PR-only. Attribution of refuted runs (`worker`, `judge`, `wait_for`) is still to do.**
 6. Loop 7's replay (`factory rejudge`) against last night's branches; then fix cycles may send work back.
 7. Parity 10 to 12 (provenance block, hash ledger, harness deny rules): nothing in the loops needs them; after the loops.
 8. Parity 13 and the Keycard client secret (the Secure Enclave signer, private_key_jwt, `docs/jwks.json`): last; nothing
@@ -488,6 +490,8 @@ response is reconciled. The misreported-outcome rule in factory.md applies to al
 - **A Codex integrity lens that blocks.** It cannot produce a repro; its mechanically checkable parts are host gates and
   verifier checks.
 - **Deep lint widening Scope or removing anything; lint revisions as `-r1`.** Additions and holds only, in place.
+  (Superseded while the factory is PR-only, 2026-11-12: a rewrite that a second model accepts replaces the instructions in
+  place; "Revisions" in factory.md. Still the rule under the merge gate.)
 - **`next` pushable by the App; "a token scoped to `next`".** Contents:write cannot be branch-scoped; `next` is reached by
   PR with a pinned check from a separate App.
 - **Holding every once-BLOCKed change for a human.** The final gate is the evidence; the cycle history is recorded.

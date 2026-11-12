@@ -113,6 +113,87 @@ note_at() {  # note_at <git dir> <sha>: 0 when docs/BLOCKED-$task_id.md is a reg
   rm -f "$rundir/.lstree"; case "$m" in 100644*|100755*) return 0 ;; *) return 1 ;; esac
 }
 scope_of() { printf '%s\n' "$1" | awk '/^Scope:/ && !d {f=1} /^Done when:/{f=0; d=1} f'; }   # the task's own Scope section, once: a "Scope:" line in findings that requeue appended is not one
+# Revisions (factory.md, "Revisions"): a task's instructions rewritten by a model so the task can run, when its attempt ended blocked
+# (cmd_run asks a planner) or deep lint would hold it and proposes a fix. Each one is written by Codex, checked by a fresh Claude reviewer
+# and by the host (lint, the Scope refusal list), and shown in the PR beside the task as first written: the human who merges is the
+# authority, so this is off under the merge gate (nothing reads a PR before it merges into next) and with FACTORY_REVISE=0.
+# Once per task: <queue>/revised/<id>.json is the task as first written, kept when a rewrite replaces it; a task with one is not
+# revised again, and neither is a blocked -r<N> (cmd_run). An infra retry (-i<N>) is the same task, and a revised/ file whose text
+# is still what the task says (deep lint died between its renames) does not count.
+REVISION_JQ='type=="object" and (.instructions|type=="string" and length>0) and (.reason|type=="string" and length>0) and (.changes|type=="string")'
+revise_on() { [ "${FACTORY_REVISE:-1}" != 0 ] && [ -z "$MERGER_APP_ID" ]; }
+sans_i() { _b=$1; while [[ "$_b" =~ ^(.*)-i[0-9]+$ ]]; do _b=${BASH_REMATCH[1]}; done; printf '%s' "$_b"; }
+original_of() {  # original_of <task file>: where its original would be; the queue is the file's directory, or the parent of done/, failed/ or held/
+  _d=$(dirname "$1"); case "${_d##*/}" in done|failed|held) _d=$(dirname "$_d") ;; esac; printf '%s/revised/%s.json' "$_d" "$(sans_i "$(jq -r .task_id "$1")")"
+}
+was_revised() {  # was_revised <task file>: an original that cannot be read still counts (never a second revision because a file went bad)
+  _o=$(original_of "$1"); [ -f "$_o" ] && [ ! -L "$_o" ] || return 1
+  _i=$(jq -r '.instructions // empty' "$_o" 2>/dev/null) || _i=; [ -z "$_i" ] || [ "$_i" != "$(jq -r .instructions "$1")" ]
+}
+# What a revision may never add to Scope: CI, the test harness, lockfiles, a repository-wide glob, a catch-all. Compared as path-like
+# words (a leading "[" and a trailing "]" or "." are punctuation, not path), so a path the task as written already names stays. A
+# backstop for literal paths, not a parser of prose: the Claude review is the check on meaning. Prints the first refused addition; 0 when there is one.
+REFUSE_RE='(^|/)\.(github|gitlab|circleci|buildkite|drone|travis)(/|$)|(^|/)(\.gitlab-ci\.yml|\.travis\.yml|\.drone\.yml|azure-pipelines\.yml|Jenkinsfile)$|(^|/)(__)?tests?(__)?/(helpers?|setup|fixtures?)(/|\.[A-Za-z]+$|$)|(^|/)[^/]*\.setup\.[A-Za-z]+$|(^|/)(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)$|\.lockb?$'
+MAX_REVISE_REVIEWS=3   # rewrites one deep lint sends to the reviewer; each is a Claude session before the first task runs, so the rest are held
+scope_words() { scope_of "$1" | grep -oE '[]A-Za-z0-9_.@*?/[-]+' | sed -E 's/[.]+$//; s/^\[([^]/]*\.[^]/]*)\]$/\1/' | sort -u; }   # a sentence's final dot goes; "[name.ext]" is Markdown around a file name; a route segment ([id]) is kept
+scope_refused() {  # scope_refused <instructions as written> <instructions as revised>
+  # Whole reads, no grep -q or -m: a reader that exits early would SIGPIPE the writer and, under pipefail, read as "nothing refused".
+  # One Scope and one Done when heading: scope_of reads the first Scope section, and a second one further down would be read by nothing here.
+  [ "$(printf '%s\n' "$2" | grep -cE '^(Scope|Done when):' || true)" = 2 ] || { echo "a second (or no) Scope or Done when section"; return 0; }
+  a=$(comm -13 <(scope_words "$1") <(scope_words "$2"))
+  # A glob is refused whole (a rewrite names exact paths). A bracket is allowed only as a whole route segment ([id], [...slug]): the
+  # segments are replaced by "x" (twice: adjacent ones share a slash), and a bracket left after that is a character class.
+  seg='s#(^|/)\[+\.{0,3}[A-Za-z0-9_-]+\]+(/|$)#\1x\2#g'
+  r=$({ printf '%s\n' "$a" | grep '[*?]' || true; printf '%s\n' "$a" | sed -E "$seg; $seg" | grep '[][]' || true; printf '%s\n' "$a" | grep -E "$REFUSE_RE" || true; }); [ -z "$r" ] || { printf '%s\n' "${r%%$'\n'*}"; return 0; }
+  ca='(all|any|every|whole|entire)( [a-z]+){0,2} (file|path|package|director(y|ie)|repo|repositor(y|ie)|codebase|tree|project|workspace|monorepo)s?'
+  c=$(comm -13 <(scope_of "$1" | grep -oiE "$ca" | tr 'A-Z' 'a-z' | sort -u) <(scope_of "$2" | grep -oiE "$ca" | tr 'A-Z' 'a-z' | sort -u)); [ -z "$c" ] || { echo "a catch-all (${c%%$'\n'*})"; return 0; }
+  return 1
+}
+revision_review() {  # revision_review <as written> <as revised> <why> <sha in $work>: sets rvok=1 when a fresh Claude reviewer (the review arm
+  # and its findings schema; revise-review-prompt.md) finds nothing wrong with the revision, else rvwhy. No valid answer is not a pass.
+  rvok= rvwhy=
+  p="$(cat "$FACTORY_DIR/revise-review-prompt.md")"$'\n\n'"## Why it was revised"$'\n'"$3"$'\n\n'"## The task as written"$'\n'"$1"$'\n\n'"## The task as revised"$'\n'"$2"
+  an_tok=$(anthropic_token) || an_tok=; [ -n "$an_tok" ] || { rvwhy="no Claude credential for the revision review"; return 0; }
+  rwork=$(mktemp -d "${TMPDIR:-/tmp}/factory-review.XXXXXX"); rout=$(mktemp -d "${TMPDIR:-/tmp}/factory-review-out.XXXXXX")
+  log "revision review ($REVIEW_MODEL) at $4"
+  run_container review "$an_tok" -v "$work":/src:ro -v "$rwork":/work -v "$rout":/out -e HEAD_SHA="$4" -- "$p"; an_tok=
+  rv=; [ "$status" -ne 0 ] || [ ! -f "$rout/review.json" ] || [ -L "$rout/review.json" ] || [ "$(wc -c < "$rout/review.json")" -gt 200000 ] \
+    || rv=$(jq -c 'select(type=="object" and (.blocks|type=="array") and all(.blocks[]; type=="object" and (.claim|type=="string"))) | [.blocks[].claim]' "$rout/review.json" 2>/dev/null) || rv=
+  rm -rf "$rwork" "$rout"; rwork= rout=
+  case "$rv" in '[]') rvok=1 ;; '') rvwhy="the revision review left no valid answer (container status $status)" ;;
+    *) rvwhy="the reviewer refused it: $(jq -r '.[0] | gsub("[\r\n]+"; " ")' <<< "$rv" | redact | cut -c1-300)" ;; esac
+}
+revise_blocked() {  # In cmd_run, once a blocked attempt's record is complete, in a subshell: run_container can exit from anywhere, and
+  # nothing here may change the attempt's status. A fresh Codex planner (the judge arm, revise-prompt.md) reads the attempt at $head, the
+  # task and the note, and either rewrites the instructions (attribution spec) or leaves the task dead (other). A rewrite that passes the
+  # host's checks and the Claude review is left as revision.json in the run dir; the batch queues it as <id>-r1. .revision in the
+  # manifest says what happened: proposed, none (not the task's wording), refused, or error.
+  rvset() { manifest_set '.revision = {disposition:$d, reason:$r}' --arg d "$1" --arg r "$2"; log "revision: $1. $2"; }
+  note=$(git -C "$gate" show "$head:docs/BLOCKED-$task_id.md" 2>/dev/null | tr -d '\r' | redact) || note=; note=${note:0:20000}
+  prompt="$(cat "$FACTORY_DIR/revise-prompt.md")"$'\n\n'"## Inputs"$'\n'"Base: $base_sha"$'\n'"Head, your working directory (the blocked attempt): $head"$'\n\n'"## The task as written"$'\n'"$instructions"$'\n\n'"## The agent's note, docs/BLOCKED-$task_id.md"$'\n'"$note"
+  oa_key=$(openai_key) || oa_key=; [ -n "$oa_key" ] || { rvset error "no Codex key for the planner"; return 0; }
+  jwork=$(mktemp -d "${TMPDIR:-/tmp}/factory-judge.XXXXXX"); jout=$(mktemp -d "${TMPDIR:-/tmp}/factory-judge-out.XXXXXX")
+  log "revision: planner ($JUDGE_MODEL) reads the blocked attempt at $head"
+  run_container judge "$oa_key" -v "$work":/src:ro -v "$jwork":/work -v "$jout":/out -e HEAD_SHA="$head" -- "$prompt"
+  ans=; if [ "$status" -eq 0 ] && [ -f "$jout/verdict.md" ] && [ ! -L "$jout/verdict.md" ] && [ "$(wc -c < "$jout/verdict.md")" -le 200000 ]; then
+    ans=$(tr -d '\r' < "$jout/verdict.md" | sed '1{/^```/d;}; ${/^```$/d;}'); fi
+  ans=${ans//"$oa_key"/[REDACTED]}; ans=${ans//"$(printf '%s' "$oa_key" | openssl base64 -A)"/[REDACTED]}; ans=${ans//"$(jq -rn --arg s "$oa_key" '$s|@uri')"/[REDACTED]}; oa_key=
+  rm -rf "$jwork" "$jout"; jwork= jout=
+  printf '%s\n' "$ans" | redact > "$rundir/revision-plan.json"
+  jq -e 'type=="object" and (.reason|type=="string" and length>0) and (.attribution=="other" or (.attribution=="spec" and (.instructions|type=="string" and length>0) and (.changes|type=="string" and length>0)))' "$rundir/revision-plan.json" >/dev/null 2>&1 \
+    || { rvset error "the planner left no valid answer (container status $status)"; return 0; }
+  why=$(jq -r '.reason | gsub("[\r\n]+"; " ")' "$rundir/revision-plan.json" | cut -c1-500)
+  [ "$(jq -r .attribution "$rundir/revision-plan.json")" = spec ] || { rvset none "not the task's wording: $why"; return 0; }
+  new=$(jq -r .instructions "$rundir/revision-plan.json"); chg=$(jq -r .changes "$rundir/revision-plan.json"); chg=${chg:0:2000}
+  [ "${#new}" -le 60000 ] || { rvset refused "the rewrite is over 60000 characters"; return 0; }
+  x=$(scope_refused "$instructions" "$new") && { rvset refused "the rewrite adds $x to Scope"; return 0; }
+  revision_review "$instructions" "$new" "$why"$'\n'"$chg" "$head"
+  [ -n "$rvok" ] || { rvset refused "$rvwhy"; return 0; }
+  # errexit is off in here (the caller tests this function's status), so the one write that matters is checked by hand.
+  jq -n --arg i "$new" --arg r "$why" --arg c "$chg" '{instructions:$i, reason:$r, changes:$c}' > "$rundir/revision.json" && jq -e "$REVISION_JQ" "$rundir/revision.json" >/dev/null 2>&1 \
+    || { rm -f "$rundir/revision.json"; rvset error "the revision could not be written"; return 0; }
+  rvset proposed "$why"
+}
 notify() {  # notify <line>: POST "<batch_id>: <line>" to FACTORY_NOTIFY_URL when set. URL and body via curl config on stdin, not argv (the URL may carry a token).
   [ -n "${FACTORY_NOTIFY_URL:-}" ] || return 0
   b="$batch_id: $(printf '%s' "$1" | redact)"; b=${b//\\/\\\\}; b=${b//\"/\\\"}   # the body may quote a BLOCKED note; a bare " or \ would end or alter the config line
@@ -441,7 +522,7 @@ merge_next() {  # The merge gate (docs/cascade-plan.md), after the PR is open an
 cmd_run() {
   task="${1:-}"; [ -n "$task" ] || usage
   [ -f "$task" ] || die "task file not found: $task"
-  repo_url=
+  repo_url= isblocked=
   command -v docker >/dev/null || die "docker not found; install Docker Desktop or OrbStack"
   docker info >/dev/null 2>&1 || die "docker daemon is not running"
   [ -e "$HALT" ] && die "dispatch blocked by $HALT ($(cat "$HALT")); remove it to resume"
@@ -468,7 +549,7 @@ cmd_run() {
     https://github.com/*) ;;
     *) for t in github_token openai_key; do [ -s "$FACTORY_SECRETS_DIR/$t" ] || die "missing or empty token file: $FACTORY_SECRETS_DIR/$t"; done ;;
   esac
-  for f in worker-prompt.md judge-prompt.md review-prompt.md verify.js proxy.js; do [ -s "$FACTORY_DIR/$f" ] || die "missing $FACTORY_DIR/$f"; done
+  for f in worker-prompt.md judge-prompt.md review-prompt.md revise-prompt.md revise-review-prompt.md verify.js proxy.js; do [ -s "$FACTORY_DIR/$f" ] || die "missing $FACTORY_DIR/$f"; done
   pin_image
 
   # Inside `factory batch` the batch loop holds the lock for the whole queue and this run borrows it: it records its own id and
@@ -689,7 +770,7 @@ cmd_run() {
         note="docs/BLOCKED-$task_id.md"
         # First non-blank, non-heading line. awk reads the whole note (an early exit would SIGPIPE git show and, under pipefail, lose the reason).
         reason=$(git -C "$gate" show "$head:$note" 2>/dev/null | tr -d '\r' | awk '!/^[[:space:]]*#/ && NF && !f {print; f=1}' | redact | cut -c1-200) || reason=   # redact the whole line, then bound it
-        manifest_set '. + {outcome:"blocked", reason:$r}' --arg r "$reason"
+        manifest_set '. + {outcome:"blocked", reason:$r}' --arg r "$reason"; isblocked=1
         log "blocked: $note is at $head; no PR. $reason"; status=10
       else
       case "$verdict" in
@@ -735,7 +816,17 @@ cmd_run() {
     fi
     if [ "$gh_src" != file ]; then
       # The PR is opened here, not by an agent: a separate token (pull_requests:write + contents:read, so it can read refs but not push) that no container ever held.
-      body="$instructions"$'\n\n'"$ssec## Judge (Codex), $judged round(s), verdict $verdict"$'\n\n'"$findings"$'\n\n'"$(gate_body)"
+      # A revised task (a file in <queue>/revised/ under its id, written by the batch or deep lint): the PR opens with why it was
+      # revised and the task as first written, so the human who merges can refuse the revision.
+      rsec=; pinstr=$instructions; ro=$(original_of "$task"); ro=${ro%.json}
+      if was_revised "$task"; then
+        rw=$(redact < "$ro.reason" 2>/dev/null) || rw=; oi=$(jq -r '.instructions // empty' "$ro.json" 2>/dev/null | redact) || oi=
+        [ -n "$oi" ] || { oi="(could not be read from $ro.json)"; log "revised task: $ro.json could not be read; the PR body says so"; }
+        rw=${rw:0:3000}; rw=${rw//</&lt;}; pinstr=${instructions//</&lt;}   # the reason and the instructions are a model's here: no "<!--" or "<details>" that would hide the rest
+        rsec="## Task revised by the factory (read before merging)"$'\n\n'"$rw"$'\n\n'"<details><summary>The task as first written</summary>"$'\n\n'"${oi:0:20000}"$'\n\n'"</details>"$'\n\n'
+        manifest_set '. + {revised:true}'; log "revised task: the PR body carries the reason and the task as first written"
+      fi
+      body="$rsec$pinstr"$'\n\n'"$ssec## Judge (Codex), $judged round(s), verdict $verdict"$'\n\n'"$findings"$'\n\n'"$(gate_body)"
       pr_url=$(open_pr "$repo" "$task_id" "$base_branch" "$body") || pr_url=
       if [ -n "$pr_url" ]; then log "opened $pr_url"; else manifest_set '. + {outcome:"pr_failed"}'; log "branch factory/$task_id pushed but opening the PR failed; open it by hand"; status=4; fi
       [ -z "$pr_url" ] || [ -z "$MERGER_APP_ID" ] || [ "$base_branch" != "$NEXT_BRANCH" ] || merge_next
@@ -745,6 +836,20 @@ cmd_run() {
   manifest_set '. + {ended_at:$ended, exit_status:$status, final_sha:(if $final=="null" then null else $final end), pushed:$pushed, push_status:$ps, pr_url:(if $pr=="" then null else $pr end),
                      judge:{rounds:$rounds, verdict:(if $v=="" then null else $v end)}} | '"$END_JQ" \
      --arg ended "$(now)" --argjson status "$status" --arg final "$final_sha" --argjson pushed "$pushed" --argjson ps "$push_status" --arg pr "$pr_url" --argjson rounds "$judged" --arg v "$verdict"
+  # A blocked task gets one revision (revise_blocked), after its own record is complete and in a subshell, so no exit in there changes it.
+  # Whatever the step did to the manifest (a lost log pipeline writes outcome evidence_error there), the attempt's record is put back
+  # as it was, and only .revision is taken from the step.
+  # Only inside a batch: nothing else queues what the step leaves. `factory stop` signals this process: the trap is held (":") so the
+  # record is put back and the run still exits with the attempt's status; HALT stops the batch. The step's temp clones are its own to remove.
+  if [ -n "$isblocked" ] && [ -n "${FACTORY_BATCH:-}" ] && revise_on && [[ ! "$task_id" =~ -r[0-9]+(-i[0-9]+)*$ ]] && ! was_revised "$task"; then
+    cp "$rundir/manifest.json" "$rundir/.attempt.json"; trap ':' INT TERM
+    ( trap 'rm -rf "$jwork" "$jout" "$rwork" "$rout"' EXIT; revise_blocked ) || log "revision: the step did not finish; the task stays blocked" || true
+    jq --slurpfile a "$rundir/.attempt.json" '$a[0] + {revision:(.revision // {disposition:"error", reason:"the revision step did not finish"})}' "$rundir/manifest.json" > "$rundir/manifest.json.tmp.$$" 2>/dev/null \
+      && jq -e -s 'length==1 and (.[0] | type=="object" and (.run_id|type=="string") and (.exit_status|type=="number"))' "$rundir/manifest.json.tmp.$$" >/dev/null 2>&1 \
+      || jq '. + {revision:{disposition:"error", reason:"the revision step left no readable record"}}' "$rundir/.attempt.json" > "$rundir/manifest.json.tmp.$$" 2>/dev/null \
+      || cp "$rundir/.attempt.json" "$rundir/manifest.json.tmp.$$"   # not exactly one object (the step left the manifest empty, doubled or unreadable): the attempt as saved, saying so
+    mv "$rundir/manifest.json.tmp.$$" "$rundir/manifest.json"; rm -f "$rundir/.attempt.json"
+  fi
   echo "  exit status: $status"
   exit "$status"
 }
@@ -901,7 +1006,7 @@ cmd_deep_lint() {  # factory lint --deep [dir] (docs/cascade-plan.md, loop 1): b
   for a in done failed; do [ ! -d "$dir/$a" ] || ln -s "$dir/$a" "$stage/$a"; done
   known=" "; for g in "$dir"/done/*.json "$dir"/failed/*.json "$dir"/held/*.json; do [ -e "$g" ] || continue
     [ "$(dirname "$g")" != "$dir/held" ] || cp "$g" "$stage/held/"; known="$known$(base_id "$(jq -r '.task_id // empty' "$g" 2>/dev/null || true)") "; done
-  added='[]' held='[]' refused='[]'
+  added='[]' held='[]' refused='[]' revised='[]' nrv=0; mkdir "$stage/revised"
   para="Deep lint (run $run_id) added these to depends_on, each for something this task relies on that is not on $base at ${base_sha:0:12}; the evidence is in runs/$run_id/deep-lint.json:"
   for f in "$dir"/*.json; do
     id=$(jq -r .task_id "$f"); o=$(jq -c '.depends_on // []' "$f")
@@ -910,11 +1015,32 @@ cmd_deep_lint() {  # factory lint --deep [dir] (docs/cascade-plan.md, loop 1): b
     late=; for a in $(jq -r '.add[]' <<< "$d"); do case "$known" in *" $(base_id "$a") "*) ;; *) late="$late $a" ;; esac; done
     kind=$(jq -r '.hold.kind // empty' <<< "$d"); why=$(jq -r '.hold.reason // empty' <<< "$d")
     [ -z "$late" ] || [ -n "$kind" ] || { kind=ordering; why="relies on$late, which is not an earlier task in the queue or an archived one: reorder the queue, or add the task that supplies it"; }
-    if [ -n "$kind" ]; then
-      why=$(printf '%s' "$why" | tr '\n' ' ' | cut -c1-500); cp "$f" "$stage/held/$id.json"; printf '%s: %s\n' "$kind" "$why" > "$stage/held/$id.reason"
+    why=$(printf '%s' "$why" | tr '\n' ' ' | cut -c1-500)
+    # A contradiction or an ambiguity that comes with a rewrite is a revision when revisions are on (factory.md, "Revisions"): the rewrite
+    # replaces the instructions in place, under the same id, once the host's checks and the Claude review accept it, and the task as it
+    # was goes to revised/ for the PR body. Refused, unreviewed or already revised once, the task is held as before.
+    pi=$(jq -r '.hold.proposed_instructions // ""' <<< "$d"); oi=$(jq -r .instructions "$f"); rev=
+    mk=$(sans_i "$id"); norev=
+    if [ -n "$pi" ] && { [ "$kind" = contradiction ] || [ "$kind" = ambiguity ]; } && revise_on; then
+      if [ -n "$late" ]; then norev="it also relies on$late, which cannot be waited for"   # the staged queue would fail lint and nothing at all would be applied
+      elif was_revised "$f"; then norev="revised once already"
+      elif [ "$nrv" -ge "$MAX_REVISE_REVIEWS" ]; then norev="more than $MAX_REVISE_REVIEWS rewrites in one deep lint"
+      elif [ "${#pi}" -gt 60000 ]; then norev="the rewrite is over 60000 characters"
+      elif x=$(scope_refused "$oi" "$pi"); then norev="the rewrite adds $x to Scope"
+      else nrv=$((nrv+1)); git -C "$work" update-ref refs/heads/factory-revise "$base_sha"   # the review's clone takes local branches only
+        revision_review "$oi" "$pi" "$kind: $why" "$base_sha"; rev=$rvok; [ -n "$rev" ] || norev=$rvwhy; fi
+      [ -z "$norev" ] || log "deep lint: the rewrite of $id is not used ($norev); held"
+    fi
+    if [ -n "$rev" ]; then
+      jq --argjson a "$(jq -c .add <<< "$d")" --arg i "$pi" --arg p "Revised by deep lint (run $run_id), $kind: $why The pull request shows the task as first written." \
+        'if $a != [] then .depends_on = ((.depends_on // []) + $a) else . end | .instructions = $i + "\n\n" + $p' "$f" > "$stage/$id.json"
+      cp "$f" "$stage/revised/$mk.json"; printf '%s: %s\n' "$kind" "$why" > "$stage/revised/$mk.reason"
+      revised=$(jq -c --arg id "$id" --arg k "$kind" --arg r "$why" --arg m "$mk" '. + [{task_id:$id, kind:$k, reason:$r, original:$m}]' <<< "$revised")
+    elif [ -n "$kind" ]; then
+      cp "$f" "$stage/held/$id.json"; printf '%s: %s\n' "$kind" "$why" > "$stage/held/$id.reason"
       jq --argjson a "$(jq -c .add <<< "$d")" --arg i "$(jq -r '.hold.proposed_instructions // ""' <<< "$d")" \
         'if $a != [] then .depends_on = ((.depends_on // []) + $a) else . end | if $i != "" then .instructions = $i else . end' "$f" > "$stage/held/$id.proposed.json"
-      held=$(jq -c --arg id "$id" --arg k "$kind" --arg r "$why" '. + [{task_id:$id, kind:$k, reason:$r}]' <<< "$held")
+      held=$(jq -c --arg id "$id" --arg k "$kind" --arg r "$why" --arg n "$norev" '. + [{task_id:$id, kind:$k, reason:$r} + (if $n == "" then {} else {rewrite_not_used:$n} end)]' <<< "$held")
     elif [ "$(jq '.add|length' <<< "$d")" -gt 0 ]; then
       jq --argjson a "$(jq -c .add <<< "$d")" --arg p "$para" '.depends_on = ((.depends_on // []) + $a) | .instructions += "\n\n" + $p + " " + ($a|join(", ")) + "."' "$f" > "$stage/$id.json"
       added=$(jq -c --arg id "$id" --argjson a "$(jq -c .add <<< "$d")" '. + [{task_id:$id, depends_on:$a}]' <<< "$added")
@@ -931,16 +1057,19 @@ cmd_deep_lint() {  # factory lint --deep [dir] (docs/cascade-plan.md, loop 1): b
   # rename and "applied" as the last step, so an exit in between is told apart from one that changed nothing: the batch reports it as a
   # queue that may be partly changed. ponytail: one rename per file and an honest record, not a rollback; every partial state passes lint
   # (each change stands alone), and a hold left undone is held again at the next deep lint.
-  manifest_set '.deep_lint = {result:"applying", added:$a, held:$h, refused:$r}' --argjson a "$added" --argjson h "$held" --argjson r "$refused"
+  manifest_set '.deep_lint = {result:"applying", added:$a, held:$h, refused:$r, revised:$v}' --argjson a "$added" --argjson h "$held" --argjson r "$refused" --argjson v "$revised"
   trap '' INT TERM; mkdir -p "$dir/held"
   for id in $(jq -r '.[].task_id' <<< "$held"); do mv "$stage/held/$id.json" "$stage/held/$id.reason" "$stage/held/$id.proposed.json" "$dir/held/"; rm -f "${dir:?}/${id:?}.json"; done
   for id in $(jq -r '.[].task_id' <<< "$added"); do mv "$stage/$id.json" "$dir/$id.json"; done
+  while read -r id mk; do [ -n "$id" ] || continue; mkdir -p "$dir/revised"; mv "$stage/revised/$mk.json" "$stage/revised/$mk.reason" "$dir/revised/"; mv "$stage/$id.json" "$dir/$id.json"
+  done < <(jq -r '.[] | "\(.task_id) \(.original)"' <<< "$revised")   # the original first: a revised task is never queued without it (was_revised reads a stop between the two as not revised)
   trap 'exit 130' INT TERM
   jq -r '.[] | "  added \(.task_id): depends_on + \(.depends_on|join(" "))"' <<< "$added"
   jq -r '.[] | "  refused \(.task_id): the answer dropped \(.dropped|join(" ")), which stays"' <<< "$refused"
   jq -r '.[] | "  held \(.task_id) (\(.kind)): \(.reason)"' <<< "$held"
+  jq -r '.[] | "  revised \(.task_id) (\(.kind)): \(.reason)"' <<< "$revised"
   log "deep lint applied: $(jq length <<< "$added") addition(s), $(jq length <<< "$held") hold(s), $(jq length <<< "$refused") refused drop(s)"
-  echo "deep lint: $(jq length <<< "$added") task(s) gained depends_on, $(jq length <<< "$held") held"
+  echo "deep lint: $(jq length <<< "$added") task(s) gained depends_on, $(jq length <<< "$held") held$([ "$revised" = '[]' ] || echo ", $(jq length <<< "$revised") revised")"
   manifest_set '.deep_lint.result = "applied"'
 }
 
@@ -1062,9 +1191,11 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
     elif [ "$dl" -ne 0 ] && [ "$dres" = applying ]; then dlsay="failed while applying (exit $dl, run $dlid); the queue may be partly changed"; notify "deep lint failed while applying its result (exit $dl, run $dlid): the queue may be partly changed (deep_lint in the manifest has the plan); the night runs on the deterministic lint"
     elif [ "$dl" -ne 0 ]; then dlsay="failed (exit $dl${dlid:+, run $dlid}); deterministic lint only"; notify "deep lint failed (exit $dl${dlid:+, run $dlid}); the night runs on the deterministic lint"
     elif [ -z "$dlid" ]; then dlsay="nothing to read"
-    else dm="$RUNS/$dlid/manifest.json"; dlsay="run $dlid, $(jq -r '"\(.deep_lint.added|length) task(s) gained depends_on, \(.deep_lint.held|length) held"' "$dm" 2>/dev/null || echo 'its manifest is unreadable')"
+    else dm="$RUNS/$dlid/manifest.json"; dlsay="run $dlid, $(jq -r '"\(.deep_lint.added|length) task(s) gained depends_on, \(.deep_lint.held|length) held\(.deep_lint.revised // [] | if length > 0 then ", \(length) revised" else "" end)"' "$dm" 2>/dev/null || echo 'its manifest is unreadable')"
       while IFS=$'\t' read -r hid hk hr; do hr=${hr//|//}; dlrows="$dlrows| - | held | - | - | - | - | - | $hid ($hk): $hr |"$'\n'; notify "$hid held by deep lint ($hk): $hr"
       done < <(jq -r '.deep_lint.held[] | [.task_id, .kind, .reason] | @tsv' "$dm" 2>/dev/null)
+      while IFS=$'\t' read -r hid hk hr; do hr=${hr//|//}; dlrows="$dlrows| - | revised | - | - | - | - | - | $hid ($hk): $hr |"$'\n'; notify "$hid revised by deep lint ($hk): $hr; it runs as revised, and its PR shows the task as written"
+      done < <(jq -r '.deep_lint.revised // [] | .[] | [.task_id, .kind, .reason] | @tsv' "$dm" 2>/dev/null)
     fi
   fi
   cmd_lint "$dir" || die "the queue fails lint after deep lint (a file changed by hand meanwhile?); fix it before batching"   # deep lint applies only a queue that passes
@@ -1086,7 +1217,7 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
   # failed: ids and base ids (an -i<N> retry counts for its task); prev: the literal chain head; outcomes: "<base id>=<rc>" per run
   # in order, 0 for a pass, for the exit status; retried: "<retry id>=<rc>/<outcome>" of the attempt a retry stands for; plain: retries
   # cut from the task's own base; next_id: a retry the loop wrote, run before anything else.
-  rows= prev= prevsha= why= cursor= next_id= failed=" " passed=" " waited=" " retried=" " plain=" " outcomes= n=0 prs=0 nfail=0 nblk=0 ninfra=0 nwait=0 ndead=0 streak=0 lastinfra= streakids=
+  rows= prev= prevsha= why= cursor= next_id= took=" " failed=" " passed=" " waited=" " retried=" " plain=" " outcomes= n=0 prs=0 nfail=0 nblk=0 ninfra=0 nwait=0 ndead=0 streak=0 lastinfra= streakids=
   # Held tasks, tonight's and older, stand as exit 10 (nothing ran; a human must act) until `factory unhold`: first in the order, so any run
   # that fails tonight decides the status before them, and a night is never quietly green while a task waits on the operator.
   # A held id that is in the queue again (restored by hand, not by unhold) runs, so it is not counted.
@@ -1099,11 +1230,12 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
     # The next task: the retry the last run left, else the smallest id after the cursor in a fresh listing. Ids, not filenames:
     # "<id>-i1.json" sorts before "<id>.json" ('-' < '.'). A retry is taken by name and leaves the cursor where it was, so an id that
     # sorts between "<id>" and "<id>-i1" (such as "<id>-foo") is neither skipped nor run before the retry.
-    task= tid=
-    if [ -n "$next_id" ] && [ -e "$dir/$next_id.json" ]; then task="$dir/$next_id.json"; tid=$next_id
+    task= tid= byname=
+    if [ -n "$next_id" ] && [ -e "$dir/$next_id.json" ]; then task="$dir/$next_id.json"; tid=$next_id; byname=1
     else for f in "$dir"/*.json; do [ -e "$f" ] || break; i=$(basename "$f" .json)
+      case "$took" in *" $i "*) continue ;; esac   # taken tonight already: a retry or a revision run by name leaves the cursor behind it, and one left in the queue (nothing pushed) must not be found again
       if { [ -z "$cursor" ] || [[ "$i" > "$cursor" ]]; } && { [ -z "$tid" ] || [[ "$i" < "$tid" ]]; }; then task=$f; tid=$i; fi; done; fi
-    next_id=
+    next_id=; took="$took$tid "
     [ -n "$task" ] || { [ "$n" -gt 0 ] || [ "$nwait" -gt 0 ] || [ "$nheld" -gt 0 ] || why="queue is empty"; break; }   # nothing after the cursor: the queue ran out, or was empty to begin with
     name=$(basename "$task" .json); cb= cbs=
     # A file that appeared after lint ran at the start (hand-added mid-night) may be malformed: a row and failed/, never a dead batch.
@@ -1112,7 +1244,7 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
       mkdir -p "$dir/failed"; mv "$task" "$dir/failed/$batch_id-$name.json"; cursor=$name; continue
     fi
     id=$(jq -r .task_id "$task"); base=$(jq -r .base_branch "$task")
-    case "$retried" in *" $id="*) ;; *) cursor=$name ;; esac   # a retry does not move the cursor
+    case "$retried" in *" $id="*) ;; *) [ -n "$byname" ] || cursor=$name ;; esac   # a retry or a revision, taken by name, does not move the cursor
     bid=$(base_id "$id"); isretry=; [[ ! "$id" =~ -i[0-9]+$ ]] || isretry=1   # the task this run stands for; whether it is already an infra retry
     [ -z "$chain" ] || [ -z "$prev" ] || { cb="factory/$prev"; cbs=$prevsha; }   # the branch, and the commit it was at: the run falls back to the commit if the branch is gone
     case "$plain" in *" $id "*) cb= cbs= ;; esac
@@ -1166,7 +1298,7 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
     case "$retried" in *" $id=$rc/$outcome "*) cls=task; note="retry failed the same way"; rundir="$RUNS/$run_id"; manifest_set '. + {class:"task", class_note:"retry failed the same way as its original"}' ;; esac
     # The word on the phone: the verdict for a refusal, the outcome when there is one, else the number (an earlier round's verdict would
     # read as the reason for a worker that crashed later).
-    case "$outcome" in refuted) what=$(awk -F' [|] ' '{print $3}' <<< "$cells") ;; "") what="exit $rc" ;; pr_failed) what="PR open failed, open it by hand" ;; *) what=$outcome ;; esac; new=
+    case "$outcome" in refuted) what=$(awk -F' [|] ' '{print $3}' <<< "$cells") ;; "") what="exit $rc" ;; pr_failed) what="PR open failed, open it by hand" ;; *) what=$outcome ;; esac; new= rid=
     eff=$rc   # the run's standing for the exit status: 0 when it passed for the chain
     # pr_failed (4) is a pass for the chain: judged passing, pushed, every gate clean, only the PR missing (pr_error in the manifest). Decided
     # from the outcome, never from the number: a worker's own exit 4 passes through as the run's status and is nothing of the kind.
@@ -1188,16 +1320,34 @@ cmd_batch() {  # factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--
       dest=failed; failed="$failed$id "; [ "$id" = "$bid" ] || failed="$failed$bid "; streak=0 lastinfra= streakids=; next=$([ -n "$cont" ] && echo continuing || echo stopped)
       if [ "$outcome" = blocked ]; then nblk=$((nblk+1)); else nfail=$((nfail+1)); fi
     fi
+    if [ -n "$dest" ]; then mkdir -p "$dir/$dest"; mv "$task" "$dir/$dest/$run_id.json"; task="$dir/$dest/$run_id.json"; fi
+    # A blocked run that left an accepted revision (cmd_run, revise_blocked) runs again tonight as <base id>-r1, next, whether or not
+    # --continue was given: the revised instructions with a paragraph saying where they came from, and the task as first written kept
+    # in revised/ for the PR body. Written after the original is archived, like a retry. An id that exists anywhere is never reused,
+    # and a revision that fails lint is not queued (the lint runs in a subshell: cmd_lint shares this loop's variable names).
+    if [ "$outcome" = blocked ] && [ "$(jq -r '.revision.disposition // empty' "$m")" = proposed ] && jq -e "$REVISION_JQ" "$RUNS/$run_id/revision.json" >/dev/null 2>&1; then
+      rid="$bid-r1"; for g in "$dir/$rid.json" "$dir"/done/*-"$rid".json "$dir"/failed/*-"$rid".json "$dir/held/$rid.json"; do [ ! -e "$g" ] || rid=; done
+      rundir="$RUNS/$run_id"
+      if [ -z "$rid" ]; then note="a revision was proposed, but $bid-r1 exists"; manifest_set '.revision = {disposition:"refused", reason:$r}' --arg r "$bid-r1 exists"
+      else
+        # The original and the reason first, then the queue file: a stop in between leaves revised/ files nothing reads, never a
+        # revised task queued without the text its PR must show.
+        mkdir -p "$dir/revised"; cp "$task" "$dir/revised/$rid.json"; jq -r '.reason + "\n\n" + .changes' "$RUNS/$run_id/revision.json" > "$dir/revised/$rid.reason"; lo=
+        jq --arg id "$rid" --slurpfile r "$RUNS/$run_id/revision.json" --arg o "docs/BLOCKED-$id.md" --arg ob "docs/BLOCKED-$bid.md" --arg n "docs/BLOCKED-$rid.md" --arg a "Revised by the factory from $id (run $run_id), which ended blocked: " \
+          '.task_id=$id | .instructions = ($r[0].instructions | split("docs/BLOCKED-<task_id>.md") | join($n) | split($o) | join($n) | split($ob) | join($n)) + "\n\n" + $a + $r[0].reason + " The pull request shows the task as first written."' "$task" > "$dir/$rid.json" || lo="the queue file could not be written"
+        if [ -z "$lo" ] && lo=$(cmd_lint "$dir" 2>&1); then next_id=$rid; note="revised as $rid"; next="revised as $rid"
+        else rm -f "$dir/$rid.json" "$dir/revised/$rid.json" "$dir/revised/$rid.reason"; manifest_set '.revision = {disposition:"refused", reason:$r}' --arg r "the revised task fails lint: ${lo:0:300}"; echo "== $name: its revision fails lint and is not queued:"; printf '%s\n' "${lo:0:2000}"; note="the revision fails lint; not queued"; rid=; fi
+      fi
+    fi
     rows="$rows| $run_id | $cells | ${cb:--} | $(( $(date +%s) - t0 ))s | ${note:--} |"$'\n'; n=$((n+1)); outcomes="$outcomes$bid=$eff "
     [ "$rc" -eq 0 ] || notify "$name exited $rc ($what, $next)${reason:+: $reason}"
     [ "${cells##* | }" = - ] || prs=$((prs+1))   # the row's last cell is the PR URL or -
-    if [ -n "$dest" ]; then mkdir -p "$dir/$dest"; mv "$task" "$dir/$dest/$run_id.json"; task="$dir/$dest/$run_id.json"; fi
     # The retry file is written after the original is archived, so a kill between the two leaves nothing to run twice.
     # ponytail: retried and plain live in this loop only. A retry left queued by HALT, --max-tasks or --stop-at runs tomorrow as an ordinary
     # task: a same-way failure then reads as "retry failed too" (archived, no second retry), and a conflict retry is cut from the chain base.
     if [ -n "$new" ]; then jq --arg id "$new" --arg o "docs/BLOCKED-$id.md" --arg n "docs/BLOCKED-$new.md" '.task_id=$id | .instructions |= (split($o) | join($n))' "$task" > "$dir/$new.json"; retried="$retried$new=$rc/$outcome "; next_id=$new; [ "$outcome" != conflict ] || plain="$plain$new "; fi
     [ "$streak" -lt 2 ] || { why="two infra failures in a row (${streakids% })"; break; }
-    [ "$eff" -eq 0 ] || [ "$cls" = infra ] || [ -n "$cont" ] || { why="$name exited $rc"; break; }   # 3 no changes, 5 REFUTED, 10 blocked, 14 manifest; the row has the verdict
+    [ "$eff" -eq 0 ] || [ "$cls" = infra ] || [ -n "$cont" ] || [ -n "$rid" ] || { why="$name exited $rc"; break; }   # 3 no changes, 5 REFUTED, 10 blocked, 14 manifest; the row has the verdict
   done
   left=$(ls "$dir"/*.json 2>/dev/null | wc -l | tr -d ' ' || true)   # || true: an empty queue makes ls fail, and a failed substitution in an assignment is fatal under set -e
   wsay=; [ "$nwait" -eq 0 ] || wsay=" ($nwait waiting on a dependency)"; [ "$nheld" -eq 0 ] || wsay="$wsay, $nheld held for a human (queue/held/)"
