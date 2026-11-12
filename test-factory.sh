@@ -106,6 +106,14 @@ case "$mode" in
            case "${args[$((${#args[@]}-1))]}" in "You review a queue of coding tasks"*"## Inputs"*"Queue directory: /queue (read-only). Tasks, in order: "*) ;; *) echo "stub: deep lint prompt" >&2; exit 9;; esac
            case "${STUB_DEEP:-}" in crash) exit 1;; "") jq -n '{tasks:[inputs | {task_id, depends_on:(.depends_on // []), hold:null}]}' "$queue"/*.json > "$out/verdict.md";; *) cp "$STUB_DEEP" "$out/verdict.md";; esac; exit 0
          fi
+         case "${args[$((${#args[@]}-1))]}" in "A coding task in an autonomous software factory ended blocked"*)   # the planner (revise-prompt.md), at the blocked head, with the task and the note. STUB_REVISE: spec (default), other, bad, crash, nolint, and rewrites that add to Scope: ci (a workflow), lock (a lockfile in Markdown brackets), glob (the whole repository)
+           [ "$HEAD_SHA" = "$(git -C "$src" rev-parse "refs/heads/factory/$TASK_ID")" ] || { echo "stub: planner HEAD_SHA mismatch" >&2; exit 9; }
+           case "${args[$((${#args[@]}-1))]}" in *"## The task as written"*"Goal: g."*"## The agent's note, docs/BLOCKED-$TASK_ID.md"*'no "url" column on sandboxes'*) ;; *) echo "stub: planner prompt lacks the task or the note" >&2; exit 9;; esac
+           sc="s, x.js"; why="Done when needs x.js; Scope lists s."; case "${STUB_REVISE:-}" in ci) sc="s, .github/workflows/ci.yml";; lock) sc="s, [package-lock.json]";; glob) sc="s, **/*";; scope:*) sc=${STUB_REVISE#scope:};; html) why="Done when <!-- needs x.js.";; esac   # scope:<text>: the rewrite's Scope; html: a reason that opens an HTML comment
+           case "${STUB_REVISE:-spec}" in crash) exit 1;; bad) echo 'not json' > "$out/verdict.md";;
+             other) echo '{"attribution":"other","reason":"the agent could have added the column inside Scope.","changes":"","instructions":""}' > "$out/verdict.md";;
+             nolint) jq -n --arg i "$(printf 'Goal: g2.\nContext: c.\nScope: s, x.js.\nDone when: tests pass.')" '{attribution:"spec", reason:"r.", changes:"c", instructions:$i}' > "$out/verdict.md";;   # no Out of scope heading: lint refuses it
+             *) jq -n --arg i "$(printf 'Goal: g2.\nContext: c.\nScope: %s.\nDone when: tests pass.\nOut of scope: o. If stuck commit docs/BLOCKED-<task_id>.md.' "$sc")" '{attribution:"spec", reason:$w, changes:"Scope: s -> Scope: s, x.js", instructions:$i}' --arg w "$why" > "$out/verdict.md";; esac; exit 0;; esac
          n=$(cat "$STUB_STATE" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_STATE"
          v=$(echo "$STUB_VERDICTS" | cut -d, -f$n)
          # STUB_CONFLICT=<remote>: main moves under the run, with a change that conflicts with the worker's (both edit README.md).
@@ -122,7 +130,9 @@ case "$mode" in
            BIG)    { head -c 199982 /dev/zero | tr '\0' x; printf 'VERDICT: VERIFIED\n\nVERDICT: REFUTED\n'; } > "$out/verdict.md"; exit 0;;   # byte 200000 ends the first verdict
          esac
          printf 'finding %d: fix it (file.js:1)\nsaw key ghs_%s and mine b64 %s\nVERDICT: %s\n\n' "$n" "$(printf 'y%.0s' $(seq 36))" "$(printf '%s' "$secret" | base64)" "$v" > "$out/verdict.md";;   # a token by shape, and the judge's own key encoded
-  review) n=$(cat "$STUB_STATE.r" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_STATE.r"; v=$(echo "${STUB_REVIEW:-none}" | cut -d, -f$n)
+  review) case "${args[$((${#args[@]}-1))]}" in "You are a reviewer in an autonomous software factory, with one job: decide whether a rewritten task"*"## Why it was revised"*"## The task as written"*"## The task as revised"*)   # the revision review (revise-review-prompt.md). STUB_REVREVIEW: ok (default), block, crash
+           echo "stub revision review"; case "${STUB_REVREVIEW:-ok}" in crash) exit 1;; block) echo '{"blocks":[{"loc":"Done when","claim":"the rewrite drops the test for y","clause":"tests pass","repro":"true"}],"notes":[]}' > "$out/review.json";; *) echo '{"blocks":[],"notes":["fine"]}' > "$out/review.json";; esac; exit 0;; esac
+         n=$(cat "$STUB_STATE.r" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_STATE.r"; v=$(echo "${STUB_REVIEW:-none}" | cut -d, -f$n)
          [ "$HEAD_SHA" = "$(git -C "$src" rev-parse "refs/heads/factory/$TASK_ID")" ] || { echo "stub: review HEAD_SHA mismatch" >&2; exit 9; }
          case "${args[$((${#args[@]}-1))]}" in *"## Commits"*"Head: $HEAD_SHA"*"## Task given to the agent"*) ;; *) echo "stub: review prompt lacks the commits or the task" >&2; exit 9;; esac
          case "${args[$((${#args[@]}-1))]}" in *"Claims from the previous"*|*"VERDICT"*) echo "stub: the review saw the loop judge's findings" >&2; exit 9;; esac
@@ -156,7 +166,7 @@ chmod +x "$t/bin/"*
 run() {  # run <task_id> <verdicts> -> prints exit status; RUN_REPO overrides the local bare repo (a GitHub owner/name goes through the App path); RUN_INSTR the instructions (JSON-escaped)
   echo "{\"repo\":\"${RUN_REPO:-$t/remote.git}\",\"base_branch\":\"${RUN_BASE:-main}\",\"task_id\":\"$1\",\"instructions\":\"${RUN_INSTR:-do the thing}\"}" > "$t/$1.json"
   rm -f "$t/state" "$t/state.r" "$t/state.p" "$t/state.m" "$t/state.g" "$t/allow" "$t/logs"; set +e   # FACTORY_MAX_ROUNDS=3: the verdict fixtures below are written for three rounds; one case sets 5
-  PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_ALLOW="$t/allow" STUB_NETLOG="$t/netlog" STUB_LOGS="$t/logs" STUB_PROMPT="$t/prompt" STUB_APP_KEY="$t/app-key.b64" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_MAX_ROUNDS="${FACTORY_MAX_ROUNDS:-3}" \
+  PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_ALLOW="$t/allow" STUB_NETLOG="$t/netlog" STUB_LOGS="$t/logs" STUB_PROMPT="$t/prompt" STUB_APP_KEY="$t/app-key.b64" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_MAX_ROUNDS="${FACTORY_MAX_ROUNDS:-3}" FACTORY_REVISE="${FACTORY_REVISE:-0}" \
     "$here/factory" run "$t/$1.json" >"$t/$1.out" 2>&1; rc=$?; set -e
   echo "$rc"
 }
@@ -278,7 +288,7 @@ printf '%s\n' "$out" | grep -q "080-h: depends_on '010-a 020-b' is not a task id
 # bytes after the move to done/), base_branch stays the task's own and chain_base is in the manifest, and the report has one row per task.
 batch() {  # batch <queue-dir> <verdicts> [flags...] -> exit status; output in $t/batch.out
   rm -f "$t/state" "$t/state.r" "$t/state.p" "$t/state.m" "$t/state.g"; set +e
-  PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_MAX_ROUNDS=3 FACTORY_DEEP_LINT="${FACTORY_DEEP_LINT:-0}" \
+  PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_MAX_ROUNDS=3 FACTORY_DEEP_LINT="${FACTORY_DEEP_LINT:-0}" FACTORY_REVISE="${FACTORY_REVISE:-0}" \
     "$here/factory" batch "$1" "${@:3}" > "$t/batch.out" 2>&1; rc=$?; set -e
   echo "$rc"
 }
@@ -411,7 +421,7 @@ check "$(moved dy)" "020-dy-c.json 030-dy-d.json done failed " "deps worst-first
 # proposal; a supplier that runs later is held for reordering; lint knows a held task and the batch waits on it as dead. All or nothing.
 deep() {  # deep <queue-dir> [answer-file|crash] -> exit status; output in $t/deep.out
   sleep 1; set +e   # a deep-lint run id is a second plus "deep-lint": two in one second would collide
-  PATH="$t/bin:$PATH" STUB_DEEP="${2:-}" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 "$here/factory" lint --deep "$1" > "$t/deep.out" 2>&1; rc=$?; set -e; echo "$rc"
+  PATH="$t/bin:$PATH" STUB_DEEP="${2:-}" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_REVISE="${FACTORY_REVISE:-0}" "$here/factory" lint --deep "$1" > "$t/deep.out" 2>&1; rc=$?; set -e; echo "$rc"
 }
 answer() { jq -n "$1" > "$t/answer-$2.json"; echo "$t/answer-$2.json"; }   # answer <jq program> <name>: the session's final message
 dlm() { jq -r "$1" "$(ls -d "$runs"/*-deep-lint | tail -1)/manifest.json"; }   # the last deep-lint run's manifest
@@ -532,6 +542,118 @@ check "$(jq -r .instructions "$t/bq/010-bk-a-r1.json" | tail -1)" 'Previous atte
 check "$(jq -r '.depends_on // "none"' "$t/bq/010-bk-a-i1-r1.json")" none "requeue with source: the source's missing depends_on removes the old one"
 task "$t/remote.git" main 010-bk-other 'Goal: x\nContext: c.\nScope: s.\nDone when: d.\nOut of scope: o.' "$t/bqsrc"; "$here/factory" requeue "$t/bq/failed/"*-010-bk-a.json "$t/bqsrc/010-bk-other.json" >/dev/null 2>&1 && { echo "FAIL: requeue accepted a source for another task"; exit 1; }
 check "$("$here/factory" lint "$t/bk")" "lint ok: 1 task(s)" "requeued file passes lint"
+# Revisions (factory.md, "Revisions"). 010 blocks; the planner (Codex) rewrites the task, the reviewer (Claude) accepts, and the batch runs
+# it next as 010-rv-a-r1, without --continue, with the planner's text, the note path under the new id and the host's paragraph; 020, which
+# depends on 010, then runs in the same night. The blocked attempt keeps its own record (exit 10, outcome blocked).
+mkdir -p "$t/rv"; task "$t/remote.git" main 010-rv-a "$body" "$t/rv"; taskd "$t/remote.git" main 020-rv-b "$body" "$t/rv" '["010-rv-a"]'
+rc=$(FACTORY_REVISE=1 STUB_WORK_BLOCKED=010-rv-a FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/rv" "VERIFIED,VERIFIED")
+check "$rc" 0 "revision: the night ends green"; m=$(ls -d "$runs"/*-010-rv-a | tail -1)
+check "$(moved rv/done) / $(moved rv/failed) / $(moved rv/revised)" "010-rv-a-r1.json 020-rv-b.json  / 010-rv-a.json  / 010-rv-a-r1.json 010-rv-a-r1.reason " "revision: -r1 and its dependent ran; the original is in failed/ and in revised/"
+check "$(jq -r '"\(.exit_status) \(.outcome) \(.revision.disposition) \(.revision.reason)"' "$m/manifest.json")" "10 blocked proposed Done when needs x.js; Scope lists s." "revision: the blocked attempt's record stands, with the revision beside it"
+check "$(jq -r .instructions "$t/rv/done/"*-010-rv-a-r1.json | sed -E 's/run [0-9TZ]+-010-rv-a/run <id>/')" 'Goal: g2.
+Context: c.
+Scope: s, x.js.
+Done when: tests pass.
+Out of scope: o. If stuck commit docs/BLOCKED-010-rv-a-r1.md.
+
+Revised by the factory from 010-rv-a (run <id>), which ended blocked: Done when needs x.js; Scope lists s. The pull request shows the task as first written.' "revision: the planner's instructions, the note path renamed, the host's paragraph"
+cmp -s "$t/rv/revised/010-rv-a-r1.json" "$t/rv/failed/"*-010-rv-a.json || { echo "FAIL: revision: revised/ does not hold the task as first written"; exit 1; }
+check "$(cat "$t/rv/revised/010-rv-a-r1.reason")" 'Done when needs x.js; Scope lists s.
+
+Scope: s -> Scope: s, x.js' "revision: the reason and the changes, for the PR"
+check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" '010-rv-a exited 10 (blocked, revised as 010-rv-a-r1): no \"url\" column on sandboxes
+done: 3 run, 0 PR(s), 0 failed, 1 blocked. All tasks ran.' "revision: the phone says it was revised"; rm -f "$t/notify"
+check "$(grep -c 'stub judge secret=' "$m/log.jsonl") $(grep -c 'stub revision review' "$m/log.jsonl")" "1 1" "revision: one planner session and one review, in the blocked run"
+# No revision, and the manifest says why: the planner says the wording is not the cause; the reviewer refuses the rewrite; the rewrite adds
+# CI to Scope (refused by the host before any review); the planner crashes; the planner answers nonsense. The task stays blocked, nothing is queued.
+norev() {  # norev <name> <disposition: reason> <what>, after a blocked batch of 010-<name>-a
+  m=$(ls -d "$runs"/*-"010-$1-a" | tail -1)
+  check "$rc / $(moved "$1") / $(jq -r '.revision | .disposition + ": " + .reason' "$m/manifest.json")" "10 / failed  / $2" "no revision: $3"
+}
+for c in rn ro rc rl rg rx ry re rh rj rb1 rb2 rb3 rb4 rb5 rb6; do mkdir -p "$t/$c"; task "$t/remote.git" main "010-$c-a" "$body" "$t/$c"; done
+rc=$(FACTORY_REVISE=1 STUB_REVISE=other STUB_WORK_BLOCKED=010-rn-a batch "$t/rn" VERIFIED --continue); norev rn "none: not the task's wording: the agent could have added the column inside Scope." "the planner blames the agent"
+rc=$(FACTORY_REVISE=1 STUB_REVREVIEW=block STUB_WORK_BLOCKED=010-ro-a batch "$t/ro" VERIFIED --continue); norev ro "refused: the reviewer refused it: the rewrite drops the test for y" "the reviewer refuses"
+rc=$(FACTORY_REVISE=1 STUB_REVISE=ci STUB_WORK_BLOCKED=010-rc-a batch "$t/rc" VERIFIED --continue); norev rc "refused: the rewrite adds .github/workflows/ci.yml to Scope" "a workflow added to Scope"
+check "$(grep -c 'stub revision review' "$m/log.jsonl")" 0 "no revision: a refused Scope never reaches the reviewer"
+rc=$(FACTORY_REVISE=1 STUB_REVISE=lock STUB_WORK_BLOCKED=010-rl-a batch "$t/rl" VERIFIED --continue); norev rl "refused: the rewrite adds package-lock.json to Scope" "a lockfile added to Scope, in Markdown brackets"
+rc=$(FACTORY_REVISE=1 STUB_REVISE=glob STUB_WORK_BLOCKED=010-rg-a batch "$t/rg" VERIFIED --continue); norev rg "refused: the rewrite adds **/* to Scope" "a repository-wide glob added to Scope"
+rc=$(FACTORY_REVISE=1 STUB_REVISE='scope:s, .githu[bB]/workflo[wW]s/x.yml' STUB_WORK_BLOCKED=010-rb1-a batch "$t/rb1" VERIFIED --continue); norev rb1 "refused: the rewrite adds .githu[bB]/workflo[wW]s/x.yml to Scope" "a character class is not a route segment"
+rc=$(FACTORY_REVISE=1 STUB_REVISE='scope:s, bun.lockb' STUB_WORK_BLOCKED=010-rb2-a batch "$t/rb2" VERIFIED --continue); norev rb2 "refused: the rewrite adds bun.lockb to Scope" "another lockfile"
+rc=$(FACTORY_REVISE=1 STUB_REVISE='scope:s, the entire project' STUB_WORK_BLOCKED=010-rb3-a batch "$t/rb3" VERIFIED --continue); norev rb3 "refused: the rewrite adds a catch-all (entire project) to Scope" "a catch-all in prose"
+rc=$(FACTORY_REVISE=1 STUB_REVISE='scope:s, .githu?/workflows/ci.yml' STUB_WORK_BLOCKED=010-rb5-a batch "$t/rb5" VERIFIED --continue); norev rb5 "refused: the rewrite adds .githu?/workflows/ci.yml to Scope" "a single-character glob"
+rc=$(FACTORY_REVISE=1 STUB_REVISE='scope:s, Jenkinsfile' STUB_WORK_BLOCKED=010-rb6-a batch "$t/rb6" VERIFIED --continue); norev rb6 "refused: the rewrite adds Jenkinsfile to Scope" "CI configuration that is not GitHub's"
+# What a real fix adds is not refused: a test file that is about setup, a workflow module of the app, a Next.js route segment.
+rc=$(FACTORY_REVISE=1 STUB_REVISE='scope:s, apps/web/test/setup.test.ts, src/workflow/render.ts, apps/web/app/api/sandboxes/[id]/fs/[op]/route.ts, apps/web/app/[id], apps/web/app/[[...slug]]' STUB_WORK_BLOCKED=010-rb4-a batch "$t/rb4" VERIFIED --continue)
+check "$rc $(moved rb4/done)" "0 010-rb4-a-r1.json " "revision: ordinary test, module and route paths are accepted"
+rc=$(FACTORY_REVISE=1 STUB_REVISE=crash STUB_WORK_BLOCKED=010-rx-a batch "$t/rx" VERIFIED --continue); norev rx "error: the planner left no valid answer (container status 1)" "the planner crashed"
+rc=$(FACTORY_REVISE=1 STUB_REVISE=bad STUB_WORK_BLOCKED=010-ry-a batch "$t/ry" VERIFIED --continue); norev ry "error: the planner left no valid answer (container status 0)" "the planner's answer is not JSON"
+rc=$(FACTORY_REVISE=1 STUB_REVREVIEW=crash STUB_WORK_BLOCKED=010-rh-a batch "$t/rh" VERIFIED --continue); norev rh "refused: the revision review left no valid answer (container status 1)" "the reviewer crashed: no answer is not a pass"
+# A rewrite the reviewer accepted but lint refuses is not queued, leaves nothing in revised/, and is recorded as refused.
+rc=$(FACTORY_REVISE=1 STUB_REVISE=nolint STUB_WORK_BLOCKED=010-rj-a batch "$t/rj" VERIFIED --continue); m=$(ls -d "$runs"/*-010-rj-a | tail -1)
+check "$rc / $(moved rj) / $(ls "$t/rj/revised" | wc -l | tr -d ' ') / $(jq -r '.revision | .disposition + ": " + .reason' "$m/manifest.json" | cut -c1-87)" "10 / failed revised  / 0 / refused: the revised task fails lint: 010-rj-a-r1: instructions need the headings Goal," "no revision: the rewrite fails lint"
+# The planner's log pipeline fails (run_container writes outcome evidence_error into the manifest and exits 12, in the subshell): the
+# blocked attempt's record is put back as it was, and only .revision says the step did not finish.
+rc=$(FACTORY_REVISE=1 STUB_JQ_FAIL=judge STUB_WORK_BLOCKED=010-re-a batch "$t/re" VERIFIED --continue); m=$(ls -d "$runs"/*-010-re-a | tail -1)
+check "$rc $(jq -r '"\(.exit_status) \(.outcome) \(.class) \(.revision.disposition)"' "$m/manifest.json")" "10 10 blocked task error" "revision: a lost log in the planner step leaves the blocked record as it was"
+# The revision is taken by name and leaves the cursor: an id that sorts between the task and its -r1 still runs.
+mkdir -p "$t/rk"; for i in 010-rk-a 010-rk-a-foo 020-rk-b; do task "$t/remote.git" main "$i" "$body" "$t/rk"; done
+rc=$(FACTORY_REVISE=1 STUB_WORK_BLOCKED=010-rk-a batch "$t/rk" "VERIFIED,VERIFIED,VERIFIED"); check "$rc $(moved rk/done)" "0 010-rk-a-r1.json 010-rk-a-foo.json 020-rk-b.json " "revision: a task between <id> and <id>-r1 is not skipped (done/ lists in run order)"
+# A revision whose run fails with nothing pushed stays in the queue for tomorrow and is not taken a second time tonight (the cursor
+# is still behind it): one run of 010-ru-a-r1, the file still queued.
+mkdir -p "$t/ru"; task "$t/remote.git" main 010-ru-a "$body" "$t/ru"
+rc=$(FACTORY_REVISE=1 STUB_PUSH_FAIL_AT=2 STUB_WORK_BLOCKED=010-ru-a batch "$t/ru" "VERIFIED,VERIFIED,VERIFIED" --continue)
+check "$(ls -d "$runs"/*-010-ru-a-r1 | wc -l | tr -d ' ') $(ls "$t/ru" | tr '\n' ' ')" "1 010-ru-a-r1.json failed revised " "revision: a revision left in the queue by an infra failure is not run twice in one night"
+# An id already used is never reused: the proposal is recorded as refused and the task stays blocked.
+mkdir -p "$t/rz/done"; task "$t/remote.git" main 010-rz-a "$body" "$t/rz"; echo '{}' > "$t/rz/done/20261101T000000Z-010-rz-a-r1.json"
+rc=$(FACTORY_REVISE=1 STUB_WORK_BLOCKED=010-rz-a batch "$t/rz" VERIFIED); m=$(ls -d "$runs"/*-010-rz-a | tail -1)
+check "$rc $(jq -r '.revision | .disposition + ": " + .reason' "$m/manifest.json") $(ls "$t/rz" | tr '\n' ' ')" "10 refused: 010-rz-a-r1 exists done failed " "revision: an id that exists is not reused"
+# Once per task, and never under the merge gate: a blocked -r1 gets no planner, and with a merger App set nothing is revised.
+mkdir -p "$t/rw"; task "$t/remote.git" main 010-rw-a-r1 "$body" "$t/rw"
+rc=$(FACTORY_REVISE=1 STUB_WORK_BLOCKED=010-rw-a-r1 batch "$t/rw" VERIFIED --continue); m=$(ls -d "$runs"/*-010-rw-a-r1 | tail -1)
+check "$rc $(jq -r '.revision // "none"' "$m/manifest.json") $(grep -c 'stub judge secret=' "$m/log.jsonl")" "10 none 0" "revision: a task that was revised once is not revised again"
+mkdir -p "$t/rmg"; task "$t/remote.git" main 010-rmg-a "$body" "$t/rmg"
+rc=$(FACTORY_MERGER_APP_ID=Iv1.merger FACTORY_REVISE=1 STUB_WORK_BLOCKED=010-rmg-a batch "$t/rmg" VERIFIED --continue); m=$(ls -d "$runs"/*-010-rmg-a | tail -1)
+check "$rc $(jq -r '.revision // "none"' "$m/manifest.json") $(grep -c 'stub judge secret=' "$m/log.jsonl")" "10 none 0" "revision: off under the merge gate"
+rc=$(FACTORY_REVISE=1 STUB_WORK_BLOCKED=rvp run rvp VERIFIED); m=$(ls -d "$runs"/*-rvp | tail -1)
+check "$rc $(jq -r '.revision // "none"' "$m/manifest.json") $(grep -c 'stub judge secret=' "$m/log.jsonl")" "10 none 0" "revision: a run outside a batch asks no planner (nothing would queue the answer)"
+# Deep lint: a contradiction that comes with a rewrite is revised in place, under the same id, once the reviewer accepts it; the task as
+# it was goes to revised/. The second night finds revised/<id>.json and holds instead; a rewrite the reviewer refuses is a hold as before.
+dra() { answer '{tasks:[{task_id:"010-'"$1"'-a",depends_on:[],hold:{kind:"'"${2:-contradiction}"'",reason:"Done when needs x.js; Scope lists s.",proposed_instructions:"Goal: g.\nContext: c.\nScope: s, x.js.\nDone when: tests pass.\nOut of scope: o."}},{task_id:"020-'"$1"'-b",depends_on:[],hold:null}]}' "$1"; }
+queue dr 010-dr-a 020-dr-b; cp "$t/dr/010-dr-a.json" "$t/dr-010.orig"; a=$(dra dr)
+rc=$(FACTORY_REVISE=1 deep "$t/dr" "$a"); check "$rc" 0 "deep lint revision: applied"
+check "$(moved dr) / $(moved dr/revised) / $(moved dr/held)" "010-dr-a.json 020-dr-b.json held revised  / 010-dr-a.json 010-dr-a.reason  / " "deep lint revision: the task stays queued under its id; nothing is held"
+check "$(jq -r .instructions "$t/dr/010-dr-a.json" | sed -E 's/run [0-9TZ]+-deep-lint/run <id>/')" 'Goal: g.
+Context: c.
+Scope: s, x.js.
+Done when: tests pass.
+Out of scope: o.
+
+Revised by deep lint (run <id>), contradiction: Done when needs x.js; Scope lists s. The pull request shows the task as first written.' "deep lint revision: the rewrite, then the host's paragraph"
+cmp -s "$t/dr/revised/010-dr-a.json" "$t/dr-010.orig" || { echo "FAIL: deep lint revision: revised/ does not hold the task as it was"; exit 1; }
+check "$(cat "$t/dr/revised/010-dr-a.reason") $(dlm '[.deep_lint.result, (.deep_lint.revised|length), (.deep_lint.held|length)] | @json')" 'contradiction: Done when needs x.js; Scope lists s. ["applied",1,0]' "deep lint revision: the reason and the manifest"
+grep -q '^deep lint: 0 task(s) gained depends_on, 0 held, 1 revised$' "$t/deep.out" || { echo "FAIL: deep lint revision not said"; cat "$t/deep.out"; exit 1; }
+check "$("$here/factory" lint "$t/dr" | tail -1)" "lint ok: 2 task(s)" "deep lint revision: the result passes lint"
+rc=$(FACTORY_REVISE=1 deep "$t/dr" "$a"); check "$rc $(moved dr/held) $(dlm '.deep_lint.held[0].rewrite_not_used')" "0 010-dr-a.json 010-dr-a.proposed.json 010-dr-a.reason  revised once already" "deep lint revision: once per task; the second objection is a hold"
+queue ds 010-ds-a 020-ds-b; a=$(dra ds); rc=$(FACTORY_REVISE=1 STUB_REVREVIEW=block deep "$t/ds" "$a")
+check "$rc $(moved ds/held) $(ls "$t/ds/revised" 2>/dev/null | wc -l | tr -d ' ')" "0 010-ds-a.json 010-ds-a.proposed.json 010-ds-a.reason  0" "deep lint revision: a rewrite the reviewer refuses is held as before"
+check "$(dlm '.deep_lint.held[0].rewrite_not_used')" "the reviewer refused it: the rewrite drops the test for y" "deep lint revision: the manifest says why the rewrite was not used"
+# An ambiguity with a rewrite is revised the same way. A rewrite that also relies on a later task is a hold, as it was before revisions
+# (the staged queue would fail lint and nothing would be applied). And one deep lint sends at most three rewrites to the reviewer.
+queue dw 010-dw-a 020-dw-b; a=$(dra dw ambiguity); rc=$(FACTORY_REVISE=1 deep "$t/dw" "$a")
+check "$rc $(cat "$t/dw/revised/010-dw-a.reason")" "0 ambiguity: Done when needs x.js; Scope lists s." "deep lint revision: an ambiguity"
+queue dv 010-dv-a 020-dv-b; a=$(answer '{tasks:[{task_id:"010-dv-a",depends_on:["020-dv-b"],hold:{kind:"contradiction",reason:"r.",proposed_instructions:"Goal: g.\nContext: c.\nScope: s, x.js.\nDone when: tests pass.\nOut of scope: o."}},{task_id:"020-dv-b",depends_on:[],hold:null}]}' dv)
+rc=$(FACTORY_REVISE=1 deep "$t/dv" "$a"); check "$rc $(moved dv/held) $(dlm '.deep_lint.held[0].rewrite_not_used')" "0 010-dv-a.json 010-dv-a.proposed.json 010-dv-a.reason  it also relies on 020-dv-b, which cannot be waited for" "deep lint revision: a rewrite with a later supplier is held, and the rest of the answer is still applied"
+queue dcap 010-dcap-a 020-dcap-b 030-dcap-c 040-dcap-d; a=$(answer '{tasks:[("010-dcap-a","020-dcap-b","030-dcap-c","040-dcap-d") | {task_id:., depends_on:[], hold:{kind:"contradiction",reason:"r.",proposed_instructions:"Goal: g.\nContext: c.\nScope: s, x.js.\nDone when: tests pass.\nOut of scope: o."}}]}' dcap)
+rc=$(FACTORY_REVISE=1 deep "$t/dcap" "$a"); check "$rc $(dlm '[(.deep_lint.revised|length), (.deep_lint.held|map(.task_id + ": " + .rewrite_not_used)|join(","))] | @json')" '0 [3,"040-dcap-d: more than 3 rewrites in one deep lint"]' "deep lint revision: at most three reviews; the fourth rewrite is held"
+# A task deep lint revised in place and that then blocks gets no planner: it was revised once.
+queue du 010-du-a 020-du-b; a=$(dra du)
+sleep 1; rc=$(FACTORY_DEEP_LINT=1 FACTORY_REVISE=1 STUB_DEEP="$a" STUB_WORK_BLOCKED=010-du-a batch "$t/du" VERIFIED --continue); m=$(ls -d "$runs"/*-010-du-a | tail -1)
+check "$rc $(jq -r '.revision // "none"' "$m/manifest.json") $(grep -c 'stub judge secret=' "$m/log.jsonl")" "10 none 0" "revision: a task deep lint revised is not revised again after a block"
+# Inside a batch: the revision is notified with its reason, has its row, and the task runs the same night.
+queue dn 010-dn-a 020-dn-b; a=$(dra dn)
+sleep 1; rc=$(FACTORY_DEEP_LINT=1 FACTORY_REVISE=1 STUB_DEEP="$a" FACTORY_NOTIFY_URL=http://notify.test/hook STUB_NOTIFY="$t/notify" batch "$t/dn" "VERIFIED,VERIFIED"); check "$rc $(moved dn/done)" "0 010-dn-a.json 020-dn-b.json " "deep lint revision in a batch: the task ran"
+check "$(head -1 "$t/notify" | sed -E 's/^batch-[0-9]+T[0-9]+Z: //')" "010-dn-a revised by deep lint (contradiction): Done when needs x.js; Scope lists s.; it runs as revised, and its PR shows the task as written" "deep lint revision in a batch: notified"; rm -f "$t/notify"
+rep=$(ls "$runs"/batch-*.md | tail -1); grep -q '^| - | revised | - | - | - | - | - | 010-dn-a (contradiction): Done when needs x.js; Scope lists s. |$' "$rep" && grep -q 'deep lint: run [0-9TZ]*-deep-lint, 0 task(s) gained depends_on, 0 held, 1 revised$' "$rep" || { echo "FAIL: deep lint revision not in the report"; cat "$rep"; exit 1; }
 "$here/factory" requeue "$t/bk/failed/"*-010-bk-a.json > /dev/null; check "$(ls "$t/bk"/*.json | xargs -n1 basename | tr '\n' ' ')" "010-bk-a-r1.json 010-bk-a-r2.json " "requeue numbers past the queued retry"
 # requeue a refuted run: the last judge file is appended; a skipped task (no run) gets nothing appended.
 "$here/factory" requeue "$t/rf/failed/"*-020-rf-b.json > /dev/null; i=$(jq -r .instructions "$t/rf/020-rf-b-r1.json")
@@ -774,6 +896,23 @@ set +e; out=$(PATH="$t/bin:$PATH" STUB_APP_KEY="$t/app-key.b64" STUB_STATE="$t/s
 check "$rc" 0 "ruleset-check exit"; check "$(printf '%s\n' "$out" | grep -c '^PASS:')" 8 "ruleset-check: eight PASS lines"; check "$(printf '%s\n' "$out" | grep -c '^FAIL:')" 0 "ruleset-check: no FAIL"
 printf '%s\n' "$out" | grep -q '^PASS: the push token cannot push to next$' && printf '%s\n' "$out" | grep -q '^PASS: a merge with a stale sha is 409$' || { echo "FAIL: ruleset-check lines: $out"; exit 1; }
 rm -f "$t/remote.git/hooks/pre-receive"; git -C "$t/remote.git" update-ref -d refs/heads/next
+# The PR of a revised task opens with why it was revised and the task as first written.
+mkdir -p "$t/rp"; task o/r main 010-rp-a "$body" "$t/rp"
+rc=$(FACTORY_REVISE=1 STUB_APP_KEY="$t/app-key.b64" STUB_PRS="$t/prs-rp" STUB_WORK_BLOCKED=010-rp-a batch "$t/rp" "VERIFIED"); check "$rc" 0 "revised PR: exit"
+check "$(jq -r .body "$t/prs-rp" | sed -n '3,11p')" '## Task revised by the factory (read before merging)
+
+Done when needs x.js; Scope lists s.
+
+Scope: s -> Scope: s, x.js
+
+<details><summary>The task as first written</summary>
+
+Goal: g.' "revised PR: the body opens with the reason, the changes and the task as first written"
+check "$(jq -r .revised "$(ls -d "$runs"/*-010-rp-a-r1 | tail -1)/manifest.json")" true "revised PR: recorded in the manifest"
+# Model text in a revised task's PR cannot open an HTML comment over the rest of the body.
+mkdir -p "$t/rq2"; task o/r main 010-rq2-a "$body" "$t/rq2"
+rc=$(FACTORY_REVISE=1 STUB_REVISE=html STUB_APP_KEY="$t/app-key.b64" STUB_PRS="$t/prs-rq2" STUB_WORK_BLOCKED=010-rq2-a batch "$t/rq2" "VERIFIED"); check "$rc" 0 "revised PR, html: exit"
+check "$(jq -r .body "$t/prs-rq2" | grep -c '<!--') $(jq -r .body "$t/prs-rq2" | grep -c 'Done when &lt;!-- needs x.js.')" "0 2" "revised PR: < is escaped in the reason and in the revised instructions"
 unset GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; rm -rf "${runs:?}"/*-gh[0-9] "${runs:?}"/*-m[0-9] "${runs:?}"/*-m1[0-9]
 
 # factory stop while docker is down still signals, logs and records the incident instead of dying after writing HALT.
@@ -819,4 +958,4 @@ grep -q '^Stopped: the base is red: ' "$(ls "$runs"/batch-*.md | tail -1)" || { 
 grep -q ': stopped: the base is red' "$t/notify-hr" || { echo "FAIL: base red notification"; cat "$t/notify-hr"; exit 1; }
 rc=$(FACTORY_DEEP_LINT=1 FACTORY_HEALTH=0 FACTORY_GATE=0 batch "$t/hr" "VERIFIED"); check "$rc" 0 "FACTORY_HEALTH=0 skips the check"
 find "$runs" -mindepth 1 -maxdepth 1 -newer "$t/secrets" -exec rm -rf {} +   # everything the run tree gained since this test began is the test's (the lock keeps a real run out)
-echo "ok: egress (per-step proxy, allowlists, network record, dead proxy, lost record), pins (image id, models, no spend cap), cost per round and report, evidence error (worker, judge), redaction (encoded, by shape: log, judge file, PR body), supply chain (credential in tree, in task, in lint; dependency manifest gate and its Scope permission; npm policy; requeue notes), judge loop (revise with facts and claims apart, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, five rounds, App bot commit identity and its failed lookup), verification gate (clean gate ships with the record in the PR body; pre-existing, invalid and truncated never block; a regression and an unmet clause cost one worker round with the facts, one judge round with the facts and a re-gate; crashed or invalid review, crashed verifier, a stop during the review are gate_pending and retried as -i1; a failed second push keeps the first; no new commits, the same repro twice, REFUTED in a cycle and the MAX_GATES ceiling are refuted by the gate; blocked and conflict never reach it; the differential test checks with npm ci), gates (blocked: round-1 note skips the judge, note on code, note in round 2 after REFUTED and after CAVEATS, deleted note, a directory is not a note, a replace ref does not skip the judge, manifest ahead of blocked; the worker prompt names the note path; conflict with the target), lint, batch (chain, refuted chain, chain after a failure, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run left in queue, blocked reason on the phone, notify host and off state, failed POST visible, infra retry recovered / failed the same way / conflict cut from its own base / conflict mid-chain not retried, hand-queued -i1 after a pass, circuit breaker, pr_failed chains, a stopped run is class task, depends_on: passed tonight / not merged waits / merged runs / no-chain waits / queued waits / dead notified and non-zero / pruned record unknown / worst dependency decides / declared base waiting / GitHub merged, open, reverted by exact title, 502 and 403 unknown, merged elsewhere dead / one cached read-only token), class and pushed in the manifest, lint depends_on (graph, later, self, unknown, other repo, schema, id grammar, malformed archive), requeue (blocked, refuted, skipped), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), merge gate (merged into next by the merger App; PR-only without it; held on chain taint and on the cap; open on a failed check post, a refused merge, a timeout, a conflict; a lost answer reconciled; the batch's main-in-next check; ruleset-check against the stubs), deep lint (additions in place with the host's paragraph, a dropped id refused, holds with reason and proposal, a later supplier held for reordering, a held dependency known to lint and a dead wait in the batch, all held is exit 10 and notified, an invalid answer and a proposal that fails lint change nothing, a queue that fails lint never reaches the container, a failed deep lint falls through to the deterministic lint, notified), unhold (back under its own id, touch recorded, refused outside held/, over a queued file, when the queue would fail lint, while a batch holds the lock; a failed copy keeps the held files), a held dependency dead ahead of an open PR, .proposed ids reserved, a deep lint that dies while applying says so, stop with docker down, chain base by commit after a mid-batch merge, chain base behind main merged in, scope note in the PR and on the phone, requeue from a source spec, red base stops the night (exit 15, FACTORY_HEALTH=0)"
+echo "ok: revisions (a blocked task rewritten, reviewed and rerun the same night; deep lint rewrites; the PR shows the original), egress (per-step proxy, allowlists, network record, dead proxy, lost record), pins (image id, models, no spend cap), cost per round and report, evidence error (worker, judge), redaction (encoded, by shape: log, judge file, PR body), supply chain (credential in tree, in task, in lint; dependency manifest gate and its Scope permission; npm policy; requeue notes), judge loop (revise with facts and claims apart, refuted, no verdict, caveats, failed revision, idle revision, redaction, CRLF/double/oversize verdicts, judged-round count, five rounds, App bot commit identity and its failed lookup), verification gate (clean gate ships with the record in the PR body; pre-existing, invalid and truncated never block; a regression and an unmet clause cost one worker round with the facts, one judge round with the facts and a re-gate; crashed or invalid review, crashed verifier, a stop during the review are gate_pending and retried as -i1; a failed second push keeps the first; no new commits, the same repro twice, REFUTED in a cycle and the MAX_GATES ceiling are refuted by the gate; blocked and conflict never reach it; the differential test checks with npm ci), gates (blocked: round-1 note skips the judge, note on code, note in round 2 after REFUTED and after CAVEATS, deleted note, a directory is not a note, a replace ref does not skip the judge, manifest ahead of blocked; the worker prompt names the note path; conflict with the target), lint, batch (chain, refuted chain, chain after a failure, max-tasks, stop-at, halt, no-chain, continue, declared dependency, killed run left in queue, blocked reason on the phone, notify host and off state, failed POST visible, infra retry recovered / failed the same way / conflict cut from its own base / conflict mid-chain not retried, hand-queued -i1 after a pass, circuit breaker, pr_failed chains, a stopped run is class task, depends_on: passed tonight / not merged waits / merged runs / no-chain waits / queued waits / dead notified and non-zero / pruned record unknown / worst dependency decides / declared base waiting / GitHub merged, open, reverted by exact title, 502 and 403 unknown, merged elsewhere dead / one cached read-only token), class and pushed in the manifest, lint depends_on (graph, later, self, unknown, other repo, schema, id grammar, malformed archive), requeue (blocked, refuted, skipped), GitHub App (installation lookup, 404, failed PR open, PR reconciliation, refused mint, chained PRs target base_branch), merge gate (merged into next by the merger App; PR-only without it; held on chain taint and on the cap; open on a failed check post, a refused merge, a timeout, a conflict; a lost answer reconciled; the batch's main-in-next check; ruleset-check against the stubs), deep lint (additions in place with the host's paragraph, a dropped id refused, holds with reason and proposal, a later supplier held for reordering, a held dependency known to lint and a dead wait in the batch, all held is exit 10 and notified, an invalid answer and a proposal that fails lint change nothing, a queue that fails lint never reaches the container, a failed deep lint falls through to the deterministic lint, notified), unhold (back under its own id, touch recorded, refused outside held/, over a queued file, when the queue would fail lint, while a batch holds the lock; a failed copy keeps the held files), a held dependency dead ahead of an open PR, .proposed ids reserved, a deep lint that dies while applying says so, stop with docker down, chain base by commit after a mid-batch merge, chain base behind main merged in, scope note in the PR and on the phone, requeue from a source spec, red base stops the night (exit 15, FACTORY_HEALTH=0)"
