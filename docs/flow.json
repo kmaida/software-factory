@@ -33,7 +33,6 @@
  "mainPath": [
   "task",
   "factory",
-  "lint",
   "worker",
   "judge",
   "push",
@@ -44,23 +43,23 @@
   {
    "id": "task",
    "lane": "you",
-   "col": 0,
+   "col": 1,
    "type": "frontend",
    "label": "Task file",
    "sublabel": "queue/*.json"
   },
   {
-   "id": "ntfy",
+   "id": "lint",
    "lane": "host",
-   "col": 5,
-   "type": "messagebus",
-   "label": "ntfy",
-   "sublabel": "failures, summary"
+   "col": 0,
+   "type": "security",
+   "label": "Deep lint",
+   "sublabel": "once per batch"
   },
   {
    "id": "factory",
    "lane": "host",
-   "col": 0,
+   "col": 1,
    "type": "backend",
    "label": "Orchestrator",
    "sublabel": "trust boundary"
@@ -68,18 +67,10 @@
   {
    "id": "keycard",
    "lane": "host",
-   "col": 2,
+   "col": 3,
    "type": "security",
    "label": "Keycard",
    "sublabel": "credentials"
-  },
-  {
-   "id": "lint",
-   "lane": "sandbox",
-   "col": 0,
-   "type": "security",
-   "label": "Deep lint",
-   "sublabel": "once per batch"
   },
   {
    "id": "worker",
@@ -106,9 +97,17 @@
    "sublabel": "contents:write"
   },
   {
+   "id": "ntfy",
+   "lane": "gatelane",
+   "col": 1,
+   "type": "messagebus",
+   "label": "ntfy",
+   "sublabel": "failures, summary"
+  },
+  {
    "id": "nopr",
    "lane": "gatelane",
-   "col": 4,
+   "col": 3,
    "type": "security",
    "label": "No PR",
    "sublabel": "exit 5, 6, 10–14"
@@ -149,22 +148,18 @@
   },
   {
    "from": "factory",
+   "to": "lint",
+   "role": "branch"
+  },
+  {
+   "from": "factory",
    "to": "keycard",
    "label": "tokens",
    "role": "branch"
   },
   {
    "from": "factory",
-   "to": "ntfy",
-   "label": "alerts",
-   "role": "async",
-   "variant": "dashed",
-   "route": "up-channel",
-   "channelY": 166
-  },
-  {
-   "from": "factory",
-   "to": "lint",
+   "to": "worker",
    "label": "1 secret",
    "variant": "emphasis",
    "route": "drop",
@@ -172,13 +167,10 @@
    "toSide": "top"
   },
   {
-   "from": "lint",
-   "to": "worker"
-  },
-  {
    "from": "worker",
    "to": "judge",
-   "label": "commits"
+   "label": "commits",
+   "labelDy": 14
   },
   {
    "from": "judge",
@@ -186,9 +178,7 @@
    "label": "revise, ≤5 rounds",
    "role": "return",
    "variant": "dashed",
-   "route": "bottom-channel",
-   "fromSide": "bottom",
-   "toSide": "bottom"
+   "labelDy": -14
   },
   {
    "from": "judge",
@@ -219,8 +209,7 @@
    "to": "nopr",
    "label": "refuted",
    "role": "error",
-   "variant": "security",
-   "labelDy": -20
+   "variant": "security"
   },
   {
    "from": "gate",
@@ -237,12 +226,33 @@
   },
   {
    "from": "nopr",
-   "to": "factory",
+   "to": "ntfy",
+   "label": "alert",
+   "role": "async",
+   "variant": "dashed"
+  },
+  {
+   "from": "nopr",
+   "to": "task",
    "label": "rewrite once",
    "role": "return",
    "variant": "dashed",
-   "route": "return-left",
-   "labelSegment": 0
+   "fromSide": "bottom",
+   "toSide": "left",
+   "via": [
+    [
+     430,
+     538
+    ],
+    [
+     14,
+     538
+    ],
+    [
+     14,
+     119
+    ]
+   ]
   }
  ]
 }
