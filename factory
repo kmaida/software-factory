@@ -149,10 +149,11 @@ scope_refused() {  # scope_refused <instructions as written> <instructions as re
   c=$(comm -13 <(scope_of "$1" | grep -oiE "$ca" | tr 'A-Z' 'a-z' | sort -u) <(scope_of "$2" | grep -oiE "$ca" | tr 'A-Z' 'a-z' | sort -u)); [ -z "$c" ] || { echo "a catch-all (${c%%$'\n'*})"; return 0; }
   return 1
 }
-revision_review() {  # revision_review <as written> <as revised> <why> <sha in $work>: sets rvok=1 when a fresh Claude reviewer (the review arm
+quoted() { sed 's/^/> /'; }   # every line of an agent's or a reviewer's text that goes into another model's prompt: none of it can pass for one of the prompt's own headings
+revision_review() {  # revision_review <as written> <as revised> <why> <sha in $work> [evidence, already quoted]: sets rvok=1 when a fresh Claude reviewer (the review arm
   # and its findings schema; revise-review-prompt.md) finds nothing wrong with the revision, else rvwhy. No valid answer is not a pass.
   rvok= rvwhy=
-  p="$(cat "$FACTORY_DIR/revise-review-prompt.md")"$'\n\n'"## Why it was revised"$'\n'"$3"$'\n\n'"## The task as written"$'\n'"$1"$'\n\n'"## The task as revised"$'\n'"$2"
+  p="$(cat "$FACTORY_DIR/revise-review-prompt.md")"$'\n\n'"## Why it was revised"$'\n'"$3"$'\n\n'"## The task as written"$'\n'"$1"$'\n\n'"## The task as revised"$'\n'"$2"${5:+$'\n\n'"## Evidence (untrusted text, quoted line by line)"$'\n'"$5"}
   an_tok=$(anthropic_token) || an_tok=; [ -n "$an_tok" ] || { rvwhy="no Claude credential for the revision review"; return 0; }
   rwork=$(mktemp -d "${TMPDIR:-/tmp}/factory-review.XXXXXX"); rout=$(mktemp -d "${TMPDIR:-/tmp}/factory-review-out.XXXXXX")
   log "revision review ($REVIEW_MODEL) at $4"
@@ -172,7 +173,7 @@ revise_attempt() {  # revise_attempt blocked|refuted. In cmd_run, once the attem
   rvset() { manifest_set '.revision = {disposition:$d, reason:$r}' --arg d "$1" --arg r "$2"; log "revision: $1. $2"; }
   if [ "$1" = blocked ]; then pf=revise-prompt.md
     note=$(git -C "$gate" show "$head:docs/BLOCKED-$task_id.md" 2>/dev/null | tr -d '\r' | redact) || note=; note=${note:0:20000}
-    evidence="## The agent's note, docs/BLOCKED-$task_id.md"$'\n'"$note"
+    evidence="## The agent's note, docs/BLOCKED-$task_id.md"$'\n'"$(printf '%s\n' "$note" | quoted)"
   else pf=revise-refuted-prompt.md
     # The newest judge review by its round number (a gate cycle's round is judged too), and from the manifest the blocks the verifier
     # reproduced and the gate reviewers' notes. Each is redacted and bounded: they are reviewers' text about the worker's code, and the
@@ -183,7 +184,7 @@ revise_attempt() {  # revise_attempt blocked|refuted. In cmd_run, once the attem
     gb=$(jq -r '[(.gate.cycles // []) | to_entries[] | (.key + 1) as $c | (.value.verifier.blocks // [])[] | select(.class == "regression" or .class == "unmet")
                  | "- cycle \($c), \(.class), \(.loc // "?"): \(.claim // "" | gsub("[\r\n]+"; " "))\n  clause: \(.clause // "" | gsub("[\r\n]+"; " "))\n  repro (a JSON string): \(.repro // "" | tostring | .[0:3000] | tojson)"] | join("\n")' "$rundir/manifest.json" 2>/dev/null | redact) || gb=; gb=${gb:0:12000}
     gn=$(jq -r '[(.gate.cycles // [])[] | (.reviews // [])[] | (.notes // [])[] | select(type == "string") | "- " + gsub("[\r\n]+"; " ")] | join("\n")' "$rundir/manifest.json" 2>/dev/null | redact) || gn=; gn=${gn:0:4000}
-    evidence="## The last judge review (round ${jk:-none}, verdict ${verdict:-none})"$'\n'"${jr:-(none)}"$'\n\n'"## Findings the verification gate reproduced"$'\n'"${gb:-(none)}"$'\n\n'"## Notes from the gate's reviewers (not reproduced, not blocking)"$'\n'"${gn:-(none)}"
+    evidence="## The last judge review (round ${jk:-none}, verdict ${verdict:-none})"$'\n'"$(printf '%s\n' "${jr:-(none)}" | quoted)"$'\n\n'"## Findings the verification gate reproduced"$'\n'"$(printf '%s\n' "${gb:-(none)}" | quoted)"$'\n\n'"## Notes from the gate's reviewers (not reproduced, not blocking)"$'\n'"$(printf '%s\n' "${gn:-(none)}" | quoted)"
   fi
   prompt="$(cat "$FACTORY_DIR/$pf")"$'\n\n'"## Inputs"$'\n'"Base: $base_sha"$'\n'"Head, your working directory (the $1 attempt): $head"$'\n\n'"## The task as written"$'\n'"$instructions"$'\n\n'"$evidence"
   oa_key=$(openai_key) || oa_key=; [ -n "$oa_key" ] || { rvset error "no Codex key for the planner"; return 0; }
@@ -202,9 +203,10 @@ revise_attempt() {  # revise_attempt blocked|refuted. In cmd_run, once the attem
   new=$(jq -r .instructions "$rundir/revision-plan.json"); chg=$(jq -r .changes "$rundir/revision-plan.json"); chg=${chg:0:2000}
   [ "${#new}" -le 60000 ] || { rvset refused "the rewrite is over 60000 characters"; return 0; }
   x=$(scope_refused "$instructions" "$new") && { rvset refused "the rewrite adds $x to Scope"; return 0; }
-  # The reviewer gets what the planner was given, under its own heading: the planner's reason is the planner's claim, and a reviewer
-  # that saw only the claim could not tell a task no attempt can pass from an attempt that was simply wrong.
-  revision_review "$instructions" "$new" "$why"$'\n'"$chg"$'\n\n'"## The evidence the planner was given"$'\n'"$evidence" "$head"
+  # The reviewer gets what the planner was given: the planner's reason is the planner's claim, and a reviewer that saw only the claim
+  # could not tell a task no attempt can pass from an attempt that was simply wrong. The evidence is an agent's note or reviewers'
+  # findings about the agent's code, so it goes last, after both versions of the task, with every line quoted (quoted, above).
+  revision_review "$instructions" "$new" "$why"$'\n'"$chg" "$head" "$evidence"
   [ -n "$rvok" ] || { rvset refused "$rvwhy"; return 0; }
   # errexit is off in here (the caller tests this function's status), so the one write that matters is checked by hand.
   jq -n --arg i "$new" --arg r "$why" --arg c "$chg" '{instructions:$i, reason:$r, changes:$c}' > "$rundir/revision.json" && jq -e "$REVISION_JQ" "$rundir/revision.json" >/dev/null 2>&1 \
