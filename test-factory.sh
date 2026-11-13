@@ -135,8 +135,10 @@ case "$mode" in
            BIG)    { head -c 199982 /dev/zero | tr '\0' x; printf 'VERDICT: VERIFIED\n\nVERDICT: REFUTED\n'; } > "$out/verdict.md"; exit 0;;   # byte 200000 ends the first verdict
          esac
          printf 'finding %d: fix it (file.js:1)\nsaw key ghs_%s and mine b64 %s\nVERDICT: %s\n\n' "$n" "$(printf 'y%.0s' $(seq 36))" "$(printf '%s' "$secret" | base64)" "$v" > "$out/verdict.md";;   # a token by shape, and the judge's own key encoded
-  review) case "${args[$((${#args[@]}-1))]}" in "You are a reviewer in an autonomous software factory, with one job: decide whether a rewritten task"*"## Why it was revised"*"## The task as written"*"## The task as revised"*)   # the revision review (revise-review-prompt.md). STUB_REVREVIEW: ok (default), block, crash
-           case "${args[$((${#args[@]}-1))]}" in *"## The task as revised"*"## Evidence (untrusted text, quoted line by line)"$'\n'"## The last judge review (round 3, verdict REFUTED)"$'\n'"> finding 3: fix it"*|*"## The task as revised"*"## Evidence (untrusted text, quoted line by line)"$'\n'"## The agent's note, docs/BLOCKED-$TASK_ID.md"$'\n'"> "*'no "url" column on sandboxes'*) echo "stub: the reviewer was given the planner's evidence";; esac   # last in the prompt, every line of it quoted
+  review) sm=$(printf '%s\n' "${args[$((${#args[@]}-1))]}" | sed -n 's/^Section marker for this review: \([0-9a-f]\{16\}\)$/\1/p')   # stated once, before the first section; every heading the host writes carries it
+         case "${args[$((${#args[@]}-1))]}" in "You are a reviewer in an autonomous software factory, with one job: decide whether a rewritten task"*$'\n'"## [$sm] Why it was revised (the rewriter's claim, quoted line by line)"$'\n'"> "*$'\n'"## [$sm] The task as written"$'\n'*$'\n'"## [$sm] The task as revised"$'\n'*)   # the revision review (revise-review-prompt.md). STUB_REVREVIEW: ok (default), block, crash
+           case "${args[$((${#args[@]}-1))]}" in *$'\n'"> Done when needs x.js; Scope lists s."$'\n'"> Scope: s -> Scope: s, x.js"$'\n\n'"## [$sm] The task as written"$'\n'*) echo "stub: the reviewer's reason is quoted, the changes too";; esac   # the planner's own words: no line of them can pass for a heading
+           case "${args[$((${#args[@]}-1))]}" in *"## [$sm] The task as revised"*$'\n'"## [$sm] Evidence (untrusted text, quoted line by line)"$'\n'"## The last judge review (round 3, verdict REFUTED)"$'\n'"> finding 3: fix it"*|*"## [$sm] The task as revised"*$'\n'"## [$sm] Evidence (untrusted text, quoted line by line)"$'\n'"## The agent's note, docs/BLOCKED-$TASK_ID.md"$'\n'"> "*'no "url" column on sandboxes'*) echo "stub: the reviewer was given the planner's evidence";; esac   # last in the prompt, every line of it quoted
            echo "stub revision review"; case "${STUB_REVREVIEW:-ok}" in crash) exit 1;; block) echo '{"blocks":[{"loc":"Done when","claim":"the rewrite drops the test for y","clause":"tests pass","repro":"true"}],"notes":[]}' > "$out/review.json";; *) echo '{"blocks":[],"notes":["fine"]}' > "$out/review.json";; esac; exit 0;; esac
          n=$(cat "$STUB_STATE.r" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_STATE.r"; v=$(echo "${STUB_REVIEW:-none}" | cut -d, -f$n)
          [ "$HEAD_SHA" = "$(git -C "$src" rev-parse "refs/heads/factory/$TASK_ID")" ] || { echo "stub: review HEAD_SHA mismatch" >&2; exit 9; }
@@ -168,6 +170,13 @@ cat > "$t/bin/jq" <<J
 [ -n "\${STUB_JQ_FAIL:-}" ] && [[ "\$*" == *"--arg m \$STUB_JQ_FAIL"* ]] && exit 7
 exec "$realjq" "\$@"
 J
+realopenssl=$(type -P openssl)
+cat > "$t/bin/openssl" <<O
+#!/bin/bash
+# Stub: the real openssl, except STUB_NO_RAND=1 fails "openssl rand" (the revision review's section marker).
+[ "\${1:-}" = rand ] && [ -n "\${STUB_NO_RAND:-}" ] && exit 1
+exec "$realopenssl" "\$@"
+O
 chmod +x "$t/bin/"*
 run() {  # run <task_id> <verdicts> -> prints exit status; RUN_REPO overrides the local bare repo (a GitHub owner/name goes through the App path); RUN_INSTR the instructions (JSON-escaped)
   echo "{\"repo\":\"${RUN_REPO:-$t/remote.git}\",\"base_branch\":\"${RUN_BASE:-main}\",\"task_id\":\"$1\",\"instructions\":\"${RUN_INSTR:-do the thing}\"}" > "$t/$1.json"
@@ -569,14 +578,14 @@ check "$(cat "$t/rv/revised/010-rv-a-r1.reason")" 'Done when needs x.js; Scope l
 Scope: s -> Scope: s, x.js' "revision: the reason and the changes, for the PR"
 check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify")" '010-rv-a exited 10 (blocked, revised as 010-rv-a-r1): no \"url\" column on sandboxes
 done: 3 run, 0 PR(s), 0 failed, 1 blocked. All tasks ran.' "revision: the phone says it was revised"; rm -f "$t/notify"
-check "$(grep -c 'stub judge secret=' "$m/log.jsonl") $(grep -c 'stub revision review' "$m/log.jsonl") $(grep -c "stub: the reviewer was given the planner's evidence" "$m/log.jsonl")" "1 1 1" "revision: one planner session and one review, given the agent's note, in the blocked run"
+check "$(grep -c 'stub judge secret=' "$m/log.jsonl") $(grep -c 'stub revision review' "$m/log.jsonl") $(grep -c "stub: the reviewer was given the planner's evidence" "$m/log.jsonl") $(grep -c "stub: the reviewer's reason is quoted, the changes too" "$m/log.jsonl")" "1 1 1 1" "revision: one planner session and one review, given the agent's note under a marked heading and the planner's reason quoted, in the blocked run"
 # No revision, and the manifest says why: the planner says the wording is not the cause; the reviewer refuses the rewrite; the rewrite adds
 # CI to Scope (refused by the host before any review); the planner crashes; the planner answers nonsense. The task stays blocked, nothing is queued.
 norev() {  # norev <name> <disposition: reason> <what>, after a blocked batch of 010-<name>-a
   m=$(ls -d "$runs"/*-"010-$1-a" | tail -1)
   check "$rc / $(moved "$1") / $(jq -r '.revision | .disposition + ": " + .reason' "$m/manifest.json")" "10 / failed  / $2" "no revision: $3"
 }
-for c in rn ro rc rl rg rx ry re rh rj rb1 rb2 rb3 rb4 rb5 rb6; do mkdir -p "$t/$c"; task "$t/remote.git" main "010-$c-a" "$body" "$t/$c"; done
+for c in rn ro rc rl rg rx ry re rh rm rj rb1 rb2 rb3 rb4 rb5 rb6; do mkdir -p "$t/$c"; task "$t/remote.git" main "010-$c-a" "$body" "$t/$c"; done
 rc=$(FACTORY_REVISE=1 STUB_REVISE=other STUB_WORK_BLOCKED=010-rn-a batch "$t/rn" VERIFIED --continue); norev rn "none: not the task's wording: the agent could have added the column inside Scope." "the planner blames the agent"
 rc=$(FACTORY_REVISE=1 STUB_REVREVIEW=block STUB_WORK_BLOCKED=010-ro-a batch "$t/ro" VERIFIED --continue); norev ro "refused: the reviewer refused it: the rewrite drops the test for y" "the reviewer refuses"
 rc=$(FACTORY_REVISE=1 STUB_REVISE=ci STUB_WORK_BLOCKED=010-rc-a batch "$t/rc" VERIFIED --continue); norev rc "refused: the rewrite adds .github/workflows/ci.yml to Scope" "a workflow added to Scope"
@@ -594,6 +603,8 @@ check "$rc $(moved rb4/done)" "0 010-rb4-a-r1.json " "revision: ordinary test, m
 rc=$(FACTORY_REVISE=1 STUB_REVISE=crash STUB_WORK_BLOCKED=010-rx-a batch "$t/rx" VERIFIED --continue); norev rx "error: the planner left no valid answer (container status 1)" "the planner crashed"
 rc=$(FACTORY_REVISE=1 STUB_REVISE=bad STUB_WORK_BLOCKED=010-ry-a batch "$t/ry" VERIFIED --continue); norev ry "error: the planner left no valid answer (container status 0)" "the planner's answer is not JSON"
 rc=$(FACTORY_REVISE=1 STUB_REVREVIEW=crash STUB_WORK_BLOCKED=010-rh-a batch "$t/rh" VERIFIED --continue); norev rh "refused: the revision review left no valid answer (container status 1)" "the reviewer crashed: no answer is not a pass"
+rc=$(FACTORY_REVISE=1 STUB_NO_RAND=1 STUB_WORK_BLOCKED=010-rm-a batch "$t/rm" VERIFIED --continue); norev rm "refused: no section marker for the revision review" "no random value for the headings: no review, so no rewrite"
+check "$(grep -c 'stub revision review' "$m/log.jsonl")" 0 "no revision: without a marker the reviewer is never asked"
 # A rewrite the reviewer accepted but lint refuses is not queued, leaves nothing in revised/, and is recorded as refused.
 rc=$(FACTORY_REVISE=1 STUB_REVISE=nolint STUB_WORK_BLOCKED=010-rj-a batch "$t/rj" VERIFIED --continue); m=$(ls -d "$runs"/*-010-rj-a | tail -1)
 check "$rc / $(moved rj) / $(ls "$t/rj/revised" | wc -l | tr -d ' ') / $(jq -r '.revision | .disposition + ": " + .reason' "$m/manifest.json" | cut -c1-87)" "10 / failed revised  / 0 / refused: the revised task fails lint: 010-rj-a-r1: instructions need the headings Goal," "no revision: the rewrite fails lint"
@@ -633,7 +644,7 @@ check "$(moved rq/done) / $(moved rq/failed) / $(moved rq/revised)" "010-rq-a-r1
 check "$(jq -r '"\(.exit_status) \(.outcome) \(.class) \(.judge.rounds) \(.judge.verdict) \(.pr_url) \(.revision.disposition) \(.revision.reason)"' "$m/manifest.json")" "5 refuted task 3 REFUTED null proposed Done when needs x.js; Scope lists s." "refuted revision: the refuted attempt's record stands, with the revision beside it"
 check "$(jq -r .instructions "$t/rq/done/"*-010-rq-a-r1.json | tail -1 | sed -E 's/run [0-9TZ]+-010-rq-a/run <id>/')" 'Revised by the factory from 010-rq-a (run <id>), which ended refuted: Done when needs x.js; Scope lists s. The pull request shows the task as first written.' "refuted revision: the host's paragraph says the attempt was refuted"
 cmp -s "$t/rq/revised/010-rq-a-r1.json" "$t/rq/failed/"*-010-rq-a.json || { echo "FAIL: refuted revision: revised/ does not hold the task as first written"; exit 1; }
-check "$(grep -c 'stub planner: refuted' "$m/log.jsonl") $(grep -c 'stub planner: saw the last judge review' "$m/log.jsonl") $(grep -c 'stub revision review' "$m/log.jsonl") $(grep -c "stub: the reviewer was given the planner's evidence" "$m/log.jsonl")" "1 1 1 1" "refuted revision: one planner session, given the last round's review, and one revision review, given the same review (not only the planner's reason)"
+check "$(grep -c 'stub planner: refuted' "$m/log.jsonl") $(grep -c 'stub planner: saw the last judge review' "$m/log.jsonl") $(grep -c 'stub revision review' "$m/log.jsonl") $(grep -c "stub: the reviewer was given the planner's evidence" "$m/log.jsonl") $(grep -c "stub: the reviewer's reason is quoted, the changes too" "$m/log.jsonl")" "1 1 1 1 1" "refuted revision: one planner session, given the last round's review, and one revision review, given the same review (not only the planner's reason)"
 check "$(sed -E 's/^batch-[0-9]+T[0-9]+Z: //' "$t/notify" | head -1)" '010-rq-a exited 5 (REFUTED, revised as 010-rq-a-r1)' "refuted revision: the phone says it was revised"; rm -f "$t/notify"
 # Refuted by the gate (no new commits in a cycle): the planner is given the block the verifier reproduced.
 mkdir -p "$t/rqg"; task "$t/remote.git" main 010-rqg-a "$body" "$t/rqg"

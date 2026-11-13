@@ -149,11 +149,16 @@ scope_refused() {  # scope_refused <instructions as written> <instructions as re
   c=$(comm -13 <(scope_of "$1" | grep -oiE "$ca" | tr 'A-Z' 'a-z' | sort -u) <(scope_of "$2" | grep -oiE "$ca" | tr 'A-Z' 'a-z' | sort -u)); [ -z "$c" ] || { echo "a catch-all (${c%%$'\n'*})"; return 0; }
   return 1
 }
-quoted() { sed 's/^/> /'; }   # every line of an agent's or a reviewer's text that goes into another model's prompt: none of it can pass for one of the prompt's own headings
+quoted() { sed 's/^/> /'; }   # every line of an agent's, a reviewer's or a planner's text that goes into another model's prompt: none of it can pass for one of the prompt's own headings
 revision_review() {  # revision_review <as written> <as revised> <why> <sha in $work> [evidence, already quoted]: sets rvok=1 when a fresh Claude reviewer (the review arm
   # and its findings schema; revise-review-prompt.md) finds nothing wrong with the revision, else rvwhy. No valid answer is not a pass.
+  # The reason and the task as revised are a model's text (the planner's, or deep lint's), and the reviewer must not take a line of them
+  # for a section of this prompt. The reason is quoted here, for every caller. The two versions of the task stay as they are, to be
+  # compared clause by clause, so every heading written here carries a value drawn for this call, after that text exists: the prompt
+  # states it once, before the first section, and a heading without it is part of the text above it. No value, no review.
   rvok= rvwhy=
-  p="$(cat "$FACTORY_DIR/revise-review-prompt.md")"$'\n\n'"## Why it was revised"$'\n'"$3"$'\n\n'"## The task as written"$'\n'"$1"$'\n\n'"## The task as revised"$'\n'"$2"${5:+$'\n\n'"## Evidence (untrusted text, quoted line by line)"$'\n'"$5"}
+  sm=$(openssl rand -hex 8 2>/dev/null) || sm=; [ "${#sm}" -eq 16 ] || { rvwhy="no section marker for the revision review"; return 0; }
+  p="$(cat "$FACTORY_DIR/revise-review-prompt.md")"$'\n\n'"Section marker for this review: $sm"$'\n\n'"## [$sm] Why it was revised (the rewriter's claim, quoted line by line)"$'\n'"$(printf '%s\n' "$3" | quoted)"$'\n\n'"## [$sm] The task as written"$'\n'"$1"$'\n\n'"## [$sm] The task as revised"$'\n'"$2"${5:+$'\n\n'"## [$sm] Evidence (untrusted text, quoted line by line)"$'\n'"$5"}
   an_tok=$(anthropic_token) || an_tok=; [ -n "$an_tok" ] || { rvwhy="no Claude credential for the revision review"; return 0; }
   rwork=$(mktemp -d "${TMPDIR:-/tmp}/factory-review.XXXXXX"); rout=$(mktemp -d "${TMPDIR:-/tmp}/factory-review-out.XXXXXX")
   log "revision review ($REVIEW_MODEL) at $4"
