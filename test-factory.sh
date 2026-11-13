@@ -159,6 +159,8 @@ case "$mode" in
          SRC=$src IN=$vin WORK=$work OUT=$out VERIFY_TIMEOUT_MS=4000 node "$vjs";;
   push) [ -n "${HEAD_SHA:-}" ] && [ -n "${REPO_URL:-}" ] || exit 9
         n=$(cat "$STUB_STATE.p" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$STUB_STATE.p"; [ "$n" != "${STUB_PUSH_FAIL_AT:-}" ] || exit 8   # STUB_PUSH_FAIL_AT=<n>: the n-th push fails
+        # While the file $STUB_PUSH_MISS holds a count above 0, a push takes one off it and fails as git does when GitHub does not know the token yet.
+        k=$(cat "${STUB_PUSH_MISS:-/dev/null}" 2>/dev/null) || k=; [ "${k:-0}" -gt 0 ] && { echo $((k-1)) > "$STUB_PUSH_MISS"; echo "remote: Repository not found." >&2; exit 128; }
         git -C "$src" push -q "$REPO_URL" "$HEAD_SHA:refs/heads/factory/$TASK_ID"   # a chained task clones this branch as its base
         [ "$TASK_ID" = "${STUB_HALT_AFTER:-}" ] && echo test-factory > "$STUB_HALT_FILE"; exit 0;;
 esac
@@ -250,6 +252,15 @@ check "$rc" 0 "tc1 one refused clone: the run passes"; check "$(grep -c 'clone f
 echo 9 > "$t/miss"; rc=$(STUB_CLONE_MISS="$t/miss" STUB_NOSLEEP=1 run tc2 "VERIFIED"); m=$(ls -d "$runs"/*-tc2 | tail -1)
 check "$rc" 1 "tc2 a clone refused every time exits 1"; check "$(grep -c 'trying again' "$t/tc2.out") $(cat "$t/miss") $(grep -c 'factory: clone failed: ' "$t/tc2.out")" "3 5 1" "tc2 four tries, then the die"
 check "$(jq -r '"\(.exit_status) \(.class) \(.pushed)"' "$m/manifest.json") $(grep -c 'stub ' "$m/log.jsonl")" "1 infra false 0" "tc2 manifest: infra, nothing pushed, no container ran"
+# The push token is as new as the clone's: a push that git ends with 128 is tried again after 2, 5 and 10 s ($t/state.p counts the push
+# containers). Refused every time, it ends as any failed push does: push_failed, infra, nothing on GitHub (17 s of real waits: the sleep
+# stub's switch would also fire the container watchdog). g16 checks that a push failing with another status is not tried again.
+echo 1 > "$t/miss"; rc=$(STUB_PUSH_MISS="$t/miss" run tp1 "VERIFIED"); m=$(ls -d "$runs"/*-tp1 | tail -1)
+check "$rc" 0 "tp1 one refused push: the run passes"; check "$(grep -c 'push of factory/tp1 failed (status 128); trying again in 2s' "$m/log.jsonl") $(cat "$t/state.p") $(cat "$t/miss")" "1 2 0" "tp1 one retry, in the log"
+check "$(jq -r '"\(.pushed) \(.push_status) \(.final_sha)"' "$m/manifest.json")" "true 0 $(git -C "$t/remote.git" rev-parse refs/heads/factory/tp1)" "tp1 the judged commit is on the remote"
+echo 9 > "$t/miss"; rc=$(STUB_PUSH_MISS="$t/miss" run tp2 "VERIFIED"); m=$(ls -d "$runs"/*-tp2 | tail -1)
+check "$rc" 128 "tp2 a push refused every time exits with git's status"; check "$(grep -c 'trying again in' "$m/log.jsonl") $(cat "$t/state.p") $(cat "$t/miss")" "3 4 5" "tp2 four tries"
+check "$(jq -r '"\(.outcome) \(.push_attempted) \(.pushed) \(.final_sha) \(.push_status) \(.class) \(.pr_url)"' "$m/manifest.json") $(git -C "$t/remote.git" rev-parse -q --verify refs/heads/factory/tp2 || echo none)" "push_failed true false null 128 infra null none" "tp2 manifest: push_failed, infra, nothing on GitHub"
 rc=$(run t2 "REFUTED,REFUTED,REFUTED"); m=$(ls -d "$runs"/*-t2 | tail -1)
 check "$rc" 5 "t2 exit"; check "$(jq -r .judge.rounds "$m/manifest.json")" 3 "t2 rounds"; check "$(jq -r .pr_url "$m/manifest.json")" null "t2 no PR"
 check "$(jq -r '"\(.outcome) \(.class) \(.pushed)"' "$m/manifest.json")" "refuted task true" "t2 a refusal is the task's own failure, branch pushed"
@@ -802,7 +813,7 @@ rc=$(STUB_REVIEW=regress STUB_PUSH_FAIL_AT=2 run g15 "VERIFIED,VERIFIED"); m=$(l
 check "$rc" 8 "g15 exit (the second push failed)"; check "$(g '"\(.outcome) \(.pushed) \(.push_status) \(.class) \(.pr_url) \(.gate.cycles|length)"')" "push_failed true 8 infra null 1" "g15 the first push stands"
 check "$(g .final_sha)" "$(git -C "$t/remote.git" rev-parse refs/heads/factory/g15)" "g15 final_sha is the commit on GitHub (cycle 1's), not the unpushed fix"
 rc=$(STUB_PUSH_FAIL_AT=1 run g16 VERIFIED); m=$(ls -d "$runs"/*-g16 | tail -1)
-check "$rc" 8 "g16 exit (first push failed)"; check "$(g '"\(.outcome) \(.pushed) \(.final_sha) \(.push_status) \(.class)"')" "push_failed false null 8 infra" "g16 nothing on GitHub"
+check "$rc" 8 "g16 exit (first push failed)"; check "$(g '"\(.outcome) \(.pushed) \(.final_sha) \(.push_status) \(.class)"')" "push_failed false null 8 infra" "g16 nothing on GitHub"; check "$(cat "$t/state.p")" 1 "g16 a push that failed with another status is not tried again"
 rc=$(STUB_HALT_IN_REVIEW=1 STUB_HALT_FILE="$here/HALT" run g17 VERIFIED); m=$(ls -d "$runs"/*-g17 | tail -1); rm -f "$here/HALT"
 check "$rc" 12 "g17 exit (stopped during the review)"; check "$(g '"\(.outcome) \(.class) \(.pushed) \(.gate.cycles[0].halted) \(.gate.cycles[0].reviews[0].valid) \(.gate.cycles[0].verifier) \(.reason)"')" "gate_pending infra true true true null stopped before the gate's verify step" "g17 the review's record and the push are kept; the verifier never ran"
 check "$(g .final_sha)" "$(git -C "$t/remote.git" rev-parse refs/heads/factory/g17)" "g17 final_sha persisted before the stop"
