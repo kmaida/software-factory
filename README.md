@@ -71,7 +71,7 @@ These two files are the only credentials stored on the machine. The factory gets
 | `FACTORY_NOTIFY_URL` | No | Where `batch` posts notifications, for example `https://ntfy.sh/<topic>`. The topic name acts as the secret. |
 | `FACTORY_QUEUE` | No | A queue directory other than `queue/`. |
 | `FACTORY_GATE` | No | `0` skips the verification gate for a night (the manifest says `gate.result: skipped`); the escape hatch for the gate's first real nights. |
-| `FACTORY_REVISE` | No | `0` turns revisions off for a batch: a blocked task stays blocked and deep lint holds instead of rewriting (see "Revisions"). |
+| `FACTORY_REVISE` | No | `0` turns revisions off for a batch: a blocked or refuted task stays as it ended and deep lint holds instead of rewriting (see "Revisions"). |
 | `FACTORY_MAX_ROUNDS` | No | Worker and judge rounds per task. Defaults to 5. |
 | `FACTORY_ALLOW_DIRTY` | No | Set to `1` to run from a checkout with uncommitted changes. For development only; the manifest marks the commit `-dirty`. |
 
@@ -191,16 +191,17 @@ To release a held task, edit `queue/held/<id>.json` or read `<id>.proposed.json`
 
 ### Revisions
 
-A task whose own wording stops it used to cost a night: the agent blocked, or deep lint held the task, and everything behind it waited for you. With revisions on (the default while the factory only opens PRs), the factory rewrites such a task once and runs the rewrite the same night:
+A task whose own wording stops it used to cost a night: the agent blocked, the reviewers refuted every attempt, or deep lint held the task, and everything behind it waited for you. With revisions on (the default while the factory only opens PRs), the factory rewrites such a task once and runs the rewrite the same night:
 
 - **After a block.** When a run ends blocked, a fresh Codex planner (`revise-prompt.md`) reads the attempt, the task and the agent's note. If it confirms that no agent could complete the task as written, it rewrites the instructions with the smallest change that removes the conflict. The batch queues the rewrite as `<id>-r1` and runs it next, with or without `--continue`, so the tasks that depend on it run after it. A `factory run` outside a batch never asks the planner.
+- **After a refusal.** When a run ends refuted (by the judge's last round or by the verification gate), a fresh Codex planner (`revise-refuted-prompt.md`) reads the attempt, the task, the last judge review and the findings the gate reproduced. Most refuted attempts are the agent's fault, and those stay refuted. The planner rewrites the task only when a careful fresh agent would be refuted again for the same reason: two clauses in conflict, or findings about behaviour the task never decides under a "Done when" clause with no last case ("the tests prove every rule and case"). The rewrite bounds that clause to the rules and cases the task already lists, and decides an open case only where the task's Goal and other rules already imply the answer. It is queued and run as `<id>-r1`, like a rewrite after a block.
 - **Before a run.** When deep lint would hold a task for a contradiction or an ambiguity and proposes a rewrite, the rewrite replaces the instructions in place, under the same ID. One deep lint revises at most three tasks this way and holds the rest.
 
-Every rewrite passes three checks before it is used. A fresh Claude reviewer (`revise-review-prompt.md`) compares it with the task as written and must find nothing lost and nothing widened. The host refuses a rewrite that adds a workflow, a lockfile, test helpers or a catch-all to Scope. And the queue must still pass `lint`. A rewrite that fails a check is dropped and the task stays blocked or held, as before. The manifest says why: `revision` in the blocked run's, `rewrite_not_used` on the hold in deep lint's. The Scope check is a backstop for literal paths and globs; the reviewer is the check on meaning.
+Every rewrite passes three checks before it is used. A fresh Claude reviewer (`revise-review-prompt.md`) reads what the planner was given (the note, or the reviews that refuted the attempt), compares the rewrite with the task as written and must find nothing lost and nothing widened. The host refuses a rewrite that adds a workflow, a lockfile, test helpers or a catch-all to Scope. And the queue must still pass `lint`. A rewrite that fails a check is dropped and the task stays blocked, refuted or held, as before. The manifest says why: `revision` in the run's, `rewrite_not_used` on the hold in deep lint's. The Scope check is a backstop for literal paths and globs; the reviewer is the check on meaning.
 
-You stay the authority. The PR of a revised task opens with "Task revised by the factory", the reason (and, after a block, the clauses that changed) and the task as you wrote it, and `queue/revised/<id>.json` keeps that original. Close the PR if you disagree with the revision. The notification says `revised as <id>-r1`, or `<id> revised by deep lint`.
+You stay the authority. The PR of a revised task opens with "Task revised by the factory", the reason (and, after a block or a refusal, the clauses that changed) and the task as you wrote it, and `queue/revised/<id>.json` keeps that original. Close the PR if you disagree with the revision. The notification says `revised as <id>-r1`, or `<id> revised by deep lint`.
 
-A task is revised once. A task that was already revised, and any `-r<N>` task that blocks, wait for you. Revisions are off in merge mode, where nothing reads a PR before it merges into `next`.
+A task is revised once. A task that was already revised, and any `-r<N>` task that blocks or is refuted, wait for you. Revisions are off in merge mode, where nothing reads a PR before it merges into `next`.
 
 `./deep-lint-replay.sh <keycard-workshop-platform checkout>` measures the prompt. It replays the 16 tasks of 2026-11-03 against `main` as it was that night and scores the answer: each of the 11 that blocked must be held or made to wait on something that wasn't there, and none of the 5 that passed may be held. Run it when you change `deep-lint-prompt.md` or `JUDGE_MODEL`. It calls Codex with your own login, so it isn't part of `test-factory.sh`.
 
@@ -253,7 +254,7 @@ Each run leaves its evidence in `runs/<run_id>/`, where `run_id` is `<UTC timest
 | `0` | The PR is open. |
 | `3` | The worker made no changes. Nothing was pushed. |
 | `4` | The branch was pushed, but opening the PR failed (`outcome: pr_failed`). `pr_error` in the manifest has the HTTP status and body. |
-| `5` | The judge refuted the final round, or the verification gate refuted the branch (`refuted_by: gate` in the manifest: no new commits in a cycle, the same reproduced command twice, REFUTED in a cycle, or four cycles). The branch was pushed with no PR. |
+| `5` | The judge refuted the final round, or the verification gate refuted the branch (`refuted_by: gate` in the manifest: no new commits in a cycle, the same reproduced command twice, REFUTED in a cycle, or four cycles). The branch was pushed with no PR. In a batch with revisions on, the task may run again the same night as `<id>-r1` when its own wording was the cause (see "Revisions"). |
 | `6` | The judge gave no verdict. The branch was pushed with no PR. |
 | `10` | Blocked: the task's `docs/BLOCKED-<task_id>.md` note is at the pushed head. `reason` in the manifest has its first line; `judge.rounds` is 0 when the note came in round 1. No PR. |
 | `11` | The branch conflicts with the current target branch. No PR. |
@@ -313,7 +314,7 @@ Known limits:
 | `worker-prompt.md` | The house rules every worker round starts with. |
 | `judge-prompt.md` | The judge's instructions. They live here, not in the target repo, so the worker can't change them. |
 | `deep-lint-prompt.md` | Deep lint's instructions: prerequisites, contradictions, ambiguity, human inputs, and the JSON answer. |
-| `revise-prompt.md`, `revise-review-prompt.md` | Revisions: the planner that rewrites a blocked task, and the reviewer that must accept every rewrite. |
+| `revise-prompt.md`, `revise-refuted-prompt.md`, `revise-review-prompt.md` | Revisions: the planner that rewrites a blocked task, the planner that rewrites a refuted one, and the reviewer that must accept every rewrite. |
 | `deep-lint-replay.sh` | Scores `deep-lint-prompt.md` against the 2026-11-03 night's 16 tasks with a real Codex call. |
 | `test-factory.sh` | Tests the orchestrator against stubbed `docker` and `curl`. |
 | `docs/flow.svg`, `docs/flow.json` | The run diagram and its [archify](https://github.com/tt-a1i/archify) source. |
