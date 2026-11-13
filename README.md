@@ -1,12 +1,12 @@
 # software-factory
 
-The software factory turns a task file into a reviewed pull request. You write a task, and the factory runs Claude Code in a locked-down container against a fresh clone of the target repo. Codex reviews the result in a second container and tries to refute it. If the work survives review, the factory opens a pull request for a human to approve. The factory never merges.
+The software factory turns a task file into a reviewed pull request. You write a task, and the factory runs Claude Code in a locked-down container against a fresh clone of the target repo. Codex reviews the result in a second container and tries to refute it. A fresh Claude Code session then tries to break what survived, and a container with no model and no credential has to reproduce each problem it reports before that problem counts. If the work survives both, the factory opens a pull request for a human to approve. The factory never merges into `main`.
 
 It is a Level 2 (workflow-orchestrated) factory in the terms of the [Agent Baseline Secure Software Factory reference architecture](https://agentbaseline.org/reference-architecture). [Security model](#security-model) lists where it meets that architecture and where it doesn't yet.
 
 ## How it works
 
-![The factory's run loop: a task file goes to the orchestrator, which gets credentials from Keycard and runs the worker, judge and push containers, then opens a pull request for human review](docs/flow.svg)
+![The factory's run loop: a task file goes to the orchestrator, which gets credentials from Keycard and, once per batch, runs deep lint. Each task then goes through the worker, judge and push containers and the verification gate, and ends in a pull request for human review. In a batch, a run that ends with no pull request sends an alert when notifications are configured, and a task stopped by its own wording can be rewritten once](docs/flow.svg)
 
 One run takes one task through these steps:
 
@@ -29,7 +29,9 @@ One run takes one task through these steps:
 | `REFUTED` | A gating check (one the task names, or `npm test`) fails, the change is wrong or incomplete, the scope is wrong, or a test was weakened. | Another round if any remain, then the branch is pushed with no PR (exit 5). |
 | none | The judge failed or didn't end with exactly one verdict line. | Branch pushed, no PR (exit 6). |
 
-Each container gets exactly one secret, over stdin, written to a tmpfs: the worker and the gate's reviewer get an Anthropic token, the judge gets the Codex key, the push container gets the GitHub token, and the verifier gets nothing. The worker and judge never hold a GitHub token. The Anthropic and GitHub tokens expire within an hour. The Codex key lasts until you rotate it.
+Each container gets at most one secret, over stdin, written to a tmpfs: the worker and the gate's reviewer get an Anthropic token, the judge gets the Codex key, the push container gets the GitHub token, and the verifier gets nothing. The worker and judge never hold a GitHub token. The Anthropic and GitHub tokens expire within an hour. The Codex key lasts until you rotate it.
+
+A batch adds two steps around these runs. Before the first task, deep lint reads the whole queue against the base branch in one Codex session, and the verifier runs the base's own `lint`, `typecheck` and `test` scripts; a base that fails them stops the batch before any task runs (see [Deep lint](#deep-lint)). After a task ends blocked or refuted because of its own wording, the factory can rewrite the task once and run the rewrite next, when revisions are on and a second model accepts the rewrite (see [Revisions](#revisions)).
 
 ## Requirements
 
@@ -71,6 +73,8 @@ These two files are the only credentials stored on the machine. The factory gets
 | `FACTORY_NOTIFY_URL` | No | Where `batch` posts notifications, for example `https://ntfy.sh/<topic>`. The topic name acts as the secret. |
 | `FACTORY_QUEUE` | No | A queue directory other than `queue/`. |
 | `FACTORY_GATE` | No | `0` skips the verification gate for a night (the manifest says `gate.result: skipped`); the escape hatch for the gate's first real nights. |
+| `FACTORY_DEEP_LINT` | No | `0` skips deep lint for one batch, and the base health check with it. The queue still has to pass `lint`. |
+| `FACTORY_HEALTH` | No | `0` skips only the base health check: that the base branch's own `lint`, `typecheck` and `test` scripts pass before any task runs. |
 | `FACTORY_REVISE` | No | `0` turns revisions off for a batch: a blocked or refuted task stays as it ended and deep lint holds instead of rewriting (see "Revisions"). |
 | `FACTORY_MAX_ROUNDS` | No | Worker and judge rounds per task. Defaults to 5. |
 | `FACTORY_ALLOW_DIRTY` | No | Set to `1` to run from a checkout with uncommitted changes. For development only; the manifest marks the commit `-dirty`. |
@@ -93,7 +97,7 @@ Do this once for each repo the factory works in. [`keycard-sandbox/keycard-works
 
 ## Writing tasks
 
-A task is one JSON file in `queue/` in the factory checkout, with exactly four non-empty string fields:
+A task is one JSON file in `queue/` in the factory checkout, with four required non-empty string fields (a fifth, `depends_on`, is optional and described below):
 
 ```json
 {
@@ -164,7 +168,7 @@ On the mini, after any factory merge, in this order:
 2. Rebuild the image if the Dockerfile changed (the `IMAGE_ID` header in `factory` says how).
 3. `./canary.sh kmaida/test-repo` and wait for exit 0. The canary repo needs a root `package.json` whose `npm test` passes, and its lockfile; without them the pass and manifest canaries end blocked.
 4. `./factory batch queue --continue > runs/night.out 2>&1 &`
-5. `caffeinate -i -w $! &`
+5. `caffeinate -i -w $! &`. This holds the mini awake only while the batch runs; [`docs/mini-setup.md`](docs/mini-setup.md) covers keeping it awake between batches.
 
 Never skip step 3. The canary's task ids are as long as real ones; a hand-written smoke task with a short id proves only the short path (2026-11-02: the proxy's DNS name broke above 63 bytes, every real task failed, the smoke had passed).
 
@@ -248,6 +252,8 @@ Each run leaves its evidence in `runs/<run_id>/`, where `run_id` is `<UTC timest
 | `manifest.json` | The task hash, repo, base commit, image ID and whether it is the pinned one, factory commit, Keycard zone, model, judge model and budget, GitHub App installation, commit identity, each worker round's status and reported cost, judge rounds and verdict, final commit, PR URL (or `pr_error`), exit status, the npm policy supplied to the containers, and, when a gate stopped the PR or the run stopped itself, `outcome` (`blocked`, `dependency_change`, `conflict`, `gate_error`, `credential_in_input` or `evidence_error`) and its `reason`. |
 | `log.jsonl` | Every line the containers wrote, with each container's credential redacted, plus the orchestrator's own events. |
 | `judge-<round>.md` | The judge's full review for each round. |
+| `gate-<cycle>-breakit.json`, `gate-<cycle>-verify.json` | The verification gate's record for each cycle, numbered from 0: the reviewer's findings, and what the verifier got when it ran each one at the head and at the base. |
+| `revision-plan.json`, `revision.json` | In a batch with revisions on: the planner's answer for a blocked or refuted run, and the rewrite the batch queues as `<id>-r1` when it passed every check. |
 
 | Exit | Meaning |
 |---|---|
@@ -261,6 +267,7 @@ Each run leaves its evidence in `runs/<run_id>/`, where `run_id` is `<UTC timest
 | `12` | A gate couldn't run (the credential scan of the base tree, or the fetch, diff or merge-check of the branch; the end of `log.jsonl` has git's output), the verification gate left no valid record (`outcome: gate_pending`: a review or verifier that crashed, invalid findings, a failed install; the branch is judged and pushed, only the gate is missing), or the log pipeline failed during a step (`outcome: evidence_error`): the run stopped there. No PR. If that step was the push, the branch may already be on GitHub and `final_sha` says which commit. |
 | `13` | Refused to start: the task text or the base tree contains something shaped like a credential. `reason` names the file (or `instructions`), never the content. No container ran and no agent credential was issued; the task-text check runs before anything is minted, the tree check after the clone, so by then the one-hour clone token exists. |
 | `14` | The branch changes a dependency manifest (`package.json`, a lockfile) and the task's Scope doesn't name `package.json`. The branch was pushed with no PR; `reason` lists the files. |
+| `15` | From `lint --deep` and `batch`, not from a run: `npm ci` on the base branch fails, or its own `lint`, `typecheck` or `test` script does, so no task ran (see [Deep lint](#deep-lint)). |
 | Other | The orchestrator or a worker round failed. Check the end of `log.jsonl` and the factory's stderr. |
 
 Every non-zero exit also carries `class` (`task` or `infra`) and `pushed` (`true`, `false`, or `null` when the push step started and its result is unknown; `final_sha` is set only on a successful push, and a failed one records `outcome: push_failed`). `batch` reads both: see [Batches](#batches).
@@ -273,7 +280,7 @@ To retry a failed task, fix whatever blocked it, then requeue it and run `batch`
 ./factory requeue queue/failed/<file>.json
 ```
 
-`requeue` gives the task a new ID, `<task_id>-r<N>`, because its old `factory/<task_id>` branch still exists. It adds the blocked reason or the last judge review only when the archived file is from a run that has one; a skipped task gets none. It keeps `base_branch` as it was, so update any task that names the old ID. `batch` never requeues on its own, so a task that fails the same way twice doesn't run a third time.
+`requeue` gives the task a new ID, `<task_id>-r<N>`, because its old `factory/<task_id>` branch still exists. It adds the blocked reason or the last judge review only when the archived file is from a run that has one; a skipped task gets none. It keeps `base_branch` as it was, so update any task that names the old ID. Within a night, `batch` reruns a task on its own in two cases only, once each: the rewrite of a task its own wording stopped (`<id>-r1`, see [Revisions](#revisions)) and the retry after an infra failure (`<id>-i1`, see [Batches](#batches)). It never calls `requeue`, so a task that fails the same way twice doesn't run a third time.
 
 ## Security model
 
@@ -285,7 +292,7 @@ The table compares the factory to the controls in the reference architecture's a
 |---|---|---|---|
 | Sandbox | A fresh, hardened sandbox per task, unprivileged, writes confined to the workspace, resource limits, destroyed afterward | A fresh container per step: non-root, read-only root filesystem, all capabilities dropped, `no-new-privileges`, 4 GB memory, 2 CPUs, 512 processes, one-hour timeout, no Docker socket, only the clone mounted (the judge also gets its own scratch and output directories), removed on exit | Meets |
 | Sandbox | A microVM for untrusted code; process, file and network activity recorded outside the agent | Containers share the Docker Desktop VM; only the agent's own output stream and its outbound connections, by host, are recorded | Partial |
-| Network | Default-deny egress proxy that all traffic passes through | Each step runs on an internal Docker network with no route out. Its only exit is a proxy container started for that step with that step's hosts (worker: Anthropic and npm; judge: OpenAI and npm; push: GitHub); it allows `CONNECT` on 443 to those and refuses everything else, and every decision goes into the run's log. It filters by host, not by request, and the credential still travels inside the container | Partial |
+| Network | Default-deny egress proxy that all traffic passes through | Each step runs on an internal Docker network with no route out. Its only exit is a proxy container started for that step with that step's hosts (worker and the gate's reviewer: Anthropic and npm; judge: OpenAI and npm; verifier: npm; push: GitHub); it allows `CONNECT` on 443 to those and refuses everything else, and every decision goes into the run's log. It filters by host, not by request, and the credential still travels inside the container | Partial |
 | Identity and access | Credentials attached at the proxy, never inside the sandbox | Each container holds one short-lived credential | Gap |
 | Identity and access | Its own identity per agent, short-lived task-scoped credentials, independent approval, fail-closed | One shared Application identity, `urn:factory:mini`, not one per agent, and a run ID per run in the manifest; one-hour Anthropic and GitHub tokens, the GitHub tokens scoped to one repo, but a long-lived Codex key; ruleset requires a human approval the App can't give; the run refuses to start on any token or schema failure | Partial |
 | Identity and access | Revoke any grant at any time | `factory stop` kills the run and blocks dispatch; tokens aren't revoked, they expire within an hour | Partial |
@@ -295,7 +302,7 @@ The table compares the factory to the controls in the reference architecture's a
 | Inference | Model gateway, approved models, per-task spend limits | Claude Code and Codex still call their APIs directly, through the step's proxy. Each is pinned to one full model ID, the worker runs under a per-round spend cap (Claude Code's own estimate, so it can overshoot; a worker calling the API itself is outside it), and each worker round's reported cost is in the manifest and `report`. Codex has no cap; the consoles' hard spend limits are the backstop | Partial |
 | Execution | Start each agent only with granted access; stop on demand | Keycard policy grants each credential; `factory stop` | Meets |
 | Observability | Records linked by run ID, tamper-evident, outside the agent's reach; versioned factory configuration | Manifest, log and judge reviews keyed by run ID and written by the orchestrator, not the agent, owner-readable only; factory commit and image ID recorded; Keycard audits every grant; a run whose log pipeline fails stops there with `outcome: evidence_error` rather than continue unrecorded; the files aren't tamper-evident | Partial |
-| Validation | Verify every output before it advances | Independent judge on a fresh clone, plus required CI and a human review | Meets |
+| Validation | Verify every output before it advances | Independent judge on a fresh clone, then the verification gate (a second fresh session whose findings count only when a container with no model and no credential reproduces them), plus required CI and a human review | Meets |
 
 Known limits:
 
@@ -309,16 +316,23 @@ Known limits:
 | Path | Contents |
 |---|---|
 | `factory` | The orchestrator (bash 3.2, macOS). |
-| `Dockerfile` | The sandbox image and its entrypoint, with three modes: `work`, `judge` and `push`. |
+| `Dockerfile` | The sandbox image and its entrypoint, with five modes: `work`, `judge`, `push`, `review` and `verify`. |
 | `proxy.js` | The per-step egress proxy: `CONNECT` to that step's allowlisted hosts on 443, nothing else. Runs in the sandbox image. |
 | `worker-prompt.md` | The house rules every worker round starts with. |
 | `judge-prompt.md` | The judge's instructions. They live here, not in the target repo, so the worker can't change them. |
+| `review-prompt.md` | The verification gate's reviewer: the break-it lens, and the JSON findings it must write. |
+| `verify.js` | The verifier: runs each finding's command at the head and at the base, the two checks on changed test files, and the base health check. No model and no credential. |
 | `deep-lint-prompt.md` | Deep lint's instructions: prerequisites, contradictions, ambiguity, human inputs, and the JSON answer. |
 | `revise-prompt.md`, `revise-refuted-prompt.md`, `revise-review-prompt.md` | Revisions: the planner that rewrites a blocked task, the planner that rewrites a refuted one, and the reviewer that must accept every rewrite. |
 | `deep-lint-replay.sh` | Scores `deep-lint-prompt.md` against the 2026-11-03 night's 16 tasks with a real Codex call. |
 | `test-factory.sh` | Tests the orchestrator against stubbed `docker` and `curl`. |
+| `canary.sh` | The canary queue: real runs against a throwaway repo, with each run's manifest asserted. |
+| `se-sign.swift` | A Secure Enclave signer for Keycard client assertions. `factory` doesn't call it yet; factory.md has the notes. |
 | `docs/flow.svg`, `docs/flow.json` | The run diagram and its [archify](https://github.com/tt-a1i/archify) source. |
 | `docs/demo.md` | A short demo script. |
+| `docs/mini-setup.md` | Setting up the Mac mini: one account, FileVault, staying awake, remote access. |
 | `factory.md` | Design notes, decisions and history. |
 | `docs/hardening-plan.md` | The design note behind the PR gates, five rounds, chaining past failures and `requeue`. |
+| `docs/cascade-plan.md`, `docs/parity-plan.md` | Plans: verification, repair and flow so a night runs unattended, and closing gaps against the reference architecture. |
+| `REVIEW.md` | The review brief from the 2026-10-28 rewrite. Historical. |
 | `queue/`, `runs/` | Task files and run evidence. Host state, not committed. |
