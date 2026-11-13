@@ -79,6 +79,17 @@ NPM_BEFORE_DAYS=7   # npm policy on the fixed docker run line: no install script
 GIT_CRED='!f() { h=; while IFS= read -r l; do case "$l" in host=*) h=${l#host=};; esac; done; [ "$h" = github.com ] || exit 0; echo username=x-access-token; echo "password=$(cat <&3)"; }; f'
 
 die()   { echo "factory: $*" >&2; exit 1; }
+# A token GitHub issued a moment ago is sometimes refused by its git servers for a few seconds: "Repository not found", although the App
+# is installed on the repo (2026-11-13: the first clone of a canary failed, and the next run's clone passed 5 s later). So a failed clone
+# is tried again after 2, 5 and 10 s with the same token before it counts. git prints its own error on every try.
+clone_repo() {  # clone_repo <dest> <token>: clones $repo_url into <dest> (an existing empty directory). 1 when the fourth try failed too.
+  local pause
+  for pause in 0 2 5 10; do
+    [ "$pause" = 0 ] || { echo "factory: clone failed; trying again in ${pause}s" >&2; sleep "$pause"; find "$1" -mindepth 1 -delete 2>/dev/null || true; }
+    git -c credential.helper= -c credential.helper="$GIT_CRED" clone -q "$repo_url" "$1" 3< <(printf '%s' "$2") && return 0
+  done
+  return 1
+}
 usage() { echo "usage: factory run <task-file> | factory lint [--deep] [dir] | factory batch [queue-dir] [--max-tasks N] [--stop-at HH:MM] [--no-chain] [--continue] | factory report [n] | factory requeue <queue/failed/file.json> [source-task.json] | factory unhold <queue/held/file.json> | factory stop <run_id> | factory ruleset-check <owner/name>" >&2; exit 2; }
 # Job schema: these four keys, all non-empty strings, plus an optional depends_on (task ids, non-empty strings). Everything else is derived by the orchestrator.
 JOB_SCHEMA='type=="object" and ((keys|sort)==["base_branch","instructions","repo","task_id"] or (keys|sort)==["base_branch","depends_on","instructions","repo","task_id"]) and (to_entries | all(if .key=="depends_on" then (.value|type=="array" and all(.[]; type=="string" and length>0)) else (.value|type=="string" and length>0) end))'
@@ -631,7 +642,7 @@ cmd_run() {
 
   # Clone (the container never sees the task file; only /work and /run/secrets are mounted).
   work=$(mktemp -d "${TMPDIR:-/tmp}/factory-work.XXXXXX")
-  git -c credential.helper= -c credential.helper="$GIT_CRED" clone -q "$repo_url" "$work" 3< <(printf '%s' "$gh_tok") || die "clone failed: $repo_url"
+  clone_repo "$work" "$gh_tok" || die "clone failed: $repo_url"
   # A chain base merged and deleted mid-batch (GitHub auto-deletes a merged PR's branch; 2026-11-05 lost two tasks to it) is still its
   # recorded commit, reachable from the merge: the ref is recreated locally, so the credential scan, the worker's checkout and the commit
   # count run unchanged. A commit the clone lacks (deleted unmerged: that task's PR was closed) is not built on.
@@ -979,7 +990,7 @@ cmd_deep_lint() {  # factory lint --deep [dir] (docs/cascade-plan.md, loop 1): b
   # The base, read-only for the session: cloned on the host with the batch's read token (contents:read), never one that can push.
   tok=$(dep_token "$repo" "$repo_url") || tok=; [ -n "$tok" ] || die "no read token for $repo"
   work=$(mktemp -d "${TMPDIR:-/tmp}/factory-deep.XXXXXX")
-  git -c credential.helper= -c credential.helper="$GIT_CRED" clone -q "$repo_url" "$work" 3< <(printf '%s' "$tok") || die "clone failed: $repo_url"; tok=
+  clone_repo "$work" "$tok" || die "clone failed: $repo_url"; tok=
   base_sha=$(git -C "$work" rev-parse "origin/$base" 2>/dev/null) || die "base branch not found: $base"
   manifest_set '. + {base_sha:$s}' --arg s "$base_sha"; log "cloned $repo_url at $base_sha"
   # The same screen as a run's, for the same reason: the base goes to a model provider. The queue's text passed lint's screen above.
@@ -1487,7 +1498,7 @@ cmd_ruleset_check() {  # factory ruleset-check <owner/name>: the negative tests 
   push_tok=$(mint_github_token "$repo" "$app_key" '{"contents":"write"}') || die "no push token"; app_key=
   mt=$(merger_token) || die "no merger token"
   w=$(mktemp -d "${TMPDIR:-/tmp}/factory-rc.XXXXXX"); trap 'rm -rf "$w"' EXIT
-  git -c credential.helper= -c credential.helper="$GIT_CRED" clone -q "$repo_url" "$w" 3< <(printf '%s' "$push_tok") || die "clone failed"
+  clone_repo "$w" "$push_tok" || die "clone failed"
   ci() { git -C "$w" -c commit.gpgsign=false -c user.name="$GITHUB_APP_SLUG[bot]" -c user.email="$GITHUB_APP_SLUG[bot]@users.noreply.github.com" commit -q --allow-empty -m "factory: ruleset check $ts" || die "commit failed"; }
   # The push test: an empty commit on top of next, pushed by sha, so a refusal can only be the ruleset's (a non-fast-forward would be git's).
   git -C "$w" checkout -q --detach "origin/$NEXT_BRANCH" || die "no $NEXT_BRANCH on $repo"; ci; cn=$(git -C "$w" rev-parse HEAD)

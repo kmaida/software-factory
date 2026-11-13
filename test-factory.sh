@@ -177,6 +177,19 @@ cat > "$t/bin/openssl" <<O
 [ "\${1:-}" = rand ] && [ -n "\${STUB_NO_RAND:-}" ] && exit 1
 exec "$realopenssl" "\$@"
 O
+realgit=$(type -P git); realsleep=$(type -P sleep)
+cat > "$t/bin/git" <<G
+#!/bin/bash
+# Stub: the real git, except while the file \$STUB_CLONE_MISS holds a count above 0 a clone takes one off it and fails as GitHub does for a token it does not know yet.
+case " \$* " in *" clone "*) n=\$(cat "\${STUB_CLONE_MISS:-/dev/null}" 2>/dev/null) || n=; [ "\${n:-0}" -gt 0 ] && { echo \$((n-1)) > "\$STUB_CLONE_MISS"; echo "remote: Repository not found." >&2; exit 128; };; esac
+exec "$realgit" "\$@"
+G
+cat > "$t/bin/sleep" <<S
+#!/bin/bash
+# Stub: the real sleep, except STUB_NOSLEEP=1 returns at once (the clone's waits, in a run that never reaches a container).
+[ -n "\${STUB_NOSLEEP:-}" ] && exit 0
+exec "$realsleep" "\$@"
+S
 chmod +x "$t/bin/"*
 run() {  # run <task_id> <verdicts> -> prints exit status; RUN_REPO overrides the local bare repo (a GitHub owner/name goes through the App path); RUN_INSTR the instructions (JSON-escaped)
   echo "{\"repo\":\"${RUN_REPO:-$t/remote.git}\",\"base_branch\":\"${RUN_BASE:-main}\",\"task_id\":\"$1\",\"instructions\":\"${RUN_INSTR:-do the thing}\"}" > "$t/$1.json"
@@ -231,6 +244,12 @@ rc=$(STUB_PROXY_DEAD=1 run t1p "VERIFIED"); m=$(ls -d "$runs"/*-t1p | tail -1)
 check "$rc" 1 "t1p dead proxy exit"; check "$(grep -c 'stub work' "$m/log.jsonl")" 0 "t1p no step ran without its proxy"; check "$(jq -r '"\(.exit_status) \(.class) \(.pushed)"' "$m/manifest.json")" "1 infra false" "t1p manifest: a die is infra, nothing pushed (written by cleanup)"
 rc=$(STUB_LOGS_FAIL=3 run t1l "VERIFIED"); m=$(ls -d "$runs"/*-t1l | tail -1)
 check "$rc" 1 "t1l lost network record exit"; check "$(grep -c 'stub work' "$m/log.jsonl")" 1 "t1l the step ran"; check "$(jq -r .exit_status "$m/manifest.json")" 1 "t1l manifest"
+# A clone GitHub refuses once (a token issued a moment ago) is tried again and the run goes on; a clone refused four times is the run's failure, infra, nothing pushed.
+echo 1 > "$t/miss"; rc=$(STUB_CLONE_MISS="$t/miss" run tc1 "VERIFIED"); m=$(ls -d "$runs"/*-tc1 | tail -1)
+check "$rc" 0 "tc1 one refused clone: the run passes"; check "$(grep -c 'clone failed; trying again in 2s' "$t/tc1.out") $(cat "$t/miss")" "1 0" "tc1 one retry, said on stderr"; check "$(jq -r .judge.verdict "$m/manifest.json")" VERIFIED "tc1 verdict"
+echo 9 > "$t/miss"; rc=$(STUB_CLONE_MISS="$t/miss" STUB_NOSLEEP=1 run tc2 "VERIFIED"); m=$(ls -d "$runs"/*-tc2 | tail -1)
+check "$rc" 1 "tc2 a clone refused every time exits 1"; check "$(grep -c 'trying again' "$t/tc2.out") $(cat "$t/miss") $(grep -c 'factory: clone failed: ' "$t/tc2.out")" "3 5 1" "tc2 four tries, then the die"
+check "$(jq -r '"\(.exit_status) \(.class) \(.pushed)"' "$m/manifest.json") $(grep -c 'stub ' "$m/log.jsonl")" "1 infra false 0" "tc2 manifest: infra, nothing pushed, no container ran"
 rc=$(run t2 "REFUTED,REFUTED,REFUTED"); m=$(ls -d "$runs"/*-t2 | tail -1)
 check "$rc" 5 "t2 exit"; check "$(jq -r .judge.rounds "$m/manifest.json")" 3 "t2 rounds"; check "$(jq -r .pr_url "$m/manifest.json")" null "t2 no PR"
 check "$(jq -r '"\(.outcome) \(.class) \(.pushed)"' "$m/manifest.json")" "refuted task true" "t2 a refusal is the task's own failure, branch pushed"
