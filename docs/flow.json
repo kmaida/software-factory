@@ -22,6 +22,10 @@
    "label": "Containers"
   },
   {
+   "id": "gatelane",
+   "label": "Verification gate"
+  },
+  {
    "id": "github",
    "label": "GitHub"
   }
@@ -29,11 +33,12 @@
  "mainPath": [
   "task",
   "factory",
+  "lint",
   "worker",
   "judge",
   "push",
-  "pr",
-  "review"
+  "gate",
+  "pr"
  ],
  "nodes": [
   {
@@ -45,12 +50,12 @@
    "sublabel": "queue/*.json"
   },
   {
-   "id": "keycard",
+   "id": "ntfy",
    "lane": "host",
-   "col": 2,
-   "type": "security",
-   "label": "Keycard",
-   "sublabel": "credentials"
+   "col": 5,
+   "type": "messagebus",
+   "label": "ntfy",
+   "sublabel": "failures, summary"
   },
   {
    "id": "factory",
@@ -61,17 +66,25 @@
    "sublabel": "trust boundary"
   },
   {
-   "id": "ntfy",
+   "id": "keycard",
    "lane": "host",
-   "col": 5,
-   "type": "messagebus",
-   "label": "ntfy",
-   "sublabel": "failures, summary"
+   "col": 2,
+   "type": "security",
+   "label": "Keycard",
+   "sublabel": "credentials"
+  },
+  {
+   "id": "lint",
+   "lane": "sandbox",
+   "col": 0,
+   "type": "security",
+   "label": "Deep lint",
+   "sublabel": "once per batch"
   },
   {
    "id": "worker",
    "lane": "sandbox",
-   "col": 0,
+   "col": 1,
    "type": "backend",
    "label": "Worker",
    "sublabel": "Claude Code"
@@ -79,7 +92,7 @@
   {
    "id": "judge",
    "lane": "sandbox",
-   "col": 2,
+   "col": 3,
    "type": "security",
    "label": "Judge",
    "sublabel": "Codex"
@@ -87,34 +100,42 @@
   {
    "id": "push",
    "lane": "sandbox",
-   "col": 4,
+   "col": 5,
    "type": "backend",
    "label": "Push",
    "sublabel": "contents:write"
   },
   {
    "id": "nopr",
-   "lane": "sandbox",
-   "col": 5,
+   "lane": "gatelane",
+   "col": 4,
    "type": "security",
    "label": "No PR",
-   "sublabel": "exit 5, 6, 10–12"
+   "sublabel": "exit 5, 6, 10–14"
   },
   {
-   "id": "pr",
-   "lane": "github",
-   "col": 4,
-   "type": "external",
-   "label": "Pull request",
-   "sublabel": "verdict in body"
+   "id": "gate",
+   "lane": "gatelane",
+   "col": 5,
+   "type": "security",
+   "label": "Gate",
+   "sublabel": "break it, reproduce"
   },
   {
    "id": "review",
    "lane": "github",
-   "col": 5,
+   "col": 3,
    "type": "security",
    "label": "Human review",
    "sublabel": "approve + CI"
+  },
+  {
+   "id": "pr",
+   "lane": "github",
+   "col": 5,
+   "type": "external",
+   "label": "Pull request",
+   "sublabel": "verdict, gate record"
   }
  ],
  "edges": [
@@ -134,12 +155,25 @@
   },
   {
    "from": "factory",
-   "to": "worker",
+   "to": "ntfy",
+   "label": "alerts",
+   "role": "async",
+   "variant": "dashed",
+   "route": "up-channel",
+   "channelY": 166
+  },
+  {
+   "from": "factory",
+   "to": "lint",
    "label": "1 secret",
    "variant": "emphasis",
    "route": "drop",
    "fromSide": "bottom",
    "toSide": "top"
+  },
+  {
+   "from": "lint",
+   "to": "worker"
   },
   {
    "from": "worker",
@@ -163,16 +197,35 @@
   },
   {
    "from": "push",
-   "to": "nopr",
-   "label": "REFUTED, gate",
-   "labelDy": -20,
-   "role": "error",
-   "variant": "security"
+   "to": "gate",
+   "label": "VERIFIED, CAVEATS",
+   "variant": "emphasis",
+   "route": "drop",
+   "fromSide": "bottom",
+   "toSide": "top",
+   "labelDy": 30
   },
   {
    "from": "push",
+   "to": "nopr",
+   "label": "REFUTED",
+   "role": "error",
+   "variant": "security",
+   "fromSide": "bottom",
+   "toSide": "top"
+  },
+  {
+   "from": "gate",
+   "to": "nopr",
+   "label": "refuted",
+   "role": "error",
+   "variant": "security",
+   "labelDy": -20
+  },
+  {
+   "from": "gate",
    "to": "pr",
-   "label": "VERIFIED, CAVEATS",
+   "label": "clean",
    "variant": "emphasis",
    "route": "drop",
    "fromSide": "bottom",
@@ -184,12 +237,12 @@
   },
   {
    "from": "nopr",
-   "to": "ntfy",
-   "label": "alert",
-   "role": "async",
+   "to": "factory",
+   "label": "rewrite once",
+   "role": "return",
    "variant": "dashed",
-   "fromSide": "top",
-   "toSide": "bottom"
+   "route": "return-left",
+   "labelSegment": 0
   }
  ]
 }

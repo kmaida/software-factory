@@ -1,6 +1,6 @@
 # Demo script
 
-This script runs a 10-minute demo of the factory on `keycard-sandbox/keycard-workshop-platform`. A full run takes longer than a demo slot (the judge alone runs `npm ci` and the whole test suite), so you show a finished run and start a live one alongside it.
+This script runs a 10-minute demo of the factory on `keycard-sandbox/keycard-workshop-platform`. A full run takes longer than a demo slot (the judge runs `npm ci` and the whole test suite, and the verification gate runs `npm ci` and each reported command at the head and at the base), so you show a finished run and start a live one alongside it.
 
 ## Before the demo
 
@@ -18,7 +18,7 @@ This script runs a 10-minute demo of the factory on `keycard-sandbox/keycard-wor
 
 ## During the demo
 
-1. Show the diagram in the README (1 minute), and trace task, worker, judge, push, PR and human.
+1. Show the diagram in the README (1 minute), and trace task, deep lint, worker, judge, push, gate, PR and human.
 2. Start the live run (1 minute):
 
    ```bash
@@ -26,7 +26,7 @@ This script runs a 10-minute demo of the factory on `keycard-sandbox/keycard-wor
    ./factory batch ~/demo-b
    ```
 
-3. Show it working (2 minutes). In a second terminal, run:
+3. Show it working (2 minutes). The first containers belong to deep lint: the verifier runs the base branch's own checks, then one Codex session reads the queue against that branch. The worker starts after both. In a second terminal, run:
 
    ```bash
    docker ps --filter label=factory.run
@@ -40,6 +40,6 @@ This script runs a 10-minute demo of the factory on `keycard-sandbox/keycard-wor
    ```
 
    The first is refused by the step's proxy (`403` after `CONNECT`); the second connects. Nothing else on the internet is reachable.
-4. Show the finished run (4 minutes). Open `runs/<run_id>/manifest.json`, then `judge-<n>.md`, where `<n>` is `judge.rounds` from the manifest (the final review), then the PR on GitHub with the verdict in its body. Point out that the App opened the PR and can't approve it.
+4. Show the finished run (4 minutes). Open `runs/<run_id>/manifest.json`, then `judge-<n>.md`, where `<n>` is `judge.rounds` from the manifest (the final review), then `gate-0-breakit.json` and `gate-0-verify.json`, the first gate cycle (what a second, fresh session reported, and what a container with no model and no credential got when it ran each command at the head and at the base), then the PR on GitHub with the verdict and the gate's record in its body. Point out that the App opened the PR and can't approve it.
 5. Walk through the security table in the README (2 minutes), including the Gap rows. The biggest are credentials inside the containers, no package admission point, and egress filtered by host rather than by request.
 6. To close, if the live run has finished, show the `done:` notification on your phone. If not, show `./factory report`.
