@@ -376,7 +376,11 @@ run_container() {  # run_container <mode> <secret> [docker args...] -- [entrypoi
   docker logs "$pname" 2>&1 | grep -q '"listening"' || { egress_record || true; die "proxy $pname is not listening after 5s; its output is in the log"; }
   log "container $cname starting; egress ^(?:$allow)$ via $pname"
   wd=$TIMEOUT_SEC; [ "$mode" != verify ] || wd=$((TIMEOUT_SEC * 2))   # ponytail: 2 x MAX_BLOCKS + 4 runs at 300 s is 7200 s; a total budget in verify.js if this ever bites
-  ( sleep "$wd" && docker stop -t 10 "$cname" >/dev/null 2>&1 ) & watchdog=$!
+  # One-second sleeps, not one `sleep "$wd"`: `kill "$watchdog"` below ends the subshell and orphans the sleep it is in. The orphan stops
+  # nothing, but it holds the run's stdout open until it ends, so with a single long sleep a piped batch (| tee, ssh) hung for up to $wd
+  # seconds after its last task. ponytail: a loop, not a TERM trap that kills the sleep; under bash 3.2 a TERM that lands as the subshell
+  # starts is handled only after the sleep (Codex, 2026-11-16: 7 of 100 trials).
+  ( n=0; while [ "$n" -lt "$wd" ]; do sleep 1; n=$((n + 1)); done; docker stop -t 10 "$cname" >/dev/null 2>&1 ) & watchdog=$!
   set +e
   printf '%s\n' "$secret" \
   | docker run -i --init --name "$cname" --label "factory.run=$run_id" --rm --read-only --tmpfs /tmp --tmpfs /run/secrets:size=64k \
@@ -394,7 +398,7 @@ run_container() {  # run_container <mode> <secret> [docker args...] -- [entrypoi
   | jq -R -c --arg r "$run_id" --arg m "$mode" --argjson n "$round" '{run_id:$r, ts:(now|todate), mode:$m, round:$n, event:(. as $l | try fromjson catch {type:"text", text:$l})}' >> "$logf"
   ps=("${PIPESTATUS[@]}")   # one assignment: reading an element resets it
   set -e
-  kill "$watchdog" 2>/dev/null || true
+  kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true   # the wait reaps it, so bash prints no "Terminated" line into the batch output
   status=${ps[1]}
   # A run that cannot produce its record fails closed: a failed redaction loop, redact or jq means the log is incomplete while the step
   # looks fine, and no exit code of the step can carry that (a judge status becomes "no verdict", a worker failure still pushes). So it
