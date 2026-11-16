@@ -114,8 +114,11 @@ try:
     net = sh(f"cd /work && git add -A && (git diff --cached --quiet || git commit -qm 'factory: {TASK} (uncommitted changes)') && git symbolic-ref -q HEAD") if turn else (None, "skipped: the agent failed")
     check("safety-net step completed and HEAD is the task branch", net == (0, f"refs/heads/{BRANCH}"), str(net))
 
-    def host_git(*args):   # read from the host's clone: what the orchestrator would judge and push
-        return subprocess.run(["git", "-C", WORK, *args], capture_output=True, text=True).stdout.strip()
+    def host_git(*args):   # read the host's clone: what the orchestrator would judge and push
+        # Never with git on the host. The agent wrote this repo, and git runs what a repo's config names (gpg.program under
+        # log.showSignature, for one). So: a throwaway container, the clone read-only, no network, as factory's push step does.
+        return subprocess.run(["docker", "run", "--rm", "--network", "none", "-e", "HOME=/tmp", "-v", f"{WORK}:/src:ro", "--entrypoint", "sh", IMAGE,
+                               "-c", 'git config --global --add safe.directory /src && git -C /src "$@"', "sh", *args], capture_output=True, text=True).stdout.strip()
     commits, body = host_git("rev-list", "--count", f"origin/main..{BRANCH}"), host_git("show", f"{BRANCH}:spike.txt")
     author, subject = host_git("log", "-1", "--format=%an", BRANCH), host_git("log", "-1", "--format=%s", BRANCH)
     # The agent's own commit, never the safety net's. In mock mode it has to be exactly the one the tool call made.
