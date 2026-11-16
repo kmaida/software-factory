@@ -1,5 +1,5 @@
-// Stand-in for api.anthropic.com in mock mode: answers every model call with one canned streamed text block and
-// prints the credential headers it received (hashed), one JSON line per request. No dependencies.
+// Stand-in for api.anthropic.com in mock mode: a canned model that asks a worker for one Bash command and then answers
+// in text. Prints the credential headers it received (hashed), one JSON line per request. No dependencies.
 // For `spike.sh exchange` it also stands in for the two token endpoints on the way: Keycard's (RFC 8693) and
 // Anthropic's federation endpoint (RFC 7523). Each accepts only what the real one requires and prints what it was sent.
 "use strict";
@@ -7,6 +7,7 @@ const http = require("http");
 const crypto = require("crypto");
 const sha = (s) => (s ? crypto.createHash("sha256").update(s).digest("hex").slice(0, 16) : null);
 const TEXT = "SPIKE_OK";
+const COMMAND = "echo 'made by the worker' > spike.txt && git add spike.txt && git commit -qm 'spike: the worker commits'";
 
 // What "Keycard" issues: a signed JWT for the worker, addressed to the gateway (the sandbox holds this), then an opaque
 // token for Anthropic's audience in exchange for it. What "Anthropic" issues: an opaque API token in exchange for that.
@@ -46,15 +47,24 @@ http.createServer((req, res) => {
       console.log(JSON.stringify({ token_endpoint: "anthropic", ok, content_type: type, client_auth: auth.split(" ")[0] || null, params: Object.keys(p).sort() }));
       return ok ? json(200, { access_token: AN, token_type: "Bearer", expires_in: 3600 }) : json(401, { type: "error", error: { type: "authentication_error", message: "Authentication failed" } });
     }
-    console.log(JSON.stringify({ method: req.method, url: req.url, bearer_sha: sha(auth.startsWith("Bearer ") ? auth.slice(7) : auth && "not a bearer: " + auth), x_api_key_sha: sha(req.headers["x-api-key"]) }));
-    let model = "mock"; try { model = JSON.parse(body).model || model; } catch {}
+    // The model: a worker that is offered Bash and has not yet seen a tool result is told to run COMMAND (one tool call);
+    // every other call gets the text. So one worker turn is two model calls: the tool call, then the answer to its result.
+    let j = {}; try { j = JSON.parse(body); } catch {}
+    const has = (list, f) => Array.isArray(list) && list.some(f);
+    const act = has(j.tools, (t) => t.name === "Bash") && !has(j.messages, (m) => has(m.content, (c) => c.type === "tool_result"));
+    console.log(JSON.stringify({ method: req.method, url: req.url, bearer_sha: sha(auth.startsWith("Bearer ") ? auth.slice(7) : auth && "not a bearer: " + auth), x_api_key_sha: sha(req.headers["x-api-key"]), reply: act ? "tool_use" : "text" }));
     res.writeHead(200, { "content-type": "text/event-stream" });
     const ev = (o) => res.write(`event: ${o.type}\ndata: ${JSON.stringify(o)}\n\n`);
-    ev({ type: "message_start", message: { id: "msg_spike", type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } } });
-    ev({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-    ev({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: TEXT } });
+    ev({ type: "message_start", message: { id: "msg_spike", type: "message", role: "assistant", model: j.model || "mock", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } } });
+    if (act) {
+      ev({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_spike", name: "Bash", input: {} } });
+      ev({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify({ command: COMMAND, description: "Write a file and commit it" }) } });
+    } else {
+      ev({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+      ev({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: TEXT } });
+    }
     ev({ type: "content_block_stop", index: 0 });
-    ev({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 1 } });
+    ev({ type: "message_delta", delta: { stop_reason: act ? "tool_use" : "end_turn", stop_sequence: null }, usage: { output_tokens: 1 } });
     ev({ type: "message_stop" });
     res.end();
   });

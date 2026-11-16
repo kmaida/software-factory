@@ -18,7 +18,7 @@ variant=${1:-token}
 case "$variant" in token) ;; exchange) [ -z "${FACTORY_SECRETS_DIR:-}" ] || { echo "spike: exchange runs in mock mode only; the zone has no gateway application yet (README.md)" >&2; exit 2; } ;;
   *) echo "usage: spike.sh [exchange]" >&2; exit 2 ;; esac
 
-d=$(mktemp -d "${TMPDIR:-/tmp}/spike.XXXXXX"); mkdir -p "$d/secrets" "$d/data"
+d=$(mktemp -d "${TMPDIR:-/tmp}/spike.XXXXXX"); d=$(cd "$d" && pwd -P); mkdir -p "$d/secrets" "$d/data"   # the real path: OpenSandbox compares mounts with it
 agw="spike-$$-agw"; mock="spike-$$-mock"; server=   # named by pid: cleanup never touches another run's containers
 cleanup() {   # best effort, and only what this run started
   [ -z "$server" ] || { kill "$server" 2>/dev/null; wait "$server" 2>/dev/null; } || true
@@ -134,6 +134,10 @@ up=; for _ in $(seq 20); do [[ $(docker logs "$agw" 2>&1) == *'started bind'* ]]
 [ -n "$up" ] || { docker logs "$agw" >&2; echo "spike: agentgateway did not start" >&2; exit 1; }
 GW_IP=$(ip_of "$agw"); export GW_IP
 
+# The repo, as `factory` hands it to the worker: a clone whose origin/main is the base, mounted at /work.
+g() { git -c commit.gpgsign=false -c user.name=spike -c user.email=spike@example.invalid "$@"; }
+g init -q -b main "$d/origin"; g -C "$d/origin" commit -q --allow-empty -m base; g clone -q "$d/origin" "$d/work"; export WORK_DIR="$d/work"
+
 # OpenSandbox: Docker runtime, egress enforced by nftables in a sidecar (DNS-only mode would let a bare IP through).
 OSB_API_KEY=$(openssl rand -hex 16); export OSB_API_KEY OSB_DOMAIN="127.0.0.1:$OSB_PORT" FACTORY_MODEL
 cat > "$d/sandbox.toml" <<EOF
@@ -146,6 +150,8 @@ resolve_internal = false
 [runtime]
 type = "docker"
 execd_image = "opensandbox/execd:release-1.2.1"
+[storage]
+allowed_host_paths = ["$d/work"]
 [store]
 type = "sqlite"
 path = "$d/opensandbox.db"
@@ -176,6 +182,9 @@ if [ "$mode" = mock ]; then   # every model call the upstream received: the file
     if [ "$ex" = '["anthropic",true] ["keycard",true] ' ]; then echo "PASS  both token endpoints accepted every request the gateway sent (count, then what it sent): $(jq -R -c 'fromjson? | select(.token_endpoint) | {(.token_endpoint): {client_auth, params}}' <<<"$seen" | sort | uniq -c | sed -E 's/^ +//' | tr '\n' ' ')"
     else echo "FAIL  token endpoints saw [endpoint, accepted]: ${ex:-nothing}"; rc=1; fi
   fi
+  replies=$(jq -R -r 'fromjson? | select(.method == "POST") | .reply' <<<"$seen" | tr '\n' ' ')   # the worker's turn: one tool call, then the answer to its result
+  if [ "$replies" = 'tool_use text ' ]; then echo "PASS  the model was called twice: a tool call, then text after its result"
+  else echo "FAIL  the mock model's replies were [${replies% }], wanted [tool_use text]"; rc=1; fi
   want="[\"$tok\",null]"
   calls=$(jq -R -c 'fromjson? | select(.method == "POST") | [.bearer_sha, .x_api_key_sha]' <<<"$seen")
   if [ "$(printf '%s\n' "$calls" | sort -u)" = "$want" ]; then echo "PASS  upstream saw the gateway's token and nothing from the sandbox ($(printf '%s\n' "$calls" | wc -l | tr -d ' ') model calls)"

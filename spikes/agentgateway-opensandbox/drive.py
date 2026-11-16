@@ -9,7 +9,7 @@ from datetime import timedelta
 
 from opensandbox import SandboxSync
 from opensandbox.config import ConnectionConfigSync
-from opensandbox.models.sandboxes import NetworkPolicy, NetworkRule
+from opensandbox.models.sandboxes import Host, NetworkPolicy, NetworkRule, Volume
 
 GW = os.environ["GW_IP"]                 # agentgateway on the Docker bridge
 UPSTREAM = os.environ.get("MOCK_IP")     # mock mode only: the stand-in for api.anthropic.com
@@ -17,6 +17,11 @@ MODEL = os.environ["FACTORY_MODEL"]
 IMAGE = os.environ["IMAGE"]
 RUN_KEY = os.environ["RUN_KEY"]          # the gateway accepts it for this run; it is nothing to Anthropic
 CURL = "curl -s -m 8 -o /dev/null -w '%{http_code}' "
+WORK = os.environ["WORK_DIR"]            # the host's clone of the target repo, as `factory` prepares it: origin/main is the base
+TASK = "spike-task"
+BRANCH = f"factory/{TASK}"
+BOT = "spike-worker[bot]"
+PROMPT = "Create spike.txt containing exactly the line 'made by the worker', commit it with git, then reply with only SPIKE_OK."
 
 sandbox = SandboxSync.create(
     IMAGE,
@@ -28,7 +33,10 @@ sandbox = SandboxSync.create(
         "ANTHROPIC_BASE_URL": f"http://{GW}:4000",
         "ANTHROPIC_AUTH_TOKEN": RUN_KEY,
         "NPM_CONFIG_IGNORE_SCRIPTS": "true",
+        "GIT_AUTHOR_NAME": BOT, "GIT_AUTHOR_EMAIL": "spike@example.invalid",
+        "GIT_COMMITTER_NAME": BOT, "GIT_COMMITTER_EMAIL": "spike@example.invalid",
     },
+    volumes=[Volume(name="work", host=Host(path=WORK), mount_path="/work")],   # factory's `-v "$work":/work`
     network_policy=NetworkPolicy(
         defaultAction="deny",
         egress=[
@@ -85,9 +93,13 @@ try:
     if UPSTREAM:
         refused("upstream refused when called directly, past the gateway", f"http://{UPSTREAM}:9000/")
 
+    # The work step. OpenSandbox replaces the image's entrypoint, so its MODE=work steps (Dockerfile) are run here as commands:
+    # the branch from the base, the agent, the safety-net commit, and the check that HEAD is still the task branch.
     rc, out = sh(
-        f"mkdir -p /tmp/work && cd /tmp/work && claude -p {shlex.quote('Reply with the single word ok.')} --output-format json "
-        f'--model {MODEL} --allowedTools "Bash,Read,Edit,Write,Glob,Grep" < /dev/null'
+        f"umask 077 && git config --global --add safe.directory /work && cd /work && "
+        f"(git checkout -q {BRANCH} 2>/dev/null || git checkout -qb {BRANCH} origin/main) && "
+        f"claude -p {shlex.quote(PROMPT)} --output-format json --model {MODEL} "
+        '--allowedTools "Bash,Read,Edit,MultiEdit,Write,Glob,Grep,NotebookEdit,TodoWrite,Agent" < /dev/null'
     )
     try:
         result = json.loads(out.splitlines()[-1])
@@ -95,7 +107,22 @@ try:
         result = {"is_error": True, "result": out}
     said = str(result.get("result", ""))
     # In mock mode the reply has to be the mock's own text: a turn answered from anywhere else is not a turn through the gateway.
-    check("claude -p completed a turn through the gateway", rc == 0 and not result.get("is_error", True) and (not UPSTREAM or said == "SPIKE_OK"), said[-160:])
+    # That a tool call ran is not claimed here: the commit check below and spike.sh's last check (the mock's replies) establish it.
+    turn = rc == 0 and not result.get("is_error", True) and (not UPSTREAM or said == "SPIKE_OK")
+    check("claude -p finished its turn through the gateway", turn, f"{result.get('num_turns')} turns: {said[-120:]}")
+    # The entrypoint runs under `set -e`: after a failed agent it stops, and the safety net never touches the checkout.
+    net = sh(f"cd /work && git add -A && (git diff --cached --quiet || git commit -qm 'factory: {TASK} (uncommitted changes)') && git symbolic-ref -q HEAD") if turn else (None, "skipped: the agent failed")
+    check("safety-net step completed and HEAD is the task branch", net == (0, f"refs/heads/{BRANCH}"), str(net))
+
+    def host_git(*args):   # read from the host's clone: what the orchestrator would judge and push
+        return subprocess.run(["git", "-C", WORK, *args], capture_output=True, text=True).stdout.strip()
+    commits, body = host_git("rev-list", "--count", f"origin/main..{BRANCH}"), host_git("show", f"{BRANCH}:spike.txt")
+    author, subject = host_git("log", "-1", "--format=%an", BRANCH), host_git("log", "-1", "--format=%s", BRANCH)
+    # The agent's own commit, never the safety net's. In mock mode it has to be exactly the one the tool call made.
+    check("the worker's commit is on the task branch in the host's clone",
+          commits.isdigit() and int(commits) >= 1 and body == "made by the worker" and author == BOT
+          and not subject.startswith("factory:") and (not UPSTREAM or subject == "spike: the worker commits"),
+          f"{commits} commit(s) by {author}, '{subject}', spike.txt: {body!r}")
     # True by construction (nothing else is passed in); this only catches the driver being changed to pass more.
     check("the sandbox's Anthropic variables hold the run key and nothing else", sh("env | grep -i -E 'anthropic.*(token|key)'")[1] == f"ANTHROPIC_AUTH_TOKEN={RUN_KEY}")
 

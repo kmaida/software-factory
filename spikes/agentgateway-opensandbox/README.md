@@ -23,11 +23,14 @@ PASS  example.com refused  [sandbox 000, control 200]
 PASS  unlisted IP refused (1.1.1.1)  [sandbox 000, control 301]
 PASS  gateway refused on a port the rule does not name (15021)  [sandbox 000, control 404]
 PASS  upstream refused when called directly, past the gateway  [sandbox 000, control 200]
-PASS  claude -p completed a turn through the gateway  [SPIKE_OK]
+PASS  claude -p finished its turn through the gateway  [2 turns: SPIKE_OK]
+PASS  safety-net step completed and HEAD is the task branch  [(0, 'refs/heads/factory/spike-task')]
+PASS  the worker's commit is on the task branch in the host's clone  [1 commit(s) by spike-worker[bot], 'spike: the worker commits', spike.txt: 'made by the worker']
 PASS  the sandbox's Anthropic variables hold the run key and nothing else
 INFO  sandbox {'read_only': False, 'cap_drop': ['ALL', 'NET_ADMIN'], 'cap_add': None, 'security_opt': ['no-new-privileges=true'], 'memory': 4294967296, 'nano_cpus': 2000000000, 'pids_limit': 512, 'published_on': []}
 INFO  egress sidecar {'read_only': False, 'cap_drop': None, 'cap_add': ['NET_ADMIN'], 'security_opt': None, 'memory': 0, 'nano_cpus': 0, 'pids_limit': None, 'published_on': ['127.0.0.1']}
-PASS  upstream saw the gateway's token and nothing from the sandbox (1 model calls)
+PASS  the model was called twice: a tool call, then text after its result
+PASS  upstream saw the gateway's token and nothing from the sandbox (2 model calls)
 ```
 
 How to read it:
@@ -37,6 +40,9 @@ How to read it:
 - **The port check covers one port.** 15021 is open on the gateway and the rule names only 4000.
 - **In mock mode a 401 can only come from the gateway,** because the mock never sends one. In real mode Anthropic could be its author.
 - **The last line is the credential check.** For every model call (POST) the mock logged, the bearer must be the gateway's token and `x-api-key` must be absent, compared by hash. So the sandbox's key reached the upstream in neither header.
+- **The work step has the factory's shape.** The script makes a repo and a clone of it, and mounts the clone at `/work` as `factory` does. OpenSandbox replaces the image's entrypoint, so the driver runs the entrypoint's work steps as commands: the task branch from `origin/main`, the agent, the safety-net commit (skipped when the agent failed, as under the entrypoint's `set -e`), and the check that HEAD is still the task branch. Here the agent commits its own work, so the safety net finds nothing to commit.
+- **The model is canned.** The mock tells the worker to run one Bash command that writes a file and commits it, then answers `SPIKE_OK` once a tool result comes back. The check on the mock's replies requires exactly that pair, in that order.
+- **The commit is read on the host.** That check runs `git` against the host's clone, which is what the orchestrator would judge and push. The commit must carry the identity passed in `GIT_AUTHOR_NAME` and must not be the safety net's. In mock mode it must be exactly the commit the tool call makes, which is the evidence that the tool ran.
 - **The INFO lines are observations, not checks.** They are how the two containers were started.
 
 ## Exchange mode: the gateway is given no token
@@ -53,10 +59,10 @@ Mock only. The sandbox holds a JWT that a stand-in Keycard issued for the worker
 The same checks pass as above, plus one that prints what agentgateway sent to each token endpoint:
 
 ```
-PASS  both token endpoints accepted every request the gateway sent (count, then what it sent): 1 {"anthropic":{"client_auth":null,"params":["assertion","federation_rule_id","grant_type","organization_id","service_account_id","workspace_id"]}} 2 {"keycard":{"client_auth":"Basic","params":["grant_type","resource","subject_token","subject_token_type"]}}
+PASS  both token endpoints accepted every request the gateway sent (count, then what it sent): 2 {"anthropic":{"client_auth":null,"params":["assertion","federation_rule_id","grant_type","organization_id","service_account_id","workspace_id"]}} 3 {"keycard":{"client_auth":"Basic","params":["grant_type","resource","subject_token","subject_token_type"]}}
 ```
 
-The counts are per run: two calls reached the gateway (one listing models, one model call), so Keycard's endpoint was asked twice. With the cache on it was asked once.
+The counts are per run: three calls reached the gateway (one listing models, two model calls), so Keycard's endpoint was asked three times and Anthropic's twice. With the cache on, each was asked once.
 
 The mock endpoints accept only a POST with the exact subject token or assertion, grant, resource, client credentials and federation ids. The check passes when each endpoint accepted at least one request and refused none.
 
@@ -88,7 +94,8 @@ Still open:
 ## Not run
 
 - **Real mode.** The Keycard client secret is on the mini, so no real token has been through the gateway. Claude Code's real requests (beta headers, tool calls) through the gateway's parser are untested; its docs mention `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` for one known error.
-- **A real task.** The sandbox runs one trivial prompt in an empty directory. Getting a clone in and commits out (OpenSandbox volumes) is not tried.
+- **A real task.** The worker makes one canned commit in an empty repo. No model has chosen its own tool calls here, nothing installs from npm, and no revision round continues an existing branch. The entrypoint's exit codes (2 for a failed commit or a moved HEAD, 3 for no changes) and the stream of tool calls into `log.jsonl` are not reproduced. Nor are `run_container`'s watchdog, its redacting log pipeline, or the `NPM_CONFIG_BEFORE` npm policy.
+- **A Linux host for the mount.** On this Mac, OrbStack lets uid 1000 in the container write a clone owned by the host user. On Linux the ownership would have to match.
 - **The other steps** (judge, push, review, verify), a Linux host, and the sidecar's decision log as a replacement for the proxy's record in `log.jsonl`.
 - **A search of the sandbox for the token.** The script never passes a token in and the Dockerfile bakes none into the image. Nothing searches the container to confirm it; the check on its environment only guards the first half.
 
@@ -101,7 +108,8 @@ Still open:
 | `--read-only` | Root filesystem is writable |
 | `--cap-drop ALL` | Same, with `drop_capabilities = ["ALL"]` |
 | `no-new-privileges`, 4 GB, 2 CPUs, 512 pids | Same on the sandbox; the sidecar has no limits |
-| The image's entrypoint does the branch checkout, the safety-net commit and the exit codes | OpenSandbox replaces the entrypoint; the orchestrator would run those as commands |
+| The image's entrypoint does the branch checkout, the safety-net commit and the exit codes | OpenSandbox replaces the entrypoint; the driver runs the checkout, the agent and the safety-net commit as commands, without the exit codes |
+| `-v "$work":/work` | A host-path volume, allowed by `allowed_host_paths` in the server's config |
 | The orchestrator is a bash script | A server with the Docker socket, and a sidecar with `NET_ADMIN`, join the trust boundary |
 
 ## Before this is real
