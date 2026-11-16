@@ -770,7 +770,14 @@ cmd_run() {
     esac
     [ -n "$gh_tok" ] || die "GitHub did not issue a push token for $repo"
     manifest_set '. + {push_attempted:true}'   # from here the branch may exist on GitHub whatever happens next (END_JQ: pushed null, not false)
-    run_container push "$gh_tok" -v "$work":/src:ro -e REPO_URL="$repo_url" -e HEAD_SHA="$head" --   # read-only mount; pushes the judged commit by SHA
+    # The push token is seconds old too, so the push can meet the refusal clone_repo describes, here after the whole worker and judge
+    # cycle. Status 128 is git's own fatal (repository not found, authentication, network): that is tried again after 2, 5 and 10 s in a
+    # fresh container with the same token. Any other status stands at once: 1 is a ref GitHub rejected (a ruleset), which no wait
+    # changes, and a push the watchdog stopped has already had TIMEOUT_SEC.
+    for pause in 0 2 5 10; do
+      [ "$pause" = 0 ] || { [ "$status" -eq 128 ] || break; log "push of factory/$task_id failed (status 128); trying again in ${pause}s"; sleep "$pause"; }
+      run_container push "$gh_tok" -v "$work":/src:ro -e REPO_URL="$repo_url" -e HEAD_SHA="$head" --   # read-only mount; pushes the judged commit by SHA
+    done
     # Pushed means pushed: a failed push leaves final_sha as it was (null, or the previous cycle's commit, which is still on GitHub), so
     # nothing downstream (the batch's retry, a human) treats the judged commit as being there. The judged sha is in the log and judge-<n>.md
     # either way. A successful push is persisted at once, so a later die (a gate step refused by HALT) keeps it.
