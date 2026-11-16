@@ -1,17 +1,52 @@
-// Stand-in for api.anthropic.com in mock mode: answers every request with one canned streamed text block and
+// Stand-in for api.anthropic.com in mock mode: answers every model call with one canned streamed text block and
 // prints the credential headers it received (hashed), one JSON line per request. No dependencies.
+// For `spike.sh exchange` it also stands in for the two token endpoints on the way: Keycard's (RFC 8693) and
+// Anthropic's federation endpoint (RFC 7523). Each accepts only what the real one requires and prints what it was sent.
 "use strict";
 const http = require("http");
 const crypto = require("crypto");
 const sha = (s) => (s ? crypto.createHash("sha256").update(s).digest("hex").slice(0, 16) : null);
 const TEXT = "SPIKE_OK";
 
+// What "Keycard" issues: a signed JWT for the worker, addressed to the gateway (the sandbox holds this), then an opaque
+// token for Anthropic's audience in exchange for it. What "Anthropic" issues: an opaque API token in exchange for that.
+const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+const now = Math.floor(Date.now() / 1000);
+const signed = b64({ alg: "RS256", typ: "JWT", kid: "k1" }) + "." + b64({ iss: "http://mock-keycard", sub: "urn:spike:worker", aud: "urn:spike:gateway", iat: now, exp: now + 900 });
+const AGENT = signed + "." + crypto.sign("sha256", Buffer.from(signed), privateKey).toString("base64url");
+const KC = "kc-" + crypto.randomBytes(16).toString("hex");
+const AN = "an-" + crypto.randomBytes(16).toString("hex");
+const GATEWAY_BASIC = "Basic " + Buffer.from(`spike-gateway:${process.env.GW_SECRET}`).toString("base64");
+const FED = JSON.parse(process.env.FED || "{}");   // the four federation ids the gateway is configured to send
+const X = "urn:ietf:params:oauth:";
+const FORM = "application/x-www-form-urlencoded";
+
 http.createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
   req.on("end", () => {
+    const type = req.headers["content-type"] || "";
+    const json = (code, o) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
+    const params = () => { try { return type.includes("json") ? JSON.parse(body) : Object.fromEntries(new URLSearchParams(body)); } catch { return {}; } };
     const auth = req.headers.authorization || "";
-    console.log(JSON.stringify({ method: req.method, url: req.url, bearer_sha: sha(auth.replace(/^Bearer /, "")), x_api_key_sha: sha(req.headers["x-api-key"]) }));
+    if (req.url === "/jwks") return json(200, { keys: [{ ...publicKey.export({ format: "jwk" }), kid: "k1", alg: "RS256", use: "sig" }] });
+    if (req.url === "/oauth/2/token") {   // Keycard: a confidential client, a subject access token Keycard minted, a resource
+      const p = params();
+      const ok = req.method === "POST" && type.startsWith(FORM) && auth === GATEWAY_BASIC && p.grant_type === X + "grant-type:token-exchange" && p.subject_token === AGENT
+        && p.subject_token_type === X + "token-type:access_token" && p.resource === "https://api.anthropic.com";
+      console.log(JSON.stringify({ token_endpoint: "keycard", ok, content_type: type, client_auth: auth.split(" ")[0] || null, params: Object.keys(p).sort() }));
+      return ok ? json(200, { access_token: KC, token_type: "Bearer", issued_token_type: X + "token-type:access_token", expires_in: 3600 }) : json(400, { error: "invalid_request" });
+    }
+    if (req.url === "/v1/oauth/token") {   // Anthropic: the Keycard token as the assertion, and the four federation ids; a form or JSON
+      const p = params();
+      const ids = ["federation_rule_id", "organization_id", "service_account_id", "workspace_id"];
+      const ok = req.method === "POST" && (type.startsWith(FORM) || type.includes("json")) && p.grant_type === X + "grant-type:jwt-bearer" && p.assertion === KC
+        && ids.every((k) => typeof FED[k] === "string" && FED[k] !== "" && p[k] === FED[k]);
+      console.log(JSON.stringify({ token_endpoint: "anthropic", ok, content_type: type, client_auth: auth.split(" ")[0] || null, params: Object.keys(p).sort() }));
+      return ok ? json(200, { access_token: AN, token_type: "Bearer", expires_in: 3600 }) : json(401, { type: "error", error: { type: "authentication_error", message: "Authentication failed" } });
+    }
+    console.log(JSON.stringify({ method: req.method, url: req.url, bearer_sha: sha(auth.startsWith("Bearer ") ? auth.slice(7) : auth && "not a bearer: " + auth), x_api_key_sha: sha(req.headers["x-api-key"]) }));
     let model = "mock"; try { model = JSON.parse(body).model || model; } catch {}
     res.writeHead(200, { "content-type": "text/event-stream" });
     const ev = (o) => res.write(`event: ${o.type}\ndata: ${JSON.stringify(o)}\n\n`);
@@ -23,4 +58,4 @@ http.createServer((req, res) => {
     ev({ type: "message_stop" });
     res.end();
   });
-}).listen(9000, () => console.log('{"listening":9000}'));
+}).listen(9000, () => console.log(JSON.stringify({ listening: 9000, agent_jwt: AGENT, anthropic_token_sha: sha(AN) })));

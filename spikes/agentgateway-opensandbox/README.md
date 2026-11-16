@@ -39,6 +39,40 @@ How to read it:
 - **The last line is the credential check.** For every model call (POST) the mock logged, the bearer must be the gateway's token and `x-api-key` must be absent, compared by hash. So the sandbox's key reached the upstream in neither header.
 - **The INFO lines are observations, not checks.** They are how the two containers were started.
 
+## Exchange mode: the gateway is given no token
+
+```bash
+./spike.sh exchange
+```
+
+Mock only. The sandbox holds a JWT that a stand-in Keycard issued for the worker, addressed to the gateway. The gateway starts with its own client secret and no model credential. It gets one by making two trades, in one agentgateway process and by configuration alone, and caches what each returns until it expires:
+
+1. The `default` listener checks the JWT (issuer, audience, signature) and trades it at Keycard's token endpoint for a token addressed to Anthropic. This is RFC 8693 token exchange with the gateway's client credentials.
+2. It hands the call to an `inner` listener on loopback, which trades that token at Anthropic's federation endpoint for the API token. This is the RFC 7523 grant `factory` uses today.
+
+The same checks pass as above, plus one that prints what agentgateway sent to each token endpoint:
+
+```
+PASS  both token endpoints accepted the gateway's requests: {"anthropic":{"client_auth":null,"params":["assertion","federation_rule_id","grant_type","organization_id","service_account_id","workspace_id"]}} {"keycard":{"client_auth":"Basic","params":["grant_type","resource","subject_token","subject_token_type"]}}
+```
+
+The mock endpoints accept only a POST with the exact subject token or assertion, grant, resource, client credentials and federation ids. The check passes when each endpoint accepted at least one request and refused none. Whether the real ones accept it is checked this far, with no credentials:
+
+- **Keycard.** In a local copy of svc-sts (5213d2d2, which may be behind), the token endpoint takes `client_secret_basic`, and an access-token exchange needs a confidential client, a subject token the zone issued, and an exchanging application that provides the resource in the subject token's first `aud`. A token whose subject is an application is accepted. No live exchange has been tried.
+- **Anthropic.** Its federation endpoint parsed a form body. With a garbage assertion it gave the same `401 Authentication failed` for JSON and for a form, and a form with no assertion gave `400 assertion is required`.
+
+A real run needs these in the Keycard zone, none of which exist yet:
+
+- A resource for the gateway, and an application for the gateway that provides it and has its own credential.
+- That application depending on `https://api.anthropic.com`, with policy that permits the exchange.
+- The orchestrator minting the worker's token with the gateway's resource in place of Anthropic's.
+
+Still open:
+
+- Whether Anthropic's federation rule matches the exchanged token. Its subject would still be the orchestrator's application; `client_id` and `act` would name the gateway.
+- Whether agentgateway's `jwtAuth` accepts a real Keycard access token as it is.
+- One identity per agent. Today every step would present the orchestrator's identity. A separate Keycard application for the worker, the judge and the reviewer would let policy and the gateway's log tell them apart. In a run by hand, the gateway's request log carried `jwt.sub=urn:spike:worker`.
+
 ## Seen by hand, not in the script
 
 - **Removing the gateway's `auth` block makes the last check fail.** The upstream then gets no credential at all.
@@ -68,9 +102,8 @@ How to read it:
 
 ## Before this is real
 
-- The run key is a shared random string. A Keycard-issued JWT per agent (`jwtAuth`) would tie each call to an identity.
-- The token file is written once. The schema says file values are watched, so a fresh token per round should need no restart; not tested.
-- agentgateway's schema has an `oauthTokenExchange` backend auth with a `jwtBearer` grant, the same grant `factory` uses at Anthropic. The gateway could do that exchange itself from a Keycard token. Not tried: `factory` sends JSON to that endpoint and the gateway may send a form.
+- In token mode the run key is a shared random string and the token file is written once. Exchange mode replaces both, once the zone has the registrations above.
+- Exchanged tokens are cached by the gateway (the schema's default is in memory, until `expires_in`). What happens at expiry and on a revoked grant is not tested.
 - The API key policy also takes `allowedModels` and `budgets` per key, which would cover the model pin and a spend cap. Not tried.
 - OpenSandbox publishes each sandbox's command API on a host port. `publish_host = "127.0.0.1"` keeps it on loopback; the default is every interface.
 - Cleanup is best effort. A killed run can leave containers named `spike-<pid>-*` or `sandbox-*`.
