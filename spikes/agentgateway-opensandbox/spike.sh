@@ -107,6 +107,7 @@ routes:
           path: /oauth/2/token
           resources: ["$ANTHROPIC_RESOURCE"]
           clientAuth: {method: clientSecretBasic, clientId: spike-gateway, clientSecret: {file: /secrets/gateway_client_secret}}
+          cache: {maxEntries: 0}   # Keycard's rule: never cache its tokens in the application; trade again on every call
 llm:
   gateways: inner
   models:
@@ -118,6 +119,7 @@ llm:
         host: $MOCK_IP:9000
         path: /v1/oauth/token
         grantType: jwtBearer
+        cache: {maxEntries: 0}
         additionalParams:
           federation_rule_id: "'$ANTHROPIC_FEDERATION_RULE'"
           organization_id: "'$ANTHROPIC_ORG'"
@@ -171,7 +173,7 @@ if [ "$mode" = mock ]; then   # every model call the upstream received: the file
   else   # the token the mock Anthropic issued; and each token endpoint took every request the gateway sent it
     tok=$(jq -R -r 'fromjson? | .anthropic_token_sha // empty' <<<"$seen")
     ex=$(jq -R -c 'fromjson? | select(.token_endpoint) | [.token_endpoint, .ok]' <<<"$seen" | sort -u | tr '\n' ' ')
-    if [ "$ex" = '["anthropic",true] ["keycard",true] ' ]; then echo "PASS  both token endpoints accepted the gateway's requests: $(jq -R -c 'fromjson? | select(.token_endpoint) | {(.token_endpoint): {client_auth, params}}' <<<"$seen" | sort -u | tr '\n' ' ')"
+    if [ "$ex" = '["anthropic",true] ["keycard",true] ' ]; then echo "PASS  both token endpoints accepted every request the gateway sent (count, then what it sent): $(jq -R -c 'fromjson? | select(.token_endpoint) | {(.token_endpoint): {client_auth, params}}' <<<"$seen" | sort | uniq -c | sed -E 's/^ +//' | tr '\n' ' ')"
     else echo "FAIL  token endpoints saw [endpoint, accepted]: ${ex:-nothing}"; rc=1; fi
   fi
   want="[\"$tok\",null]"

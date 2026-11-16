@@ -45,7 +45,7 @@ How to read it:
 ./spike.sh exchange
 ```
 
-Mock only. The sandbox holds a JWT that a stand-in Keycard issued for the worker, addressed to the gateway. The gateway starts with its own client secret and no model credential. It gets one by making two trades, in one agentgateway process and by configuration alone, and caches what each returns until it expires:
+Mock only. The sandbox holds a JWT that a stand-in Keycard issued for the worker, addressed to the gateway. The gateway starts with its own client secret and no model credential. It gets one by making two trades, in one agentgateway process and by configuration alone. Its token cache is turned off, so it trades again on every call:
 
 1. The `default` listener checks the JWT (issuer, audience, signature) and trades it at Keycard's token endpoint for a token addressed to Anthropic. This is RFC 8693 token exchange with the gateway's client credentials.
 2. It hands the call to an `inner` listener on loopback, which trades that token at Anthropic's federation endpoint for the API token. This is the RFC 7523 grant `factory` uses today.
@@ -53,10 +53,14 @@ Mock only. The sandbox holds a JWT that a stand-in Keycard issued for the worker
 The same checks pass as above, plus one that prints what agentgateway sent to each token endpoint:
 
 ```
-PASS  both token endpoints accepted the gateway's requests: {"anthropic":{"client_auth":null,"params":["assertion","federation_rule_id","grant_type","organization_id","service_account_id","workspace_id"]}} {"keycard":{"client_auth":"Basic","params":["grant_type","resource","subject_token","subject_token_type"]}}
+PASS  both token endpoints accepted every request the gateway sent (count, then what it sent): 1 {"anthropic":{"client_auth":null,"params":["assertion","federation_rule_id","grant_type","organization_id","service_account_id","workspace_id"]}} 2 {"keycard":{"client_auth":"Basic","params":["grant_type","resource","subject_token","subject_token_type"]}}
 ```
 
-The mock endpoints accept only a POST with the exact subject token or assertion, grant, resource, client credentials and federation ids. The check passes when each endpoint accepted at least one request and refused none. Whether the real ones accept it is checked this far, with no credentials:
+The counts are per run: two calls reached the gateway (one listing models, one model call), so Keycard's endpoint was asked twice. With the cache on it was asked once.
+
+The mock endpoints accept only a POST with the exact subject token or assertion, grant, resource, client credentials and federation ids. The check passes when each endpoint accepted at least one request and refused none.
+
+This variant was written with the `using-keycard` guide loaded. It departs from that guide in three places, listed under "Before this is real". Whether the real ones accept it is checked this far, with no credentials:
 
 - **Keycard.** In a local copy of svc-sts (5213d2d2, which may be behind), the token endpoint takes `client_secret_basic`, and an access-token exchange needs a confidential client, a subject token the zone issued, and an exchanging application that provides the resource in the subject token's first `aud`. A token whose subject is an application is accepted. No live exchange has been tried.
 - **Anthropic.** Its federation endpoint parsed a form body. With a garbage assertion it gave the same `401 Authentication failed` for JSON and for a form, and a form with no assertion gave `400 assertion is required`.
@@ -103,7 +107,11 @@ Still open:
 ## Before this is real
 
 - In token mode the run key is a shared random string and the token file is written once. Exchange mode replaces both, once the zone has the registrations above.
-- Exchanged tokens are cached by the gateway (the schema's default is in memory, until `expires_in`). What happens at expiry and on a revoked grant is not tested.
+- **Token caching is off in exchange mode, on purpose.** agentgateway caches exchanged tokens in memory by default. Keycard's guidance is never to cache its tokens in the application, so the config sets `cache: {maxEntries: 0}`. The cost is two token requests per model call, and Anthropic's side of that is untested for rate limits.
+- **No discovery.** Keycard's guidance is to find the token endpoint and keys through discovery. agentgateway's exchange takes a fixed host and path, so a real config would hard-code what the zone's discovery document says today. Real mode in `spike.sh` also hard-codes `/oauth/2/token`, as `factory` does.
+- **Not Keycard's SDK.** The exchange is agentgateway's own RFC 8693 client, not `@keycardai/oauth`. That is the point of the spike, but it means Keycard's SDK behaviour (and its fixes) does not apply.
+- **A client secret, not workload identity.** With no user present, Keycard's guidance prefers workload identity. agentgateway can authenticate with `privateKeyJwt`, which Keycard accepts; the mock uses a client secret.
+- **Exact strings.** Keycard matches a resource identifier exactly, so `resources` in the gateway config has to equal the registered resource byte for byte.
 - The API key policy also takes `allowedModels` and `budgets` per key, which would cover the model pin and a spend cap. Not tried.
 - OpenSandbox publishes each sandbox's command API on a host port. `publish_host = "127.0.0.1"` keeps it on loopback; the default is every interface.
 - Cleanup is best effort. A killed run can leave containers named `spike-<pid>-*` or `sandbox-*`.
