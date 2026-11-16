@@ -197,7 +197,7 @@ run() {  # run <task_id> <verdicts> -> prints exit status; RUN_REPO overrides th
   echo "{\"repo\":\"${RUN_REPO:-$t/remote.git}\",\"base_branch\":\"${RUN_BASE:-main}\",\"task_id\":\"$1\",\"instructions\":\"${RUN_INSTR:-do the thing}\"}" > "$t/$1.json"
   rm -f "$t/state" "$t/state.r" "$t/state.p" "$t/state.m" "$t/state.g" "$t/allow" "$t/logs"; set +e   # FACTORY_MAX_ROUNDS=3: the verdict fixtures below are written for three rounds; one case sets 5
   PATH="$t/bin:$PATH" STUB_STATE="$t/state" STUB_ALLOW="$t/allow" STUB_NETLOG="$t/netlog" STUB_LOGS="$t/logs" STUB_PROMPT="$t/prompt" STUB_APP_KEY="$t/app-key.b64" STUB_VERDICTS="$2" FACTORY_SECRETS_DIR="$t/secrets" FACTORY_ALLOW_DIRTY=1 FACTORY_MAX_ROUNDS="${FACTORY_MAX_ROUNDS:-3}" FACTORY_REVISE="${FACTORY_REVISE:-0}" \
-    "$here/factory" run "$t/$1.json" >"$t/$1.out" 2>&1; rc=$?; set -e
+    "$here/factory" run "$t/$1.json" >"${RUN_OUT:-$t/$1.out}" 2>&1; rc=$?; set -e
   echo "$rc"
 }
 check() { [ "$1" = "$2" ] || { echo "FAIL: $3: got '$1' want '$2'"; cat "$t/"*.out; echo "--- log:"; jq -r "select(.event.type==\"text\" or .event.type==\"factory\") | .event.text" "$m/log.jsonl" | tail -15; exit 1; }; }
@@ -232,6 +232,15 @@ check "$(jq -r '.npm_policy.ignore_scripts' "$m/manifest.json")" true "t1 npm po
 # Image pin: without FACTORY_ALLOW_DIRTY, an image other than IMAGE_ID refuses to start (before the dirty-tree check).
 set +e; out=$(PATH="$t/bin:$PATH" FACTORY_SECRETS_DIR="$t/secrets" "$here/factory" run "$t/t1.json" 2>&1); rc=$?; set -e
 check "$rc" 1 "image pin exit"; case "$out" in *"is sha256:stub, not the pinned sha256:"*) ;; *) echo "FAIL: image pin message: $out"; exit 1;; esac
+# The watchdog ends with its step: a reader of the run's output sees its end within seconds of the run ending. The watchdog was one
+# `sleep 3600`, orphaned when its subshell was killed, so each container left a sleep holding the run's stdout open for up to two hours
+# (2026-11-16: a piped canary on the mini hung for ten minutes after its last task). Now the orphan is a `sleep 1`, hence the 4 s bound.
+# A FIFO, not ps or pgrep: neither can list processes inside a sandbox.
+mkfifo "$t/wd.fifo"; cat "$t/wd.fifo" > "$t/twd.out" & rd=$!
+rc=$(RUN_OUT="$t/wd.fifo" run twd "VERIFIED"); check "$rc" 0 "twd exit"
+for i in $(seq 1 40); do kill -0 "$rd" 2>/dev/null || break; sleep 0.1; done
+! grep -q 'Terminated' "$t/twd.out" || { echo "FAIL: twd: bash reported a killed watchdog in the run's output"; cat "$t/twd.out"; exit 1; }
+if kill -0 "$rd" 2>/dev/null; then kill "$rd"; echo "FAIL: twd: a process the run started outlived it and still holds its output open"; exit 1; fi
 # Evidence: a failing log stage (jq here) in a worker or a judge round is outcome evidence_error, exit 12: nothing further runs, nothing is pushed.
 rc=$(STUB_JQ_FAIL=work run e1 "VERIFIED"); m=$(ls -d "$runs"/*-e1 | tail -1)
 check "$rc" 12 "e1 evidence error exit"; check "$(jq -r '"\(.outcome) \(.final_sha) \(.exit_status)"' "$m/manifest.json")" "evidence_error null 12" "e1 manifest"; check "$(grep -c 'stub judge' "$m/log.jsonl")" 0 "e1 no judge ran"
