@@ -284,7 +284,7 @@ To retry a failed task, fix whatever blocked it, then requeue it and run `batch`
 
 ## Security model
 
-The orchestrator is the trust boundary, not the container. It builds every `docker run` command from a fixed schema, and nothing the agent writes can change the image, mounts, flags, repo or token scope. Task text, repo contents and tool output are all untrusted input.
+The orchestrator is the trust boundary, not the container. It builds every `docker run` command from a fixed schema, and nothing the agent writes can change the image, mounts, flags, repo or token scope. Task text, repo contents and tool output are all untrusted input. So is the worker's checkout as a git repository: git runs what a repository's config names, so after a worker round the orchestrator never runs git there on the host. It reads the branch head and the blocked note through a container with the checkout mounted read-only, no network and no credential.
 
 The table compares the factory to the controls in the reference architecture's appendix.
 
