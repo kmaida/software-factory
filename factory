@@ -77,6 +77,9 @@ NPM_BEFORE_DAYS=7   # npm policy on the fixed docker run line: no install script
 # neither argv nor the environment. `credential.helper=` first clears inherited helpers (the mini's system gitconfig sets osxkeychain,
 # which would store the token on success).
 GIT_CRED='!f() { h=; while IFS= read -r l; do case "$l" in host=*) h=${l#host=};; esac; done; [ "$h" = github.com ] || exit 0; echo username=x-access-token; echo "password=$(cat <&3)"; }; f'
+# Second layer under wgit, for every git this script runs on the host: a repository may never fetch its own missing objects, which is how a
+# promisor remote's uploadpack gets run. Nothing here uses a partial clone. A git without the 2024 fixes ignores the variable, so it is not the control.
+export GIT_NO_LAZY_FETCH=1
 
 die()   { echo "factory: $*" >&2; exit 1; }
 # A token GitHub issued a moment ago is sometimes refused by its git servers for a few seconds: "Repository not found", although the App
@@ -115,12 +118,23 @@ END_JQ='.class = ('"$CLASS_JQ"') | .pushed = (if .pushed == null then (if .push_
 ID_RE='^[A-Za-z0-9._-]+$'; BRANCH_RE='^[A-Za-z0-9._/-]+$'
 now()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
 redact() { sed -l -E "s/$CRED_RE/[REDACTED]/g"; }   # by shape, for text that leaves the run: a token the orchestrator never held is caught too; a split token is not
-note_at() {  # note_at <git dir> <sha>: 0 when docs/BLOCKED-$task_id.md is a regular file at <sha>, 1 when it is not there (or is a directory or
+wgit() {  # wgit <git args...>: read-only git in the worker's checkout ($work), run in a container. Never git on the host there: the worker
+  # wrote that repository, and git runs what a repository's config names. A promisor remote with its own uploadpack plus one deleted object
+  # made `git ls-tree` on the host run the worker's command as the orchestrator (2026-11-16, reproduced; `rev-parse` of a ref name did not,
+  # and goes through here because the next command might). In the container the checkout is read-only and there is no network and no
+  # credential, so a command the worker planted has nothing to reach; lazy fetching is off as well, where the image's git knows the variable
+  # (2.39.5 does). Bounded: a planted `sleep`, or a FIFO where git expects a file, would otherwise hold the run and its lock for good.
+  # Exit status: git's own (0, 1 for "no such ref" under --verify -q, 128), 124 or 137 from the timeout, 125 to 127 from docker. Only 0 is an answer.
+  docker run --rm --label "factory.run=$run_id" --read-only --network none --memory 256m --pids-limit 64 --cap-drop ALL --security-opt no-new-privileges \
+    -e GIT_NO_LAZY_FETCH=1 -v "$work":/src:ro --entrypoint timeout "$image_digest" -k 5 60 git -c safe.directory=/src --no-replace-objects -C /src "$@" < /dev/null
+}
+note_at() {  # note_at <sha> <git command...> (`wgit` for the worker's checkout, `git --no-replace-objects -C <dir>` for the gate's own clone): 0 when docs/BLOCKED-$task_id.md is a regular file at <sha>, 1 when it is not there (or is a directory or
   # symlink, which is not a note), 2 when git could not say. ls-tree, not cat-file -e: a missing path and a broken repo both exit 128 there,
   # and "could not say" must never read as "no note" (a round-1 note would then end as "no verdict"). --no-replace-objects: the worker's
   # checkout can carry refs/replace/* that make the real head read as another commit.
   # stderr apart from stdout: a warning on a successful listing (the worker can plant an ambiguous ref name in its checkout) must not read as "no note".
-  m=$(git --no-replace-objects -C "$1" ls-tree "$2" -- "docs/BLOCKED-$task_id.md" 2>"$rundir/.lstree") || { log "ls-tree $2 in $1 failed: $(head -c 500 "$rundir/.lstree")"; rm -f "$rundir/.lstree"; return 2; }
+  nsha=$1; shift
+  m=$("$@" ls-tree "$nsha" -- "docs/BLOCKED-$task_id.md" 2>"$rundir/.lstree") || { lr=$?; log "ls-tree $nsha ($1) exited $lr: $(head -c 500 "$rundir/.lstree")"; rm -f "$rundir/.lstree"; return 2; }
   rm -f "$rundir/.lstree"; case "$m" in 100644*|100755*) return 0 ;; *) return 1 ;; esac
 }
 scope_of() { printf '%s\n' "$1" | awk '/^Scope:/ && !d {f=1} /^Done when:/{f=0; d=1} f'; }   # the task's own Scope section, once: a "Scope:" line in findings that requeue appended is not one
@@ -712,12 +726,23 @@ cmd_run() {
     cost=$(jq -c --argjson n "$round" 'select(.mode=="work" and .round==$n and (.event|type)=="object" and .event.type=="result") | .event | {reported_cost_usd:(.total_cost_usd // null), num_turns:(.num_turns // null), duration_ms:(.duration_ms // null)}' "$logf" | tail -1)
     manifest_set '.worker.rounds += [{round:$n, status:$s} + ($c // {reported_cost_usd:null, num_turns:null, duration_ms:null})]' --argjson n "$round" --argjson s "$status" --argjson c "${cost:-null}"
     [ "$status" -eq 0 ] || break
-    head=$(git -C "$work" rev-parse --verify -q "refs/heads/factory/$task_id") || die "worker exited 0 but factory/$task_id does not exist"
+    # The head, read in a container (wgit). Exit 1 is git's "no such ref"; anything else is a checkout or a docker that could not answer, and
+    # must not read as the worker's failure. What comes back is the worker's repository speaking, so it is taken only as an object id (the
+    # judge and the push check out that id, and fail on anything that is not a commit). The cause goes into the log before the run dies:
+    # stderr here is the worker's too, so it is kept apart, cut short and redacted like every other text of its.
+    : > "$rundir/.wgit" || die "cannot write in $rundir"   # opened first: a redirection that fails exits 1 without running git, and 1 below means "no such ref"
+    hr=0; head=$(wgit rev-parse --verify -q "refs/heads/factory/$task_id" 2>"$rundir/.wgit") || hr=$?
+    [ "$hr" -ne 1 ] || { rm -f "$rundir/.wgit"; die "worker exited 0 but factory/$task_id does not exist"; }
+    if [ "$hr" -ne 0 ] || ! [[ "$head" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+      log "cannot read factory/$task_id in the worker's checkout: git in a container exited $hr: $(head -c 500 "$rundir/.wgit")" || true; rm -f "$rundir/.wgit"
+      die "cannot read factory/$task_id in the worker's checkout (git in a container exited $hr)"
+    fi
+    rm -f "$rundir/.wgit"
     if [ "$head" = "$prev_head" ]; then log "round $round: no new commits; the round $((round-1)) verdict stands"; round=$((round-1)); break; fi   # rounds = judged rounds
     prev_head=$head
     # The worker's note ends the run before the judge: nothing to review, and the reason reaches the gate below (exit 10). A round-1
     # note is judge:{rounds:0, verdict:null}; a later one keeps the earlier rounds' record.
-    nr=0; note_at "$work" "$head" || nr=$?; [ "$nr" -ne 2 ] || die "cannot read $head in the worker's checkout"
+    nr=0; note_at "$head" wgit || nr=$?; [ "$nr" -ne 2 ] || die "cannot read $head in the worker's checkout"
     if [ "$nr" -eq 0 ]; then log "round $round: docs/BLOCKED-$task_id.md is at $head; no judge round"; break; fi
 
     oa_key=$(openai_key) || oa_key=; [ -n "$oa_key" ] || die "no Codex key (Keycard $OPENAI_RESOURCE)"
@@ -811,7 +836,7 @@ cmd_run() {
       # Blocked: this task's own note is a regular file at the pushed head. A note on top of code is blocked; a note deleted again, another
       # task's note on the base, or a directory or symlink at the path is not. Decided from git, not from the verdict: a round-1 note was never
       # judged, a later one left the earlier verdict standing, and "blocked" must win over both so the batch can report the reason. No PR.
-      elif nr=0; note_at "$gate" "$head" || nr=$?; [ "$nr" -eq 2 ]; then manifest_set '. + {outcome:"gate_error"}'; log "cannot read factory/$task_id at $head in the gate repo; no PR"; status=12
+      elif nr=0; note_at "$head" git --no-replace-objects -C "$gate" || nr=$?; [ "$nr" -eq 2 ]; then manifest_set '. + {outcome:"gate_error"}'; log "cannot read factory/$task_id at $head in the gate repo; no PR"; status=12
       elif [ "$nr" -eq 0 ]; then
         note="docs/BLOCKED-$task_id.md"
         # First non-blank, non-heading line. awk reads the whole note (an early exit would SIGPIPE git show and, under pipefail, lose the reason).
