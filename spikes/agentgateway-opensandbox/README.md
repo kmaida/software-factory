@@ -21,11 +21,11 @@ PASS  npm registry reachable
 PASS  api.anthropic.com refused (direct, by name)  [sandbox 000, control 404]
 PASS  example.com refused  [sandbox 000, control 200]
 PASS  unlisted IP refused (1.1.1.1)  [sandbox 000, control 301]
-PASS  gateway's other ports refused (15021 readiness)  [sandbox 000, control 404]
+PASS  gateway refused on a port the rule does not name (15021)  [sandbox 000, control 404]
 PASS  upstream refused when called directly, past the gateway  [sandbox 000, control 200]
 PASS  claude -p completed a turn through the gateway  [SPIKE_OK]
 PASS  the sandbox's Anthropic variables hold the run key and nothing else
-INFO  sandbox {'read_only': False, 'cap_drop': ['NET_ADMIN', 'ALL'], 'cap_add': None, 'security_opt': ['no-new-privileges=true'], 'memory': 4294967296, 'nano_cpus': 2000000000, 'pids_limit': 512, 'published_on': []}
+INFO  sandbox {'read_only': False, 'cap_drop': ['ALL', 'NET_ADMIN'], 'cap_add': None, 'security_opt': ['no-new-privileges=true'], 'memory': 4294967296, 'nano_cpus': 2000000000, 'pids_limit': 512, 'published_on': []}
 INFO  egress sidecar {'read_only': False, 'cap_drop': None, 'cap_add': ['NET_ADMIN'], 'security_opt': None, 'memory': 0, 'nano_cpus': 0, 'pids_limit': None, 'published_on': ['127.0.0.1']}
 PASS  upstream saw the gateway's token and nothing from the sandbox (1 model calls)
 ```
@@ -33,8 +33,10 @@ PASS  upstream saw the gateway's token and nothing from the sandbox (1 model cal
 How to read it:
 
 - **The sandbox holds a run key, not a token.** The script makes a random key per run. The gateway accepts only that key and answers 401 without it. Anthropic has never heard of it.
-- **A refusal has a control.** Each "refused" line is the same request made twice: from the sandbox (no connection, `000`) and from a plain container on the same Docker bridge (an HTTP answer). So the policy is what refused it, not the network.
-- **The last line is the credential check.** For every model call the mock received, it compares hashes of both `Authorization` and `x-api-key` with the gateway's token. The sandbox's key must appear in neither.
+- **A refusal has a control.** Each "refused" line is the same request made twice: from the sandbox (no HTTP answer, `000`) and from a plain container on the same Docker bridge (an HTTP answer). The difference between the two is the policy. The check does not look at why the sandbox's request failed.
+- **The port check covers one port.** 15021 is open on the gateway and the rule names only 4000.
+- **In mock mode a 401 can only come from the gateway,** because the mock never sends one. In real mode Anthropic could be its author.
+- **The last line is the credential check.** For every model call (POST) the mock logged, the bearer must be the gateway's token and `x-api-key` must be absent, compared by hash. So the sandbox's key reached the upstream in neither header.
 - **The INFO lines are observations, not checks.** They are how the two containers were started.
 
 ## Seen by hand, not in the script
@@ -50,7 +52,7 @@ How to read it:
 - **Real mode.** The Keycard client secret is on the mini, so no real token has been through the gateway. Claude Code's real requests (beta headers, tool calls) through the gateway's parser are untested; its docs mention `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` for one known error.
 - **A real task.** The sandbox runs one trivial prompt in an empty directory. Getting a clone in and commits out (OpenSandbox volumes) is not tried.
 - **The other steps** (judge, push, review, verify), a Linux host, and the sidecar's decision log as a replacement for the proxy's record in `log.jsonl`.
-- **A search of the sandbox for the token.** That no token is in the container holds because the script never passes one in. The check on its environment only guards that.
+- **A search of the sandbox for the token.** The script never passes a token in and the Dockerfile bakes none into the image. Nothing searches the container to confirm it; the check on its environment only guards the first half.
 
 ## Against the factory's `docker run`
 

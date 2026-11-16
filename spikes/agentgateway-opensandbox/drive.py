@@ -61,7 +61,7 @@ def check(name, ok, detail=""):
         failed.append(name)
 
 
-def refused(name, url):   # refused by the policy: no connection from the sandbox, an answer to the same request from a container with no policy
+def refused(name, url):   # no HTTP answer in the sandbox, and an answer to the same request from a container with no policy
     control = status(subprocess.run(["docker", "run", "--rm", "--entrypoint", "sh", IMAGE, "-c", CURL + url], capture_output=True, text=True).stdout.strip())
     got = code(url)
     check(name, got == "000" and control not in ("000", "ERR"), f"sandbox {got}, control {control}")
@@ -73,13 +73,15 @@ try:
     key = f"-H 'authorization: Bearer {RUN_KEY}' "
     check("gateway answers the run key", code(key + f"http://{GW}:4000/v1/models") == "200")
     post = f"-X POST -H 'content-type: application/json' -d '{{\"model\":\"{MODEL}\",\"max_tokens\":1,\"messages\":[]}}' http://{GW}:4000/v1/messages"
-    check("gateway refuses a model call with no key", code(post) == "401", code(post))
+    # In mock mode a 401 can only be the gateway's (the mock never sends one). In real mode Anthropic could be its author.
+    nokey = code(post)
+    check("gateway refuses a model call with no key", nokey == "401", nokey)
     check("gateway refuses a model call with a wrong key", code("-H 'authorization: Bearer wrong' " + post) == "401")
     check("npm registry reachable", code("https://registry.npmjs.org/") == "200")
     refused("api.anthropic.com refused (direct, by name)", "https://api.anthropic.com/")
     refused("example.com refused", "https://example.com/")
     refused("unlisted IP refused (1.1.1.1)", "http://1.1.1.1/")
-    refused("gateway's other ports refused (15021 readiness)", f"http://{GW}:15021/")
+    refused("gateway refused on a port the rule does not name (15021)", f"http://{GW}:15021/")
     if UPSTREAM:
         refused("upstream refused when called directly, past the gateway", f"http://{UPSTREAM}:9000/")
 
