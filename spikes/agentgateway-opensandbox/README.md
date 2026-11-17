@@ -51,7 +51,7 @@ How to read it:
 FACTORY_SECRETS_DIR=<dir> ./spike.sh
 ```
 
-Run once, 2026-11-17, on the factory's Mac mini with Docker Desktop, right after mock mode passed there. The script got a token from Keycard for `https://api.anthropic.com`, traded it at Anthropic's federation endpoint as `factory` does, and wrote the result to the file the gateway mounts.
+Run twice, 2026-11-17, on the factory's Mac mini with Docker Desktop: first right after mock mode passed there, then again once the gateway's config held the run key's hash in place of the key. Both runs printed the lines below. The script got a token from Keycard for `https://api.anthropic.com`, traded it at Anthropic's federation endpoint as `factory` does, and wrote the result to the file the gateway mounts.
 
 ```
 PASS  runs as the image's unprivileged user
