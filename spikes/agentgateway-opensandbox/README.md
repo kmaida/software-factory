@@ -6,7 +6,7 @@ Can the worker run with no Anthropic credential in its container? This spike run
 ./spike.sh
 ```
 
-That is mock mode: a stand-in for `api.anthropic.com` and a made-up token, so it costs nothing and needs no secret. With `FACTORY_SECRETS_DIR` set, the script mints the token the way `factory` does and uses the real API. It needs `docker`, `uv`, `jq`, `openssl` and the `factory-sandbox` image.
+That is mock mode: a stand-in for `api.anthropic.com` and a made-up token, so it costs nothing and needs no secret. `./spike.sh real` mints the token the way `factory` does and uses the real API; it needs `FACTORY_SECRETS_DIR`, and that variable alone never selects it. It needs `docker`, `uv`, `jq`, `openssl` and the `factory-sandbox` image.
 
 ## What the script checks
 
@@ -48,7 +48,7 @@ How to read it:
 ## Real mode: a token Keycard and Anthropic issued
 
 ```bash
-FACTORY_SECRETS_DIR=<dir> ./spike.sh
+FACTORY_SECRETS_DIR=<dir> ./spike.sh real
 ```
 
 Run twice, 2026-11-17, on the factory's Mac mini with Docker Desktop: first right after mock mode passed there, then again once the gateway's config held the run key's hash in place of the key. Both runs printed the lines below. The script got a token from Keycard for `https://api.anthropic.com`, traded it at Anthropic's federation endpoint as `factory` does, and wrote the result to the file the gateway mounts.
@@ -87,7 +87,9 @@ What it does not show:
 ./spike.sh exchange
 ```
 
-Mock only. The sandbox holds a JWT that a stand-in Keycard issued for the worker, addressed to the gateway. The gateway starts with its own client secret and no model credential. It gets one by making two trades, in one agentgateway process and by configuration alone. Its token cache is turned off, so it trades again on every call:
+Only this mock form has run. `./spike.sh exchange real` is written for the real zone and `api.anthropic.com` and has never run: the zone has none of the registrations listed below.
+
+The sandbox holds a JWT that a stand-in Keycard issued for the worker, addressed to the gateway. The gateway starts with its own client secret and no model credential. It gets one by making two trades, in one agentgateway process and by configuration alone. Its token cache is turned off, so it trades again on every call:
 
 1. The `default` listener checks the JWT (issuer, audience, signature) and trades it at Keycard's token endpoint for a token addressed to Anthropic. This is RFC 8693 token exchange with the gateway's client credentials.
 2. It hands the call to an `inner` listener on loopback, which trades that token at Anthropic's federation endpoint for the API token. This is the RFC 7523 grant `factory` uses today.
@@ -119,9 +121,10 @@ This variant was written with the `using-keycard` guide loaded. It departs from 
 
 A real run needs these in the Keycard zone, none of which exist yet:
 
-- A resource for the gateway whose credential provider is the zone itself, so its token is a JWT, with a short credential lifetime (the default is 24 hours).
-- An application for the gateway that provides that resource and has its own credential. Only the providing application may exchange a token addressed to the resource.
+- A resource for the gateway whose credential provider is the zone itself, so its token is a JWT. The script expects the identifier `urn:factory:gateway:models` (`GATEWAY_RESOURCE` overrides it). Its token lifetime has to cover a whole worker step, because the worker presents the token on every model call; the default is 24 hours.
+- An application for the gateway (say `urn:factory:gateway`) that provides that resource and has its own client ID and secret. Only the providing application may exchange a token addressed to the resource. The script reads the credential from `gateway_client_id` and `gateway_client_secret` in `FACTORY_SECRETS_DIR`.
 - The orchestrator's application permitted on the gateway's resource. Under the default policy that means a dependency on it.
+- The zone's `default-app-delegation` policy in the active set, or a permit for the gateway's application on `https://api.anthropic.com` when `context.on_behalf` is true.
 - The orchestrator minting the worker's token with the gateway's resource in place of Anthropic's, and without the `openid` scope, which would add a second audience.
 - The gateway's application depending on `https://api.anthropic.com`. Keycard's guide says to declare it. In source it is not what grants this exchange.
 
@@ -143,7 +146,7 @@ Still open:
 
 ## Not run
 
-- **A real exchange.** Exchange mode has only met mocks. The zone has none of the registrations it needs.
+- **A real exchange.** Exchange mode has only met mocks. `./spike.sh exchange real` reads the zone's discovery document, mints the worker's token for the gateway's resource and points the gateway at the real endpoints. What was checked without credentials: its gateway config loads, fetches the zone's keys and answers 401 to a missing or garbage token. The zone has none of the registrations it needs, so no trade has been tried.
 - **A real task.** The worker makes one small commit in an empty repo, in one turn with one tool call. Nothing installs from npm, and no revision round continues an existing branch. agentgateway's docs mention `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` for one known error with beta headers; the real run did not need it. The entrypoint's exit codes (2 for a failed commit or a moved HEAD, 3 for no changes) and the stream of tool calls into `log.jsonl` are not reproduced. Nor are `run_container`'s watchdog, its redacting log pipeline, or the `NPM_CONFIG_BEFORE` npm policy.
 - **A Linux host for the mount.** On a Mac, OrbStack and Docker Desktop let uid 1000 in the container write a clone owned by the host user. On Linux the ownership would have to match.
 - **The other steps** (judge, push, review, verify), a Linux host, and the sidecar's decision log as a replacement for the proxy's record in `log.jsonl`.
@@ -166,10 +169,10 @@ Still open:
 
 - In token mode the run key is a shared random string and the token file is written once. Exchange mode replaces both, once the zone has the registrations above.
 - **Token caching is off in exchange mode, on purpose.** agentgateway caches exchanged tokens in memory by default. Keycard's guidance is never to cache its tokens in the application, so the config sets `cache: {maxEntries: 0}`. The cost is two token requests per model call, and Anthropic's side of that is untested for rate limits.
-- **No discovery.** Keycard's guidance is to find the token endpoint and keys through discovery. agentgateway's exchange takes a fixed host and path, so a real config would hard-code what the zone's discovery document says today. Real mode in `spike.sh` also hard-codes `/oauth/2/token`, as `factory` does.
+- **Discovery happens once, in the script.** Keycard's guidance is to find the token endpoint and keys through discovery. agentgateway's exchange takes a fixed host and path, so in real mode `spike.sh` reads the zone's discovery document and writes what it says into the gateway's config. A long-lived gateway would not notice the endpoints change. `factory` itself still hard-codes `/oauth/2/token`.
 - **Not Keycard's SDK.** The exchange is agentgateway's own RFC 8693 client, not `@keycardai/oauth`. That is the point of the spike, but it means Keycard's SDK behaviour (and its fixes) does not apply.
 - **A client secret, not workload identity.** With no user present, Keycard's guidance prefers workload identity. agentgateway can authenticate with `privateKeyJwt`. Keycard accepts that for a public-key credential whose keys it can fetch from a `jwks_uri`, so the gateway's public key would have to be published where Keycard can reach it. That removes the shared secret. It is still not workload identity, which is a separate path in Keycard. The mock uses a client secret.
-- **The same three departures are in real mode and in `factory`.** The orchestrator's own request to Keycard uses a client secret, a hard-coded token path and a hand-written request.
+- **The orchestrator's own request departs too.** In real mode and in `factory` it uses a client secret and a hand-written request, not workload identity and Keycard's SDK.
 - **TLS to a real token endpoint has to be named.** In agentgateway a `host` on port 443 does not turn TLS on. A real config writes `https://` in the host or sets `backendTLS`.
 - **The gateway's stats and readiness ports listen on every interface** (15020 and 15021) unless `config.statsAddr` and `config.readinessAddr` say otherwise. The spike leaves 15021 open on purpose, as its control for the port rule.
 - **Exact strings.** Keycard matches a resource identifier exactly, so `resources` in the gateway config has to equal the registered resource byte for byte.
