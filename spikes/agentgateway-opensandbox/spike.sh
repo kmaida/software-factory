@@ -28,7 +28,7 @@ trap cleanup EXIT
 ip_of() { docker inspect -f '{{.NetworkSettings.Networks.bridge.IPAddress}}' "$1"; }
 
 # The credential: only ever a file on the host, mounted into the gateway. The sandbox never gets it.
-if [ -n "${FACTORY_SECRETS_DIR:-}" ]; then   # the factory's keycard_token and anthropic_token, inline. Not run yet: the secrets are on the mini.
+if [ -n "${FACTORY_SECRETS_DIR:-}" ]; then   # the factory's keycard_token and anthropic_token, inline. Ran on the mini 2026-11-17 (README.md).
   mode=real; upstream=
   kc=$(printf 'user = "%s:%s"\n' "$(cat "$FACTORY_SECRETS_DIR/keycard_client_id")" "$(cat "$FACTORY_SECRETS_DIR/keycard_client_secret")" \
     | curl -sS -m 30 -K - "$KEYCARD_ZONE/oauth/2/token" -d grant_type=client_credentials -d "resource=$ANTHROPIC_RESOURCE" | jq -r '.access_token // empty') || kc=
@@ -65,7 +65,7 @@ llm:
     apiKey:
       mode: strict
       keys:
-      - key: "$RUN_KEY"
+      - keyHash: "sha256:$(printf '%s' "$RUN_KEY" | shasum -a 256 | cut -d' ' -f1)"   # the config never holds the key itself
   models:
   - name: "*"
     provider: anthropic
@@ -145,8 +145,6 @@ cat > "$d/sandbox.toml" <<EOF
 host = "127.0.0.1"
 port = $OSB_PORT
 api_key = "$OSB_API_KEY"
-[proxy]
-resolve_internal = false
 [runtime]
 type = "docker"
 execd_image = "opensandbox/execd:release-1.2.1"

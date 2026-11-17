@@ -14,7 +14,9 @@ const COMMAND = "echo 'made by the worker' > spike.txt && git add spike.txt && g
 const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
 const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
 const now = Math.floor(Date.now() / 1000);
-const signed = b64({ alg: "RS256", typ: "JWT", kid: "k1" }) + "." + b64({ iss: "http://mock-keycard", sub: "urn:spike:worker", aud: "urn:spike:gateway", iat: now, exp: now + 900 });
+// The header type and the last three claims are what Keycard's real token endpoint requires of a subject token (README.md).
+const signed = b64({ alg: "RS256", typ: "at+jwt", kid: "k1" }) + "." + b64({ iss: "http://mock-keycard", sub: "urn:spike:worker", aud: "urn:spike:gateway", iat: now, exp: now + 900,
+  client_id: "spike-worker-credential", keycard_app_id: "spike-worker", sub_profile: "app" });
 const AGENT = signed + "." + crypto.sign("sha256", Buffer.from(signed), privateKey).toString("base64url");
 const KC = "kc-" + crypto.randomBytes(16).toString("hex");
 const AN = "an-" + crypto.randomBytes(16).toString("hex");

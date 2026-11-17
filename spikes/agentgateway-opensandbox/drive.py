@@ -93,7 +93,7 @@ try:
     if UPSTREAM:
         refused("upstream refused when called directly, past the gateway", f"http://{UPSTREAM}:9000/")
 
-    # The work step. OpenSandbox replaces the image's entrypoint, so its MODE=work steps (Dockerfile) are run here as commands:
+    # The work step. OpenSandbox never runs the image's entrypoint (README.md), so its MODE=work steps (Dockerfile) are run here as commands:
     # the branch from the base, the agent, the safety-net commit, and the check that HEAD is still the task branch.
     rc, out = sh(
         f"umask 077 && git config --global --add safe.directory /work && cd /work && "
@@ -139,9 +139,8 @@ try:
     print("INFO  egress sidecar", flags(f"sandbox-egress-{sandbox.id}"))
 finally:
     try:
-        sandbox.kill()
-    finally:   # the server may be gone; its containers must not outlive the run
+        sandbox.destroy()   # the SDK's create-use-discard call: kill, then close, and it closes even when the kill fails
+    finally:   # spike.sh stops the server right after this, so nothing else would remove what a failed kill left behind
         subprocess.run(["docker", "rm", "-f", f"sandbox-{sandbox.id}", f"sandbox-egress-{sandbox.id}"], capture_output=True)
-        sandbox.close()
 
 sys.exit(1 if failed else 0)
