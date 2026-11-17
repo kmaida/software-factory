@@ -201,7 +201,8 @@ up=; for _ in $(seq 60); do curl -fsS -m 2 -o /dev/null "http://$OSB_DOMAIN/heal
 
 rc=0; uv run -q --with "$OSB_SDK" python "$here/drive.py" || rc=$?
 # A failed real exchange is explained in the gateway's log (the token endpoint's own error), which the run would otherwise delete.
-[ "$rc" = 0 ] || [ "$mode$variant" != realexchange ] || docker logs "$agw" 2>&1 | grep -i -E 'error|denied|invalid' | tail -6 | cut -c1-500 >&2 || true
+[ "$rc" = 0 ] || [ "$mode$variant" != realexchange ] || docker logs "$agw" 2>&1 | grep -i -E 'error|denied|invalid' | tail -6 | cut -c1-500 \
+  | sed -E 's/eyJ[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]*)*/[jwt]/g; s/sk-ant-[A-Za-z0-9_-]+/[token]/g; s/(Bearer|Basic) +[^ ",]+/\1 [redacted]/g' >&2 || true   # a token endpoint's error can echo the request
 
 if [ "$mode" = mock ]; then   # every model call the upstream received: the file's token as the bearer, and no x-api-key
   seen=$(docker logs "$mock" 2>&1)
