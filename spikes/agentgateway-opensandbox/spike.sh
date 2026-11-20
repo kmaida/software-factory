@@ -36,6 +36,20 @@ cleanup() {   # best effort, and only what this run started
 }
 trap cleanup EXIT
 ip_of() { docker inspect -f '{{.NetworkSettings.Networks.bridge.IPAddress}}' "$1"; }
+# Every log this script prints goes through here: a token endpoint's error can echo the request, and a gateway's
+# start-up log its config. A secret is matched by its name as well as by its shape, and before any line is cut short.
+redact() {
+  perl -pe '
+    s/eyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)*/[jwt]/g;
+    s/sk-ant-[A-Za-z0-9_-]+/[token]/g;
+    s/\b(Bearer|Basic)\s+[^\s",]+/$1 [redacted]/gi;
+    s/((?:client_secret|client_assertion|subject_token|actor_token|access_token|refresh_token|id_token|assertion|password|secret|api[_-]?key|authorization|token)["\x27]?\s*[:=]\s*["\x27]?)(?!\[)[^\s",&}\x27]+/$1\[redacted]/gi;
+    s/\bcode=[^\s",&}]+/code=[redacted]/gi;
+    s/[A-Za-z0-9_+\/=-]{40,}/[opaque]/g;
+  '
+}
+[ "$(printf '%s' 'client_secret=abc "access_token":"q9" authorization: bearer zz code=c1 key AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA eyJa.b.c' | redact)" = \
+  'client_secret=[redacted] "access_token":"[redacted]" authorization: [redacted] [redacted] code=[redacted] key [opaque] [jwt]' ] || { echo "spike: redact does not redact; is perl missing?" >&2; exit 2; }
 
 # The credential: only ever a file on the host, mounted into the gateway. The sandbox never gets it.
 if [ "$mode" = real ]; then   # the factory's keycard_token and anthropic_token, inline. Ran on the mini 2026-11-17 (README.md).
@@ -63,7 +77,7 @@ else
     '{federation_rule_id:$r, organization_id:$o, service_account_id:$s, workspace_id:$w}')   # what the mock Anthropic must be sent; ids, not secrets
   docker run -d --name "$mock" -e GW_SECRET="$GW_SECRET" -e FED="$FED" -v "$here/mock-anthropic.js":/mock.js:ro --entrypoint node "$IMAGE" /mock.js >/dev/null
   up=; for _ in $(seq 20); do [[ $(docker logs "$mock" 2>&1) == *'"listening"'* ]] && { up=1; break; }; sleep 0.5; done
-  [ -n "$up" ] || { docker logs "$mock" >&2; echo "spike: the mock did not start" >&2; exit 1; }
+  [ -n "$up" ] || { docker logs "$mock" 2>&1 | redact >&2; echo "spike: the mock did not start" >&2; exit 1; }
   MOCK_IP=$(ip_of "$mock"); export MOCK_IP
   upstream="params: {baseUrl: \"http://$MOCK_IP:9000/v1\"}"
 fi
@@ -161,7 +175,7 @@ fi
 docker run -d --name "$agw" --user "$(id -u):$(id -g)" -v "$d/agw.yaml":/config.yaml:ro -v "$d/secrets":/secrets:ro -v "$d/data":/data \
   "$AGW_IMAGE" -f /config.yaml >/dev/null
 up=; for _ in $(seq 20); do [[ $(docker logs "$agw" 2>&1) == *'started bind'* ]] && { up=1; break; }; sleep 0.5; done
-[ -n "$up" ] || { docker logs "$agw" >&2; echo "spike: agentgateway did not start" >&2; exit 1; }
+[ -n "$up" ] || { docker logs "$agw" 2>&1 | redact >&2; echo "spike: agentgateway did not start" >&2; exit 1; }
 GW_IP=$(ip_of "$agw"); export GW_IP
 
 # The repo, as `factory` hands it to the worker: a clone whose origin/main is the base, mounted at /work.
@@ -197,12 +211,11 @@ mode = "dns+nft"
 EOF
 uvx "$OSB_SERVER" --config "$d/sandbox.toml" > "$d/server.log" 2>&1 & server=$!
 up=; for _ in $(seq 60); do curl -fsS -m 2 -o /dev/null "http://$OSB_DOMAIN/health" 2>/dev/null && { up=1; break; }; sleep 1; done
-[ -n "$up" ] || { tail -20 "$d/server.log" >&2; echo "spike: opensandbox-server did not start" >&2; exit 1; }
+[ -n "$up" ] || { tail -20 "$d/server.log" | redact >&2; echo "spike: opensandbox-server did not start" >&2; exit 1; }
 
 rc=0; uv run -q --with "$OSB_SDK" python "$here/drive.py" || rc=$?
 # A failed real exchange is explained in the gateway's log (the token endpoint's own error), which the run would otherwise delete.
-[ "$rc" = 0 ] || [ "$mode$variant" != realexchange ] || docker logs "$agw" 2>&1 | grep -i -E 'error|denied|invalid' | tail -6 | cut -c1-500 \
-  | sed -E 's/eyJ[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]*)*/[jwt]/g; s/sk-ant-[A-Za-z0-9_-]+/[token]/g; s/(Bearer|Basic) +[^ ",]+/\1 [redacted]/g' >&2 || true   # a token endpoint's error can echo the request
+[ "$rc" = 0 ] || [ "$mode$variant" != realexchange ] || docker logs "$agw" 2>&1 | grep -i -E 'error|denied|invalid' | tail -6 | redact | cut -c1-500 >&2 || true
 
 if [ "$mode" = mock ]; then   # every model call the upstream received: the file's token as the bearer, and no x-api-key
   seen=$(docker logs "$mock" 2>&1)
